@@ -6,13 +6,15 @@ BASE="/opt/cctv"
 APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
+BACKUP="$BASE/backup"
+VERSION="2.0"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
     exit 1
 fi
 
-echo "=== CCTV v2: остановка сервисов ==="
+echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
 
 mkdir -p "$APP/templates"
@@ -20,6 +22,7 @@ mkdir -p "$WORKER"
 mkdir -p "$STORAGE/live"
 mkdir -p "$STORAGE/archive"
 mkdir -p "$STORAGE/logs"
+mkdir -p "$BACKUP"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -29,12 +32,23 @@ apt-get install -y python3 python3-venv python3-pip ffmpeg nginx sqlite3 openssl
 
 id -u cctv &>/dev/null || useradd --system --home-dir "$BASE" --shell /usr/sbin/nologin cctv
 
-echo "=== requirements.txt ==="
+echo "=== Резервные копии базы и .env ==="
+if [ -f "$APP/cctv.db" ]; then
+    cp -a "$APP/cctv.db" "$BACKUP/cctv-$(date +%Y%m%d-%H%M%S).db"
+    ls -1t "$BACKUP"/cctv-*.db 2>/dev/null | tail -n +8 | xargs -r rm -f
+    echo "Бэкап базы создан."
+fi
+if [ -f "$BASE/.env" ]; then
+    cp -a "$BASE/.env" "$BACKUP/env-$(date +%Y%m%d-%H%M%S)"
+    ls -1t "$BACKUP"/env-* 2>/dev/null | tail -n +8 | xargs -r rm -f
+fi
+
+echo "=== requirements.txt (версии зафиксированы) ==="
 cat > "$APP/requirements.txt" <<'REQ_EOF'
-Flask
-Flask-SQLAlchemy
-Flask-Login
-gunicorn
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-Login==0.6.3
+gunicorn==22.0.0
 REQ_EOF
 
 echo "=== app.py ==="
@@ -730,6 +744,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
+  <span class="badge warn">v2.0</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -886,7 +901,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка</h1>
+<h1>Админка <span class="badge warn">v2.0</span></h1>
 
 <div class="card">
 <h2>Пользователи</h2>
@@ -1248,7 +1263,7 @@ while True:
     time.sleep(3600)
 BILLING_EOF
 
-echo "=== .env ==="
+echo "=== .env (не трогаем, если есть) ==="
 if [ ! -f "$BASE/.env" ]; then
     ADMIN_PASSWORD=$(openssl rand -hex 8)
     SECRET_KEY=$(openssl rand -hex 32)
@@ -1264,7 +1279,7 @@ ENV_EOF
     echo "Admin password: $ADMIN_PASSWORD" > "$BASE/admin_password.txt"
     chmod 600 "$BASE/admin_password.txt"
 else
-    echo ".env уже есть, не трогаю."
+    echo ".env существует — оставляем прежним (пароль админа не изменится)."
 fi
 
 echo "=== Виртуальное окружение ==="
@@ -1274,17 +1289,57 @@ fi
 "$BASE/venv/bin/pip" install --upgrade pip
 "$BASE/venv/bin/pip" install -r "$APP/requirements.txt"
 
-echo "=== Миграция базы ==="
+echo "=== Миграция базы (идемпотентная) ==="
 if [ -f "$APP/cctv.db" ]; then
-    if ! sqlite3 "$APP/cctv.db" "PRAGMA table_info(user);" | grep -q "tariff_id"; then
-        sqlite3 "$APP/cctv.db" "ALTER TABLE user ADD COLUMN tariff_id INTEGER;"
-        sqlite3 "$APP/cctv.db" "ALTER TABLE user ADD COLUMN subscription_ends_at TIMESTAMP;"
-        echo "Миграция: user += tariff_id, subscription_ends_at"
-    fi
-    if ! sqlite3 "$APP/cctv.db" "PRAGMA table_info(camera);" | grep -q "recording_enabled"; then
-        sqlite3 "$APP/cctv.db" "ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 1;"
-        echo "Миграция: camera += recording_enabled"
-    fi
+    python3 - "$APP/cctv.db" <<'PYMIG'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+conn = sqlite3.connect(path)
+cur = conn.cursor()
+
+tables = {r[0] for r in cur.execute(
+    "SELECT name FROM sqlite_master WHERE type='table'"
+).fetchall()}
+
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS tariff (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR(80) NOT NULL,
+        price FLOAT NOT NULL,
+        period_days INTEGER,
+        max_cameras INTEGER,
+        archive_days INTEGER,
+        is_active BOOLEAN
+    )
+    """
+)
+
+def cols(table):
+    return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+
+if "user" in tables:
+    u = cols("user")
+    if "tariff_id" not in u:
+        cur.execute("ALTER TABLE user ADD COLUMN tariff_id INTEGER")
+        print("migration: user += tariff_id")
+    if "subscription_ends_at" not in u:
+        cur.execute("ALTER TABLE user ADD COLUMN subscription_ends_at TIMESTAMP")
+        print("migration: user += subscription_ends_at")
+
+if "camera" in tables:
+    c = cols("camera")
+    if "recording_enabled" not in c:
+        cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 1")
+        print("migration: camera += recording_enabled")
+
+cur.execute("PRAGMA journal_mode=WAL")
+conn.commit()
+conn.close()
+print("migration ok")
+PYMIG
 else
     echo "База не найдена — будет создана при первом старте."
 fi
@@ -1377,6 +1432,10 @@ rm -f /etc/nginx/sites-enabled/default
 
 nginx -t
 
+echo "=== Версия ==="
+echo "$VERSION" > "$BASE/VERSION"
+chown cctv:cctv "$BASE/VERSION"
+
 echo "=== Старт сервисов ==="
 systemctl daemon-reload
 systemctl enable --now cctv-web.service
@@ -1384,7 +1443,30 @@ systemctl enable --now cctv-worker.service
 systemctl enable --now cctv-billing.service
 systemctl restart nginx
 
+echo "=== Самопроверка ==="
+sleep 3
+
+LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/login || true)
+ROUTE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8077/admin/camera/1/delete || true)
+
+echo "login page: HTTP $LOGIN_CODE (ожидаем 200)"
+echo "post-маршрут админки: HTTP $ROUTE_CODE (ожидаем 302 = маршрут есть, редирект на логин)"
+
+if [ "$LOGIN_CODE" != "200" ] || [ "$ROUTE_CODE" = "404" ]; then
+    echo "!!! САМОПРОВЕРКА НЕ ПРОШЛА, последние логи:"
+    journalctl -u cctv-web -n 30 --no-pager || true
+    exit 1
+fi
+
 echo ""
 echo "=== Готово ==="
-echo "Пароль админа: sudo cat /opt/cctv/admin_password.txt"
-echo "Логи: journalctl -u cctv-web -f | -u cctv-worker -f | -u cctv-billing -f"
+echo "Версия системы: $(cat "$BASE/VERSION")"
+
+if [ -f "$APP/cctv.db" ]; then
+    echo "Пользователей в базе: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
+    echo "Камер в базе:          $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
+    echo "Транзакций в базе:     $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM transaction;')"
+fi
+echo "Архив на диске:        $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
+echo "Бэкапы базы:           $BACKUP"
+echo "Пароль админа:         sudo cat /opt/cctv/admin_password.txt"
