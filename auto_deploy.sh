@@ -8,11 +8,12 @@ WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Запусти скрипт через sudo или от root."
+    echo "Запусти через sudo или от root."
     exit 1
 fi
 
-echo "=== CCTV MVP auto deploy ==="
+echo "=== CCTV v2: остановка сервисов ==="
+systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
 
 mkdir -p "$APP/templates"
 mkdir -p "$WORKER"
@@ -22,24 +23,13 @@ mkdir -p "$STORAGE/logs"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
-apt-get install -y \
-    python3 \
-    python3-venv \
-    python3-pip \
-    ffmpeg \
-    nginx \
-    sqlite3 \
-    openssl
+echo "=== Пакеты ==="
+apt-get update || echo "WARNING: apt update с ошибками, продолжаю"
+apt-get install -y python3 python3-venv python3-pip ffmpeg nginx sqlite3 openssl
 
-id -u cctv &>/dev/null || useradd \
-    --system \
-    --home-dir "$BASE" \
-    --shell /usr/sbin/nologin \
-    cctv
+id -u cctv &>/dev/null || useradd --system --home-dir "$BASE" --shell /usr/sbin/nologin cctv
 
-echo "=== Создаём requirements.txt ==="
-
+echo "=== requirements.txt ==="
 cat > "$APP/requirements.txt" <<'REQ_EOF'
 Flask
 Flask-SQLAlchemy
@@ -47,11 +37,11 @@ Flask-Login
 gunicorn
 REQ_EOF
 
-echo "=== Создаём app.py ==="
-
-cat > "$APP/app.py" <<'APP_PY_EOF'
+echo "=== app.py ==="
+cat > "$APP/app.py" <<'APP_EOF'
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
 
@@ -99,6 +89,19 @@ db = SQLAlchemy(app)
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
+login_manager.login_message = "Для доступа к этой странице нужно войти."
+
+
+class Tariff(db.Model):
+    __tablename__ = "tariff"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    period_days = db.Column(db.Integer, default=30)
+    max_cameras = db.Column(db.Integer, default=1)
+    archive_days = db.Column(db.Integer, default=7)
+    is_active = db.Column(db.Boolean, default=True)
 
 
 class User(UserMixin, db.Model):
@@ -112,6 +115,10 @@ class User(UserMixin, db.Model):
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    tariff_id = db.Column(db.Integer, db.ForeignKey("tariff.id"), nullable=True)
+    subscription_ends_at = db.Column(db.DateTime, nullable=True)
+
+    tariff = db.relationship("Tariff", backref="users")
     cameras = db.relationship("Camera", backref="owner", lazy=True)
     transactions = db.relationship("Transaction", backref="user", lazy=True)
 
@@ -128,6 +135,7 @@ class Camera(db.Model):
     rtsp_url = db.Column(db.Text, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
     active = db.Column(db.Boolean, default=True)
+    recording_enabled = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -143,11 +151,19 @@ class Transaction(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 
 def init_db():
     db.create_all()
+
+    if Tariff.query.count() == 0:
+        db.session.add_all([
+            Tariff(name="Старт", price=290, period_days=30, max_cameras=1, archive_days=3),
+            Tariff(name="Базовый", price=690, period_days=30, max_cameras=3, archive_days=7),
+            Tariff(name="Бизнес", price=1990, period_days=30, max_cameras=10, archive_days=7),
+        ])
+        db.session.commit()
 
     admin_username = os.environ.get("ADMIN_USERNAME", "admin")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
@@ -180,6 +196,12 @@ def admin_required(f):
     return decorated_function
 
 
+def subscription_active(user):
+    if user.subscription_ends_at is None:
+        return False
+    return user.subscription_ends_at > datetime.utcnow()
+
+
 def can_view_camera(camera):
     if current_user.admin:
         return True
@@ -193,14 +215,14 @@ def can_view_camera(camera):
     if not current_user.is_active:
         return False
 
-    if current_user.balance <= 0:
+    if not subscription_active(current_user):
         return False
 
     return True
 
 
 def get_camera_or_403(camera_id):
-    camera = Camera.query.get(camera_id)
+    camera = db.session.get(Camera, camera_id)
     if not camera:
         abort(404)
 
@@ -208,6 +230,48 @@ def get_camera_or_403(camera_id):
         abort(403)
 
     return camera
+
+
+def user_camera_count(user):
+    return Camera.query.filter_by(user_id=user.id).count()
+
+
+def can_add_camera_to_user(user):
+    if user is None:
+        return True
+    if user.tariff is None:
+        return False
+    return user_camera_count(user) < user.tariff.max_cameras
+
+
+def apply_tariff(user, tariff):
+    now = datetime.utcnow()
+
+    if user.balance < tariff.price:
+        return False, (
+            f"Недостаточно баланса: нужно {tariff.price:.2f}, "
+            f"на балансе {user.balance:.2f}"
+        )
+
+    base = now
+    if user.subscription_ends_at and user.subscription_ends_at > now:
+        base = user.subscription_ends_at
+
+    user.balance -= tariff.price
+    db.session.add(Transaction(
+        user_id=user.id,
+        amount=-tariff.price,
+        reason=f"Подключение тарифа {tariff.name}",
+    ))
+
+    user.tariff_id = tariff.id
+    user.subscription_ends_at = base + timedelta(days=tariff.period_days)
+    db.session.commit()
+
+    return True, (
+        f"Тариф {tariff.name} подключён до "
+        f"{user.subscription_ends_at:%d.%m.%Y}"
+    )
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -252,7 +316,11 @@ def dashboard():
             active=True,
         ).order_by(Camera.id.desc()).all()
 
-    return render_template("dashboard.html", cameras=cameras)
+    return render_template(
+        "dashboard.html",
+        cameras=cameras,
+        sub_active=subscription_active(current_user),
+    )
 
 
 @app.route("/camera/<int:camera_id>")
@@ -260,20 +328,37 @@ def dashboard():
 def camera_page(camera_id):
     camera = get_camera_or_403(camera_id)
 
-    recordings = []
+    records = []
     camera_dir = ARCHIVE_DIR / f"camera_{camera.id}"
 
     if camera_dir.exists():
-        recordings = sorted(
-            [item.name for item in camera_dir.glob("*.mp4")],
-            reverse=True,
-        )[:50]
+        archive_days = 7
+        owner = camera.owner
+        if owner is not None and owner.tariff is not None:
+            archive_days = owner.tariff.archive_days or 7
 
-    return render_template(
-        "camera.html",
-        camera=camera,
-        recordings=recordings,
-    )
+        cutoff = time.time() - archive_days * 86400
+        now_ts = time.time()
+
+        files = sorted(
+            camera_dir.glob("*.mp4"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        for p in files[:100]:
+            st = p.stat()
+            if st.st_mtime < cutoff:
+                break
+            records.append({
+                "name": p.name,
+                "ready": (now_ts - st.st_mtime) > 60,
+                "size_mb": round(st.st_size / 1048576, 1),
+            })
+
+        records = records[:50]
+
+    return render_template("camera.html", camera=camera, records=records)
 
 
 @app.route("/live/<int:camera_id>/<path:filename>")
@@ -297,17 +382,32 @@ def archive_file(camera_id, filename):
     )
 
 
+@app.route("/archive/<int:camera_id>/download/<path:filename>")
+@login_required
+def archive_download(camera_id, filename):
+    camera = get_camera_or_403(camera_id)
+    directory = str(ARCHIVE_DIR / f"camera_{camera.id}")
+    return send_from_directory(
+        directory,
+        filename,
+        as_attachment=True,
+        download_name=f"camera{camera.id}_{filename}",
+    )
+
+
 @app.route("/admin")
 @admin_required
 def admin_page():
     users = User.query.order_by(User.id.desc()).all()
     cameras = Camera.query.order_by(Camera.id.desc()).all()
+    tariffs = Tariff.query.order_by(Tariff.id).all()
     transactions = Transaction.query.order_by(Transaction.id.desc()).limit(50).all()
 
     return render_template(
         "admin.html",
         users=users,
         cameras=cameras,
+        tariffs=tariffs,
         transactions=transactions,
     )
 
@@ -345,7 +445,7 @@ def admin_user_add():
 @app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
 @admin_required
 def admin_user_toggle(user_id):
-    user = User.query.get_or_404(user_id)
+    user = db.session.get_or_404(User, user_id)
     user.active = not user.active
     db.session.commit()
 
@@ -354,6 +454,28 @@ def admin_user_toggle(user_id):
     else:
         flash(f"Пользователь {user.username} заблокирован.")
 
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/user/<int:user_id>/delete", methods=["POST"])
+@admin_required
+def admin_user_delete(user_id):
+    user = db.session.get_or_404(User, user_id)
+
+    if user.id == current_user.id:
+        flash("Нельзя удалить самого себя.")
+        return redirect(url_for("admin_page"))
+
+    for transaction in list(user.transactions):
+        db.session.delete(transaction)
+
+    for camera in list(user.cameras):
+        db.session.delete(camera)
+
+    db.session.delete(user)
+    db.session.commit()
+
+    flash(f"Пользователь {user.username} и его камеры удалены.")
     return redirect(url_for("admin_page"))
 
 
@@ -371,7 +493,7 @@ def admin_topup():
         flash("Некорректные данные.")
         return redirect(url_for("admin_page"))
 
-    user = User.query.get_or_404(user_id)
+    user = db.session.get_or_404(User, user_id)
 
     user.balance += amount
 
@@ -388,6 +510,70 @@ def admin_topup():
     return redirect(url_for("admin_page"))
 
 
+@app.route("/admin/user/<int:user_id>/tariff", methods=["POST"])
+@admin_required
+def admin_user_tariff(user_id):
+    user = db.session.get_or_404(User, user_id)
+    tariff_id = request.form.get("tariff_id", "")
+
+    try:
+        tariff_id = int(tariff_id)
+    except ValueError:
+        flash("Не выбран тариф.")
+        return redirect(url_for("admin_page"))
+
+    tariff = db.session.get_or_404(Tariff, tariff_id)
+
+    ok, message = apply_tariff(user, tariff)
+    flash(message)
+
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/tariff/add", methods=["POST"])
+@admin_required
+def admin_tariff_add():
+    name = request.form.get("name", "").strip()
+
+    try:
+        price = float(request.form.get("price", "0"))
+        period_days = int(request.form.get("period_days", "30"))
+        max_cameras = int(request.form.get("max_cameras", "1"))
+        archive_days = int(request.form.get("archive_days", "7"))
+    except ValueError:
+        flash("Некорректные числа в тарифе.")
+        return redirect(url_for("admin_page"))
+
+    if not name or price <= 0:
+        flash("Укажите название и цену.")
+        return redirect(url_for("admin_page"))
+
+    tariff = Tariff(
+        name=name,
+        price=price,
+        period_days=period_days,
+        max_cameras=max_cameras,
+        archive_days=archive_days,
+        is_active=True,
+    )
+
+    db.session.add(tariff)
+    db.session.commit()
+
+    flash(f"Тариф {name} добавлен.")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/tariff/<int:tariff_id>/toggle", methods=["POST"])
+@admin_required
+def admin_tariff_toggle(tariff_id):
+    tariff = db.session.get_or_404(Tariff, tariff_id)
+    tariff.is_active = not tariff.is_active
+    db.session.commit()
+    flash(f"Тариф {tariff.name}: {'включён' if tariff.is_active else 'выключен'}.")
+    return redirect(url_for("admin_page"))
+
+
 @app.route("/admin/camera/add", methods=["POST"])
 @admin_required
 def admin_camera_add():
@@ -399,17 +585,26 @@ def admin_camera_add():
         flash("Укажите название камеры и RTSP.")
         return redirect(url_for("admin_page"))
 
+    user = None
+    if user_id:
+        try:
+            user = db.session.get(User, int(user_id))
+        except ValueError:
+            user = None
+
+    if user is not None and not can_add_camera_to_user(user):
+        flash("У пользователя лимит камер по тарифу или нет тарифа.")
+        return redirect(url_for("admin_page"))
+
     camera = Camera(
         name=name,
         rtsp_url=rtsp_url,
         active=True,
+        recording_enabled=True,
     )
 
-    if user_id:
-        try:
-            camera.user_id = int(user_id)
-        except ValueError:
-            camera.user_id = None
+    if user is not None:
+        camera.user_id = user.id
 
     db.session.add(camera)
     db.session.commit()
@@ -421,14 +616,20 @@ def admin_camera_add():
 @app.route("/admin/camera/<int:camera_id>/assign", methods=["POST"])
 @admin_required
 def admin_camera_assign(camera_id):
-    camera = Camera.query.get_or_404(camera_id)
+    camera = db.session.get_or_404(Camera, camera_id)
     user_id = request.form.get("user_id", "").strip()
 
     if user_id:
         try:
-            camera.user_id = int(user_id)
+            user = db.session.get(User, int(user_id))
         except ValueError:
-            camera.user_id = None
+            user = None
+
+        if user is not None and not can_add_camera_to_user(user):
+            flash("У этого пользователя лимит камер по тарифу или нет тарифа.")
+            return redirect(url_for("admin_page"))
+
+        camera.user_id = user.id if user is not None else None
     else:
         camera.user_id = None
 
@@ -441,7 +642,7 @@ def admin_camera_assign(camera_id):
 @app.route("/admin/camera/<int:camera_id>/toggle", methods=["POST"])
 @admin_required
 def admin_camera_toggle(camera_id):
-    camera = Camera.query.get_or_404(camera_id)
+    camera = db.session.get_or_404(Camera, camera_id)
     camera.active = not camera.active
     db.session.commit()
 
@@ -453,368 +654,388 @@ def admin_camera_toggle(camera_id):
     return redirect(url_for("admin_page"))
 
 
+@app.route("/admin/camera/<int:camera_id>/recording", methods=["POST"])
+@admin_required
+def admin_camera_recording(camera_id):
+    camera = db.session.get_or_404(Camera, camera_id)
+    camera.recording_enabled = not camera.recording_enabled
+    db.session.commit()
+
+    if camera.recording_enabled:
+        flash(f"Камера {camera.name}: запись включена.")
+    else:
+        flash(f"Камера {camera.name}: запись выключена.")
+
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/camera/<int:camera_id>/delete", methods=["POST"])
+@admin_required
+def admin_camera_delete(camera_id):
+    camera = db.session.get_or_404(Camera, camera_id)
+    name = camera.name
+    db.session.delete(camera)
+    db.session.commit()
+
+    flash(f"Камера {name} удалена. Файлы архива останутся на диске.")
+    return redirect(url_for("admin_page"))
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-APP_PY_EOF
+APP_EOF
 
-echo "=== Создаём base.html ==="
-
-cat > "$APP/templates/base.html" <<'BASE_HTML_EOF'
+echo "=== base.html ==="
+cat > "$APP/templates/base.html" <<'BASE_EOF'
 <!doctype html>
 <html lang="ru">
 <head>
-    <meta charset="utf-8">
-    <title>CCTV MVP</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-        }
-        table {
-            border-collapse: collapse;
-            margin-bottom: 20px;
-        }
-        td, th {
-            border: 1px solid #ccc;
-            padding: 6px 10px;
-        }
-        nav {
-            margin-bottom: 15px;
-        }
-        nav a {
-            margin-right: 10px;
-        }
-        .messages {
-            color: darkred;
-            margin-bottom: 10px;
-        }
-        form.inline {
-            display: inline;
-        }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CCTV Cloud</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--accent:#38bdf8;--text:#e2e8f0;--muted:#94a3b8;--ok:#4ade80;--bad:#f87171;--warn:#facc15;}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:#111c33;border-bottom:1px solid #24344f;flex-wrap:wrap;}
+header .logo{font-weight:700;font-size:18px;color:var(--accent);}
+header a{color:var(--text);text-decoration:none;padding:6px 10px;border-radius:8px;}
+header a:hover{background:#24344f;}
+header .spacer{flex:1}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;}
+.badge.ok{background:#14342a;color:var(--ok);}
+.badge.bad{background:#3b1d1d;color:var(--bad);}
+.badge.warn{background:#3b341a;color:var(--warn);}
+main{padding:20px;max-width:1100px;margin:0 auto;}
+.card{background:var(--card);border:1px solid #2b3b57;border-radius:14px;padding:18px;margin-bottom:18px;}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px;}
+.cam{background:#16233c;border:1px solid #2b3b57;border-radius:12px;padding:14px;}
+.cam h3{margin:0 0 8px;font-size:16px;}
+.btn{display:inline-block;background:var(--accent);color:#082032;border:none;border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer;text-decoration:none;}
+.btn:hover{filter:brightness(1.1);}
+.btn.gray{background:#334155;color:var(--text);}
+.btn.red{background:#7f1d1d;color:#fecaca;}
+table{width:100%;border-collapse:collapse;font-size:14px;}
+td,th{padding:8px 10px;border-bottom:1px solid #2b3b57;text-align:left;vertical-align:top;}
+input,select{background:#0b1229;border:1px solid #33415c;color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;}
+.messages{margin:0 0 14px;padding:0;}
+.messages li{background:#3b1d1d;color:#fecaca;list-style:none;padding:8px 12px;border-radius:8px;margin-bottom:6px;}
+.muted{color:var(--muted);font-size:13px;}
+video{width:100%;border-radius:10px;background:#000;}
+.formrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;}
+h1{font-size:22px;margin:0 0 16px;}
+h2{font-size:17px;margin:0 0 12px;}
+</style>
 </head>
 <body>
-
-<nav>
-    {% if current_user.is_authenticated %}
-        <a href="{{ url_for('dashboard') }}">Камеры</a>
-
-        {% if current_user.admin %}
-            <a href="{{ url_for('admin_page') }}">Админка</a>
-        {% endif %}
-
-        <span>Баланс: {{ "%.2f"|format(current_user.balance) }}</span>
-        <a href="{{ url_for('logout') }}">Выход: {{ current_user.username }}</a>
-    {% else %}
-        <a href="{{ url_for('login') }}">Вход</a>
+<header>
+  <span class="logo">CCTV Cloud</span>
+  {% if current_user.is_authenticated %}
+    <a href="{{ url_for('dashboard') }}">Мои камеры</a>
+    {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
+    <span class="spacer"></span>
+    {% if not current_user.admin %}
+      <span class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.</span>
     {% endif %}
-</nav>
-
-<hr>
-
+    <a href="{{ url_for('logout') }}">Выход ({{ current_user.username }})</a>
+  {% else %}
+    <span class="spacer"></span>
+    <a href="{{ url_for('login') }}">Вход</a>
+  {% endif %}
+</header>
+<main>
 {% with messages = get_flashed_messages() %}
-    {% if messages %}
-        <div class="messages">
-            <ul>
-                {% for message in messages %}
-                    <li>{{ message }}</li>
-                {% endfor %}
-            </ul>
-        </div>
-    {% endif %}
+  {% if messages %}
+    <ul class="messages">
+      {% for m in messages %}<li>{{ m }}</li>{% endfor %}
+    </ul>
+  {% endif %}
 {% endwith %}
-
 {% block content %}{% endblock %}
-
+</main>
 </body>
 </html>
-BASE_HTML_EOF
+BASE_EOF
 
-echo "=== Создаём login.html ==="
-
-cat > "$APP/templates/login.html" <<'LOGIN_HTML_EOF'
+echo "=== login.html ==="
+cat > "$APP/templates/login.html" <<'LOGIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Вход</h1>
-
-<form method="post" action="{{ url_for('login') }}">
-    <p>
-        Логин:<br>
-        <input type="text" name="username" required>
-    </p>
-
-    <p>
-        Пароль:<br>
-        <input type="password" name="password" required>
-    </p>
-
-    <p>
-        <button type="submit">Войти</button>
-    </p>
-</form>
+<div class="card" style="max-width:380px;margin:60px auto;">
+  <h1>Вход</h1>
+  <form method="post" action="{{ url_for('login') }}">
+    <div class="formrow"><input type="text" name="username" placeholder="Логин" required style="flex:1"></div>
+    <div class="formrow"><input type="password" name="password" placeholder="Пароль" required style="flex:1"></div>
+    <button class="btn" type="submit">Войти</button>
+  </form>
+</div>
 {% endblock %}
-LOGIN_HTML_EOF
+LOGIN_EOF
 
-echo "=== Создаём dashboard.html ==="
-
-cat > "$APP/templates/dashboard.html" <<'DASH_HTML_EOF'
+echo "=== dashboard.html ==="
+cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Камеры</h1>
-
-{% if not current_user.admin and current_user.balance <= 0 %}
-    <p style="color:red;">
-        Баланс не пополнен. Доступ к камерам может быть заблокирован.
-    </p>
+{% if not current_user.admin %}
+<div class="card">
+  <h2>Подписка</h2>
+  {% if current_user.tariff %}
+    <p>Тариф: <b>{{ current_user.tariff.name }}</b>
+       (камер: {{ current_user.tariff.max_cameras }},
+       архив: {{ current_user.tariff.archive_days }} дн.)</p>
+    {% if sub_active %}
+      <p><span class="badge ok">активна</span>
+         до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y") }}</p>
+    {% else %}
+      <p><span class="badge bad">истекла</span>
+         пополните баланс и попросите администратора продлить тариф</p>
+    {% endif %}
+  {% else %}
+    <p><span class="badge warn">тариф не подключён</span>
+       обратитесь к администратору</p>
+  {% endif %}
+  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.</p>
+</div>
 {% endif %}
 
-<table>
-    <tr>
-        <th>ID</th>
-        <th>Название</th>
-        <th>Владелец</th>
-        <th>Статус</th>
-        <th></th>
-    </tr>
-
-    {% for camera in cameras %}
-    <tr>
-        <td>{{ camera.id }}</td>
-        <td>{{ camera.name }}</td>
-        <td>
-            {% if camera.owner %}
-                {{ camera.owner.username }}
-            {% else %}
-                -
-            {% endif %}
-        </td>
-        <td>
-            {% if camera.active %}
-                активна
-            {% else %}
-                выключена
-            {% endif %}
-        </td>
-        <td>
-            <a href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
-        </td>
-    </tr>
-    {% endfor %}
-</table>
+<h1>Мои камеры</h1>
+{% if cameras %}
+<div class="grid">
+  {% for camera in cameras %}
+  <div class="cam">
+    <h3>{{ camera.name }}</h3>
+    <p>
+      {% if camera.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
+      {% if camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}
+    </p>
+    <a class="btn" href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card"><p class="muted">Камер пока нет.</p></div>
+{% endif %}
 {% endblock %}
-DASH_HTML_EOF
+DASH_EOF
 
-echo "=== Создаём camera.html ==="
-
-cat > "$APP/templates/camera.html" <<'CAMERA_HTML_EOF'
+echo "=== camera.html ==="
+cat > "$APP/templates/camera.html" <<'CAM_EOF'
 {% extends "base.html" %}
 
 {% block content %}
 <h1>{{ camera.name }}</h1>
 
-<h2>Онлайн</h2>
+<div class="card">
+  <h2>Онлайн</h2>
+  <video id="video" controls autoplay muted></video>
+  <p class="muted" id="player-status"></p>
+</div>
 
-<video id="video" controls autoplay muted width="800"></video>
+<div class="card">
+  <h2>Архив</h2>
+  {% if records %}
+  <table>
+    <tr><th>Файл</th><th>Размер</th><th>Статус</th><th></th></tr>
+    {% for rec in records %}
+    <tr>
+      <td>{{ rec.name }}</td>
+      <td>{{ rec.size_mb }} МБ</td>
+      <td>
+        {% if rec.ready %}<span class="badge ok">готов</span>
+        {% else %}<span class="badge warn">идёт запись…</span>{% endif %}
+      </td>
+      <td>
+        <a class="btn gray" href="{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}" target="_blank">Смотреть</a>
+        {% if rec.ready %}
+        <a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Архив пуст: запись ещё не началась или выключена.</p>
+  {% endif %}
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
-    const video = document.getElementById("video");
-    const src = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
-
-    if (window.Hls && Hls.isSupported()) {
-        const hls = new Hls();
-        hls.loadSource(src);
-        hls.attachMedia(video);
-
-        hls.on(Hls.Events.ERROR, function(event, data) {
-            console.error("HLS error:", data);
-        });
-    } else {
-        video.src = src;
+const video = document.getElementById("video");
+const statusEl = document.getElementById("player-status");
+const src = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
+if (window.Hls && Hls.isSupported()) {
+  const hls = new Hls();
+  hls.loadSource(src);
+  hls.attachMedia(video);
+  hls.on(Hls.Events.ERROR, function(e, data) {
+    if (data.fatal) {
+      statusEl.textContent = "Нет сигнала: камера офлайн или поток недоступен";
     }
+  });
+} else {
+  video.src = src;
+}
 </script>
-
-<h2>Архив</h2>
-
-{% if recordings %}
-    <ul>
-        {% for record in recordings %}
-            <li>
-                <a href="{{ url_for('archive_file', camera_id=camera.id, filename=record) }}" target="_blank">
-                    {{ record }}
-                </a>
-            </li>
-        {% endfor %}
-    </ul>
-{% else %}
-    <p>Архив пока пуст или запись ещё не началась.</p>
-{% endif %}
-
 {% endblock %}
-CAMERA_HTML_EOF
+CAM_EOF
 
-echo "=== Создаём admin.html ==="
-
-cat > "$APP/templates/admin.html" <<'ADMIN_HTML_EOF'
+echo "=== admin.html ==="
+cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
 <h1>Админка</h1>
 
+<div class="card">
 <h2>Пользователи</h2>
-
 <table>
-    <tr>
-        <th>ID</th>
-        <th>Логин</th>
-        <th>Баланс</th>
-        <th>Админ</th>
-        <th>Статус</th>
-        <th>Действия</th>
-    </tr>
-
-    {% for user in users %}
-    <tr>
-        <td>{{ user.id }}</td>
-        <td>{{ user.username }}</td>
-        <td>{{ "%.2f"|format(user.balance) }}</td>
-        <td>{{ "да" if user.admin else "нет" }}</td>
-        <td>{{ "активен" if user.active else "заблокирован" }}</td>
-        <td>
-            <form method="post" action="{{ url_for('admin_user_toggle', user_id=user.id) }}" class="inline">
-                <button type="submit">
-                    {{ "Заблокировать" if user.active else "Разблокировать" }}
-                </button>
-            </form>
-        </td>
-    </tr>
-    {% endfor %}
+<tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Тариф</th><th>До</th><th>Статус</th><th>Действия</th></tr>
+{% for u in users %}
+<tr>
+<td>{{ u.id }}</td>
+<td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td>
+<td>{{ "%.2f"|format(u.balance) }}</td>
+<td>{{ u.tariff.name if u.tariff else "—" }}</td>
+<td>{{ u.subscription_ends_at.strftime("%d.%m.%Y") if u.subscription_ends_at else "—" }}</td>
+<td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
+<td>
+  <form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline">
+    <button class="btn gray" type="submit">{{ "Блок" if u.active else "Разблок" }}</button>
+  </form>
+  {% if not u.admin %}
+  <form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }} вместе с его камерами?');">
+    <button class="btn red" type="submit">Удалить</button>
+  </form>
+  {% endif %}
+</td>
+</tr>
+{% endfor %}
 </table>
 
-<h3>Добавить пользователя</h3>
-
-<form method="post" action="{{ url_for('admin_user_add') }}">
-    <input type="text" name="username" placeholder="Логин" required>
-    <input type="password" name="password" placeholder="Пароль" required>
-    <button type="submit">Создать</button>
+<h2>Добавить пользователя</h2>
+<form method="post" action="{{ url_for('admin_user_add') }}" class="formrow">
+<input name="username" placeholder="Логин" required>
+<input name="password" type="password" placeholder="Пароль" required>
+<button class="btn" type="submit">Создать</button>
 </form>
 
-<h3>Изменить баланс</h3>
-
-<form method="post" action="{{ url_for('admin_topup') }}">
-    <select name="user_id">
-        {% for user in users %}
-            <option value="{{ user.id }}">{{ user.username }}</option>
-        {% endfor %}
-    </select>
-
-    <input type="text" name="amount" placeholder="100 или -100" required>
-    <input type="text" name="reason" placeholder="Пополнение">
-    <button type="submit">Изменить баланс</button>
+<h2>Баланс</h2>
+<form method="post" action="{{ url_for('admin_topup') }}" class="formrow">
+<select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<input name="amount" placeholder="100 или -100" required>
+<input name="reason" placeholder="Причина">
+<button class="btn" type="submit">Применить</button>
 </form>
 
-<hr>
+<h2>Подключить тариф (списание с баланса)</h2>
+<form method="post" id="tariff-form" class="formrow">
+<select name="user_id" id="tariff-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select>
+<button class="btn" type="submit">Подключить</button>
+</form>
+<p class="muted">Деньги списываются сразу; срок считается от текущей даты окончания, если подписка ещё активна.</p>
+</div>
 
+<div class="card">
 <h2>Камеры</h2>
-
 <table>
-    <tr>
-        <th>ID</th>
-        <th>Название</th>
-        <th>RTSP</th>
-        <th>Владелец</th>
-        <th>Статус</th>
-        <th>Назначить</th>
-        <th>Действия</th>
-    </tr>
-
-    {% for camera in cameras %}
-    <tr>
-        <td>{{ camera.id }}</td>
-        <td>{{ camera.name }}</td>
-        <td>{{ camera.rtsp_url }}</td>
-        <td>
-            {% if camera.owner %}
-                {{ camera.owner.username }}
-            {% else %}
-                -
-            {% endif %}
-        </td>
-        <td>
-            {{ "активна" if camera.active else "выключена" }}
-        </td>
-        <td>
-            <form method="post" action="{{ url_for('admin_camera_assign', camera_id=camera.id) }}">
-                <select name="user_id">
-                    <option value="">-- не назначена --</option>
-                    {% for user in users %}
-                        <option value="{{ user.id }}" {% if camera.user_id == user.id %}selected{% endif %}>
-                            {{ user.username }}
-                        </option>
-                    {% endfor %}
-                </select>
-                <button type="submit">Назначить</button>
-            </form>
-        </td>
-        <td>
-            <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=camera.id) }}">
-                <button type="submit">
-                    {{ "Выключить" if camera.active else "Включить" }}
-                </button>
-            </form>
-        </td>
-    </tr>
-    {% endfor %}
-</table>
-
-<h3>Добавить камеру</h3>
-
-<form method="post" action="{{ url_for('admin_camera_add') }}">
-    <input type="text" name="name" placeholder="Название камеры" required>
-    <input type="text" name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required>
-
-    <select name="user_id">
-        <option value="">-- не назначена --</option>
-        {% for user in users %}
-            <option value="{{ user.id }}">{{ user.username }}</option>
-        {% endfor %}
-    </select>
-
-    <button type="submit">Добавить камеру</button>
+<tr><th>ID</th><th>Название</th><th>RTSP</th><th>Владелец</th><th>Статус</th><th>Назначить</th><th>Действия</th></tr>
+{% for cam in cameras %}
+<tr>
+<td>{{ cam.id }}</td>
+<td>{{ cam.name }}</td>
+<td class="muted">{{ cam.rtsp_url }}</td>
+<td>{{ cam.owner.username if cam.owner else "—" }}</td>
+<td>
+{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
+{% if cam.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}
+</td>
+<td>
+<form method="post" action="{{ url_for('admin_camera_assign', camera_id=cam.id) }}">
+<select name="user_id">
+<option value="">— нет —</option>
+{% for u in users %}<option value="{{ u.id }}" {% if cam.user_id == u.id %}selected{% endif %}>{{ u.username }}</option>{% endfor %}
+</select>
+<button class="btn gray" type="submit">Назначить</button>
 </form>
-
-<hr>
-
-<h2>Последние транзакции</h2>
-
-<table>
-    <tr>
-        <th>ID</th>
-        <th>Пользователь</th>
-        <th>Сумма</th>
-        <th>Причина</th>
-        <th>Дата</th>
-    </tr>
-
-    {% for transaction in transactions %}
-    <tr>
-        <td>{{ transaction.id }}</td>
-        <td>{{ transaction.user.username }}</td>
-        <td>{{ "%.2f"|format(transaction.amount) }}</td>
-        <td>{{ transaction.reason }}</td>
-        <td>{{ transaction.created_at.strftime("%Y-%m-%d %H:%M:%S") }}</td>
-    </tr>
-    {% endfor %}
+</td>
+<td>
+<form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Стоп запись" if cam.recording_enabled else "Старт запись" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }}?');"><button class="btn red" type="submit">Удалить</button></form>
+</td>
+</tr>
+{% endfor %}
 </table>
 
+<h2>Добавить камеру</h2>
+<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow">
+<input name="name" placeholder="Название" required>
+<input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1">
+<select name="user_id"><option value="">— нет —</option>{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<button class="btn" type="submit">Добавить</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Тарифы</h2>
+<table>
+<tr><th>Название</th><th>Цена</th><th>Дней</th><th>Камер</th><th>Архив</th><th>Статус</th><th></th></tr>
+{% for t in tariffs %}
+<tr>
+<td>{{ t.name }}</td>
+<td>{{ t.price }}</td>
+<td>{{ t.period_days }}</td>
+<td>{{ t.max_cameras }}</td>
+<td>{{ t.archive_days }} дн.</td>
+<td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
+<td>
+<form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
+</td>
+</tr>
+{% endfor %}
+</table>
+
+<h2>Добавить тариф</h2>
+<form method="post" action="{{ url_for('admin_tariff_add') }}" class="formrow">
+<input name="name" placeholder="Название" required>
+<input name="price" placeholder="Цена" required>
+<input name="period_days" placeholder="Дней" value="30">
+<input name="max_cameras" placeholder="Камер" value="1">
+<input name="archive_days" placeholder="Архив дней" value="7">
+<button class="btn" type="submit">Добавить</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Транзакции</h2>
+<table>
+<tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Причина</th><th>Дата</th></tr>
+{% for t in transactions %}
+<tr>
+<td>{{ t.id }}</td>
+<td>{{ t.user.username if t.user else "—" }}</td>
+<td>{{ "%.2f"|format(t.amount) }}</td>
+<td>{{ t.reason }}</td>
+<td>{{ t.created_at.strftime("%d.%m.%Y %H:%M") if t.created_at else "" }}</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+
+<script>
+document.getElementById("tariff-form").addEventListener("submit", function () {
+    var uid = document.getElementById("tariff-user").value;
+    this.action = "/admin/user/" + uid + "/tariff";
+});
+</script>
 {% endblock %}
-ADMIN_HTML_EOF
+ADMIN_EOF
 
-echo "=== Создаём worker.py ==="
-
-cat > "$WORKER/worker.py" <<'WORKER_PY_EOF'
+echo "=== worker.py ==="
+cat > "$WORKER/worker.py" <<'WORKER_EOF'
 import sqlite3
 import subprocess
 import time
@@ -848,7 +1069,8 @@ def get_cameras():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT id, rtsp_url FROM camera WHERE active=1"
+            "SELECT id, rtsp_url, recording_enabled "
+            "FROM camera WHERE active=1"
         )
         rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -860,6 +1082,7 @@ def get_cameras():
 def start_camera(cam):
     camera_id = cam["id"]
     rtsp_url = cam["rtsp_url"]
+    recording_enabled = bool(cam["recording_enabled"])
 
     archive_dir = ARCHIVE_DIR / f"camera_{camera_id}"
     live_dir = LIVE_DIR / f"camera_{camera_id}"
@@ -874,18 +1097,21 @@ def start_camera(cam):
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",
         "-i", rtsp_url,
+    ]
 
-        # Запись архива кусками по 5 минут
-        "-map", "0:v",
-        "-c:v", "copy",
-        "-an",
-        "-f", "segment",
-        "-segment_time", "300",
-        "-reset_timestamps", "1",
-        "-strftime", "1",
-        str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4"),
+    if recording_enabled:
+        cmd += [
+            "-map", "0:v",
+            "-c:v", "copy",
+            "-an",
+            "-f", "segment",
+            "-segment_time", "300",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4"),
+        ]
 
-        # Live HLS поток для браузера
+    cmd += [
         "-map", "0:v",
         "-c:v", "copy",
         "-an",
@@ -942,44 +1168,132 @@ for proc in procs.values():
         proc.wait()
     except Exception:
         pass
-WORKER_PY_EOF
+WORKER_EOF
 
-echo "=== Создаём .env ==="
+echo "=== billing.py ==="
+cat > "$WORKER/billing.py" <<'BILLING_EOF'
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 
+
+DB_PATH = Path("/opt/cctv/app/cctv.db")
+
+
+def renew_due():
+    if not DB_PATH.exists():
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    now = datetime.utcnow()
+
+    rows = conn.execute(
+        """
+        SELECT u.id AS user_id,
+               u.username,
+               u.balance,
+               u.subscription_ends_at,
+               t.id AS tariff_id,
+               t.name AS tariff_name,
+               t.price,
+               t.period_days
+        FROM user u
+        JOIN tariff t ON t.id = u.tariff_id
+        WHERE u.active = 1
+          AND u.tariff_id IS NOT NULL
+          AND u.subscription_ends_at IS NOT NULL
+        """
+    ).fetchall()
+
+    for r in rows:
+        try:
+            ends = datetime.fromisoformat(r["subscription_ends_at"])
+        except (ValueError, TypeError):
+            continue
+
+        if ends > now + timedelta(days=1):
+            continue
+
+        if r["balance"] < r["price"]:
+            print(f"[billing] {r['username']}: не хватает баланса для продления {r['tariff_name']}", flush=True)
+            continue
+
+        base = ends if ends > now else now
+        new_ends = base + timedelta(days=r["period_days"])
+
+        conn.execute(
+            "UPDATE user SET balance = balance - ?, subscription_ends_at = ?, tariff_id = ? WHERE id = ?",
+            (r["price"], new_ends.isoformat(sep=" "), r["tariff_id"], r["user_id"]),
+        )
+        conn.execute(
+            "INSERT INTO transaction (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)",
+            (r["user_id"], -r["price"], f"Автопродление тарифа {r['tariff_name']}", now.isoformat(sep=" ")),
+        )
+        conn.commit()
+
+        print(f"[billing] {r['username']}: продлён {r['tariff_name']} до {new_ends}", flush=True)
+
+    conn.close()
+
+
+while True:
+    try:
+        renew_due()
+    except Exception as e:
+        print("[billing] error:", e, flush=True)
+
+    time.sleep(3600)
+BILLING_EOF
+
+echo "=== .env ==="
 if [ ! -f "$BASE/.env" ]; then
     ADMIN_PASSWORD=$(openssl rand -hex 8)
     SECRET_KEY=$(openssl rand -hex 32)
 
-    cat > "$BASE/.env" <<EOF
+    cat > "$BASE/.env" <<ENV_EOF
 SECRET_KEY=$SECRET_KEY
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=$ADMIN_PASSWORD
-EOF
+ENV_EOF
 
     chmod 600 "$BASE/.env"
 
     echo "Admin password: $ADMIN_PASSWORD" > "$BASE/admin_password.txt"
     chmod 600 "$BASE/admin_password.txt"
 else
-    echo ".env уже существует, оставляем старый."
+    echo ".env уже есть, не трогаю."
 fi
 
-echo "=== Создаём виртуальное окружение ==="
-
+echo "=== Виртуальное окружение ==="
 if [ ! -f "$BASE/venv/bin/activate" ]; then
     python3 -m venv "$BASE/venv"
 fi
-
 "$BASE/venv/bin/pip" install --upgrade pip
 "$BASE/venv/bin/pip" install -r "$APP/requirements.txt"
 
-echo "=== Назначаем владельца ==="
+echo "=== Миграция базы ==="
+if [ -f "$APP/cctv.db" ]; then
+    if ! sqlite3 "$APP/cctv.db" "PRAGMA table_info(user);" | grep -q "tariff_id"; then
+        sqlite3 "$APP/cctv.db" "ALTER TABLE user ADD COLUMN tariff_id INTEGER;"
+        sqlite3 "$APP/cctv.db" "ALTER TABLE user ADD COLUMN subscription_ends_at TIMESTAMP;"
+        echo "Миграция: user += tariff_id, subscription_ends_at"
+    fi
+    if ! sqlite3 "$APP/cctv.db" "PRAGMA table_info(camera);" | grep -q "recording_enabled"; then
+        sqlite3 "$APP/cctv.db" "ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 1;"
+        echo "Миграция: camera += recording_enabled"
+    fi
+else
+    echo "База не найдена — будет создана при первом старте."
+fi
 
+echo "=== Владелец файлов ==="
 chown -R cctv:cctv "$BASE"
 
-echo "=== Создаём systemd-сервис для веб-приложения ==="
-
-cat > /etc/systemd/system/cctv-web.service <<'EOF'
+echo "=== systemd: cctv-web ==="
+cat > /etc/systemd/system/cctv-web.service <<'UNIT_WEB_EOF'
 [Unit]
 Description=CCTV Flask web
 After=network.target
@@ -990,17 +1304,16 @@ User=cctv
 Group=cctv
 WorkingDirectory=/opt/cctv/app
 EnvironmentFile=/opt/cctv/.env
-ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8000 app:app
+ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8077 app:app
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT_WEB_EOF
 
-echo "=== Создаём systemd-сервис для записи камер ==="
-
-cat > /etc/systemd/system/cctv-worker.service <<'EOF'
+echo "=== systemd: cctv-worker ==="
+cat > /etc/systemd/system/cctv-worker.service <<'UNIT_WORKER_EOF'
 [Unit]
 Description=CCTV recorder worker
 After=network.target
@@ -1016,11 +1329,29 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT_WORKER_EOF
 
-echo "=== Настраиваем Nginx ==="
+echo "=== systemd: cctv-billing ==="
+cat > /etc/systemd/system/cctv-billing.service <<'UNIT_BILLING_EOF'
+[Unit]
+Description=CCTV billing worker
+After=network.target
 
-cat > /etc/nginx/sites-available/cctv <<'EOF'
+[Service]
+Type=simple
+User=cctv
+Group=cctv
+WorkingDirectory=/opt/cctv/worker
+ExecStart=/opt/cctv/venv/bin/python3 /opt/cctv/worker/billing.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT_BILLING_EOF
+
+echo "=== Nginx ==="
+cat > /etc/nginx/sites-available/cctv <<'NGINX_EOF'
 server {
     listen 80;
     server_name _;
@@ -1031,7 +1362,7 @@ server {
     proxy_send_timeout 300s;
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8077;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -1039,33 +1370,21 @@ server {
         proxy_buffering off;
     }
 }
-EOF
+NGINX_EOF
 
 ln -sf /etc/nginx/sites-available/cctv /etc/nginx/sites-enabled/cctv
 rm -f /etc/nginx/sites-enabled/default
 
-echo "=== Перезапускаем сервисы ==="
+nginx -t
 
+echo "=== Старт сервисов ==="
 systemctl daemon-reload
-
 systemctl enable --now cctv-web.service
 systemctl enable --now cctv-worker.service
-
-systemctl enable nginx
+systemctl enable --now cctv-billing.service
 systemctl restart nginx
 
 echo ""
 echo "=== Готово ==="
-echo ""
-echo "Файл с паролем админа:"
-echo "/opt/cctv/admin_password.txt"
-echo ""
-echo "Посмотреть пароль:"
-echo "sudo cat /opt/cctv/admin_password.txt"
-echo ""
-echo "Открой в браузере:"
-echo "http://IP_СЕРВЕРА/"
-echo ""
-echo "Логи:"
-echo "sudo journalctl -u cctv-web -f"
-echo "sudo journalctl -u cctv-worker -f"
+echo "Пароль админа: sudo cat /opt/cctv/admin_password.txt"
+echo "Логи: journalctl -u cctv-web -f | -u cctv-worker -f | -u cctv-billing -f"
