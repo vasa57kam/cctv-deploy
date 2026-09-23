@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.3"
+VERSION="2.4"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -32,7 +32,7 @@ apt-get install -y python3 python3-venv python3-pip ffmpeg nginx sqlite3 openssl
 
 id -u cctv &>/dev/null || useradd --system --home-dir "$BASE" --shell /usr/sbin/nologin cctv
 
-echo "=== Резервные копии базы и .env ==="
+echo "=== Резервные копии ==="
 if [ -f "$APP/cctv.db" ]; then
     cp -a "$APP/cctv.db" "$BACKUP/cctv-$(date +%Y%m%d-%H%M%S).db"
     ls -1t "$BACKUP"/cctv-*.db 2>/dev/null | tail -n +8 | xargs -r rm -f
@@ -790,7 +790,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.3</span>
+  <span class="badge warn">v2.4</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -947,7 +947,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.3</span></h1>
+<h1>Админка <span class="badge warn">v2.4</span></h1>
 
 <div class="card">
 <h2>Пользователи</h2>
@@ -1113,7 +1113,7 @@ document.getElementById("pass-form").addEventListener("submit", function () {
 {% endblock %}
 ADMIN_EOF
 
-echo "=== worker.py ==="
+echo "=== worker.py (v2.4: перезапуск при смене конфига + логи) ==="
 cat > "$WORKER/worker.py" <<'WORKER_EOF'
 import sqlite3
 import subprocess
@@ -1126,8 +1126,11 @@ BASE_DIR = Path("/opt/cctv")
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 ARCHIVE_DIR = BASE_DIR / "storage" / "archive"
 LIVE_DIR = BASE_DIR / "storage" / "live"
+LOG_DIR = BASE_DIR / "storage" / "logs"
 
 procs = {}
+configs = {}
+log_files = {}
 running = True
 
 
@@ -1147,27 +1150,52 @@ def get_cameras():
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute(
-            "SELECT id, rtsp_url, recording_enabled "
-            "FROM camera WHERE active=1"
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, rtsp_url, recording_enabled FROM camera WHERE active=1"
+        )]
         conn.close()
         return rows
     except sqlite3.Error:
         return []
 
 
+def camera_config(cam):
+    return (cam["rtsp_url"], bool(cam["recording_enabled"]))
+
+
+def stop_camera(camera_id):
+    proc = procs.pop(camera_id, None)
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    lf = log_files.pop(camera_id, None)
+    if lf is not None:
+        try:
+            lf.close()
+        except Exception:
+            pass
+
+
 def start_camera(cam):
     camera_id = cam["id"]
-    rtsp_url = cam["rtsp_url"]
     recording_enabled = bool(cam["recording_enabled"])
 
     archive_dir = ARCHIVE_DIR / f"camera_{camera_id}"
     live_dir = LIVE_DIR / f"camera_{camera_id}"
 
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
     live_dir.mkdir(parents=True, exist_ok=True)
+
+    lf = open(LOG_DIR / f"camera_{camera_id}.log", "ab", buffering=0)
+    log_files[camera_id] = lf
 
     cmd = [
         "ffmpeg",
@@ -1175,7 +1203,7 @@ def start_camera(cam):
         "-hide_banner",
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",
-        "-i", rtsp_url,
+        "-i", cam["rtsp_url"],
     ]
 
     if recording_enabled:
@@ -1201,52 +1229,47 @@ def start_camera(cam):
         str(live_dir / "index.m3u8"),
     ]
 
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
 
 while running:
     cameras = get_cameras()
-    active_camera_ids = set()
+    active_ids = set()
 
     for cam in cameras:
-        camera_id = cam["id"]
-        active_camera_ids.add(camera_id)
+        cid = cam["id"]
+        active_ids.add(cid)
+        cfg = camera_config(cam)
 
-        proc = procs.get(camera_id)
+        proc = procs.get(cid)
+
+        if proc is not None and configs.get(cid) != cfg:
+            stop_camera(cid)
+            proc = None
 
         if proc is None or proc.poll() is not None:
             if proc is not None:
                 proc.wait()
+                lf = log_files.pop(cid, None)
+                if lf is not None:
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
 
-            procs[camera_id] = start_camera(cam)
+            procs[cid] = start_camera(cam)
+            configs[cid] = cfg
 
-    for camera_id in list(procs.keys()):
-        if camera_id not in active_camera_ids:
-            try:
-                procs[camera_id].terminate()
-            except Exception:
-                pass
-
-            del procs[camera_id]
+    for cid in list(procs.keys()):
+        if cid not in active_ids:
+            stop_camera(cid)
+            configs.pop(cid, None)
 
     time.sleep(5)
 
 
-for proc in procs.values():
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-
-for proc in procs.values():
-    try:
-        proc.wait()
-    except Exception:
-        pass
+for cid in list(procs.keys()):
+    stop_camera(cid)
 WORKER_EOF
 
 echo "=== billing.py ==="
@@ -1422,7 +1445,7 @@ if "camera" in tables:
     )
     print("migration: camera_access seeded from old owners")
 
-cur.execute("PRAGMA journal_mode=WAL")
+cur.execute("PRAGMA journal_mode=WAL").fetchall()
 conn.commit()
 conn.close()
 print("migration ok")
@@ -1562,4 +1585,5 @@ if [ -f "$APP/cctv.db" ]; then
     echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM "transaction";')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
+echo "Логи камер:     ls $STORAGE/logs"
 echo "Пароль админа:  sudo cat /opt/cctv/admin_password.txt"
