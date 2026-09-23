@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.1"
+VERSION="2.3"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -106,6 +106,14 @@ login_manager.login_view = "login"
 login_manager.login_message = "Для доступа к этой странице нужно войти."
 
 
+camera_access = db.Table(
+    "camera_access",
+    db.Column("id", db.Integer, primary_key=True),
+    db.Column("camera_id", db.Integer, db.ForeignKey("camera.id"), nullable=False),
+    db.Column("user_id", db.Integer, db.ForeignKey("user.id"), nullable=False),
+)
+
+
 class Tariff(db.Model):
     __tablename__ = "tariff"
 
@@ -133,7 +141,6 @@ class User(UserMixin, db.Model):
     subscription_ends_at = db.Column(db.DateTime, nullable=True)
 
     tariff = db.relationship("Tariff", backref="users")
-    cameras = db.relationship("Camera", backref="owner", lazy=True)
     transactions = db.relationship("Transaction", backref="user", lazy=True)
 
     @property
@@ -147,10 +154,12 @@ class Camera(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
     rtsp_url = db.Column(db.Text, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    user_id = db.Column(db.Integer, nullable=True)
     active = db.Column(db.Boolean, default=True)
-    recording_enabled = db.Column(db.Boolean, default=True)
+    recording_enabled = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    users = db.relationship("User", secondary="camera_access", backref="cameras")
 
 
 class Transaction(db.Model):
@@ -230,7 +239,7 @@ def can_view_camera(camera):
     if not camera.active:
         return False
 
-    if camera.user_id != current_user.id:
+    if current_user not in camera.users:
         return False
 
     if not current_user.is_active:
@@ -253,16 +262,21 @@ def get_camera_or_403(camera_id):
     return camera
 
 
-def user_camera_count(user):
-    return Camera.query.filter_by(user_id=user.id).count()
-
-
 def can_add_camera_to_user(user):
     if user is None:
         return True
     if user.tariff is None:
         return False
-    return user_camera_count(user) < user.tariff.max_cameras
+    return len(user.cameras) < user.tariff.max_cameras
+
+
+def camera_archive_days(camera):
+    values = [
+        u.tariff.archive_days
+        for u in camera.users
+        if u.tariff is not None and u.tariff.archive_days
+    ]
+    return max(values) if values else 7
 
 
 def apply_tariff(user, tariff):
@@ -332,10 +346,7 @@ def dashboard():
     if current_user.admin:
         cameras = Camera.query.order_by(Camera.id.desc()).all()
     else:
-        cameras = Camera.query.filter_by(
-            user_id=current_user.id,
-            active=True,
-        ).order_by(Camera.id.desc()).all()
+        cameras = [c for c in current_user.cameras if c.active]
 
     return render_template(
         "dashboard.html",
@@ -353,11 +364,7 @@ def camera_page(camera_id):
     camera_dir = ARCHIVE_DIR / f"camera_{camera.id}"
 
     if camera_dir.exists():
-        archive_days = 7
-        owner = camera.owner
-        if owner is not None and owner.tariff is not None:
-            archive_days = owner.tariff.archive_days or 7
-
+        archive_days = camera_archive_days(camera)
         cutoff = time.time() - archive_days * 86400
         now_ts = time.time()
 
@@ -490,13 +497,14 @@ def admin_user_delete(user_id):
     for transaction in list(user.transactions):
         db.session.delete(transaction)
 
-    for camera in list(user.cameras):
-        db.session.delete(camera)
+    db.session.execute(
+        camera_access.delete().where(camera_access.c.user_id == user.id)
+    )
 
     db.session.delete(user)
     db.session.commit()
 
-    flash(f"Пользователь {user.username} и его камеры удалены.")
+    flash(f"Пользователь {user.username} удалён. Камеры остались в общем пуле.")
     return redirect(url_for("admin_page"))
 
 
@@ -617,63 +625,73 @@ def admin_tariff_toggle(tariff_id):
 def admin_camera_add():
     name = request.form.get("name", "").strip()
     rtsp_url = request.form.get("rtsp_url", "").strip()
-    user_id = request.form.get("user_id", "").strip()
 
     if not name or not rtsp_url:
         flash("Укажите название камеры и RTSP.")
-        return redirect(url_for("admin_page"))
-
-    user = None
-    if user_id:
-        try:
-            user = db.session.get(User, int(user_id))
-        except ValueError:
-            user = None
-
-    if user is not None and not can_add_camera_to_user(user):
-        flash("У пользователя лимит камер по тарифу или нет тарифа.")
         return redirect(url_for("admin_page"))
 
     camera = Camera(
         name=name,
         rtsp_url=rtsp_url,
         active=True,
-        recording_enabled=True,
+        recording_enabled=False,
     )
-
-    if user is not None:
-        camera.user_id = user.id
 
     db.session.add(camera)
     db.session.commit()
 
-    flash(f"Камера {name} добавлена.")
+    flash(f"Камера {name} добавлена в пул. Запись выключена, включи кнопкой.")
     return redirect(url_for("admin_page"))
 
 
-@app.route("/admin/camera/<int:camera_id>/assign", methods=["POST"])
+@app.route("/admin/camera/<int:camera_id>/grant", methods=["POST"])
 @admin_required
-def admin_camera_assign(camera_id):
+def admin_camera_grant(camera_id):
     camera = get_or_404(Camera, camera_id)
-    user_id = request.form.get("user_id", "").strip()
 
-    if user_id:
-        try:
-            user = db.session.get(User, int(user_id))
-        except ValueError:
-            user = None
+    try:
+        user_id = int(request.form.get("user_id", ""))
+    except ValueError:
+        flash("Не выбран пользователь.")
+        return redirect(url_for("admin_page"))
 
-        if user is not None and not can_add_camera_to_user(user):
-            flash("У этого пользователя лимит камер по тарифу или нет тарифа.")
-            return redirect(url_for("admin_page"))
+    user = get_or_404(User, user_id)
 
-        camera.user_id = user.id if user is not None else None
-    else:
-        camera.user_id = None
+    if camera in user.cameras:
+        flash("Доступ уже выдан.")
+        return redirect(url_for("admin_page"))
 
+    if not can_add_camera_to_user(user):
+        flash(f"У {user.username} лимит камер по тарифу или нет тарифа.")
+        return redirect(url_for("admin_page"))
+
+    user.cameras.append(camera)
     db.session.commit()
 
-    flash("Камера назначена.")
+    flash(f"Доступ к {camera.name} выдан пользователю {user.username}.")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/camera/<int:camera_id>/revoke", methods=["POST"])
+@admin_required
+def admin_camera_revoke(camera_id):
+    camera = get_or_404(Camera, camera_id)
+
+    try:
+        user_id = int(request.form.get("user_id", ""))
+    except ValueError:
+        flash("Не выбран пользователь.")
+        return redirect(url_for("admin_page"))
+
+    user = get_or_404(User, user_id)
+
+    if camera in user.cameras:
+        user.cameras.remove(camera)
+        db.session.commit()
+        flash(f"Доступ к {camera.name} отозван у {user.username}.")
+    else:
+        flash("У этого пользователя не было доступа.")
+
     return redirect(url_for("admin_page"))
 
 
@@ -700,7 +718,7 @@ def admin_camera_recording(camera_id):
     db.session.commit()
 
     if camera.recording_enabled:
-        flash(f"Камера {camera.name}: запись включена.")
+        flash(f"Камера {camera.name}: запись ВКЛЮЧЕНА.")
     else:
         flash(f"Камера {camera.name}: запись выключена.")
 
@@ -712,10 +730,14 @@ def admin_camera_recording(camera_id):
 def admin_camera_delete(camera_id):
     camera = get_or_404(Camera, camera_id)
     name = camera.name
+
+    db.session.execute(
+        camera_access.delete().where(camera_access.c.camera_id == camera.id)
+    )
     db.session.delete(camera)
     db.session.commit()
 
-    flash(f"Камера {name} удалена. Файлы архива останутся на диске.")
+    flash(f"Камера {name} удалена из пула. Файлы архива останутся на диске.")
     return redirect(url_for("admin_page"))
 
 
@@ -768,7 +790,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.1</span>
+  <span class="badge warn">v2.3</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -925,7 +947,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.1</span></h1>
+<h1>Админка <span class="badge warn">v2.3</span></h1>
 
 <div class="card">
 <h2>Пользователи</h2>
@@ -944,7 +966,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
     <button class="btn gray" type="submit">{{ "Блок" if u.active else "Разблок" }}</button>
   </form>
   {% if not u.admin %}
-  <form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }} вместе с его камерами?');">
+  <form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }}? Камеры останутся в пуле.');">
     <button class="btn red" type="submit">Удалить</button>
   </form>
   {% endif %}
@@ -985,44 +1007,51 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 </div>
 
 <div class="card">
-<h2>Камеры</h2>
+<h2>Камеры (общий пул)</h2>
 <table>
-<tr><th>ID</th><th>Название</th><th>RTSP</th><th>Владелец</th><th>Статус</th><th>Назначить</th><th>Действия</th></tr>
+<tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
 {% for cam in cameras %}
 <tr>
 <td>{{ cam.id }}</td>
-<td>{{ cam.name }}</td>
-<td class="muted">{{ cam.rtsp_url }}</td>
-<td>{{ cam.owner.username if cam.owner else "—" }}</td>
+<td>{{ cam.name }}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
 <td>
 {% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
 {% if cam.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}
 </td>
 <td>
-<form method="post" action="{{ url_for('admin_camera_assign', camera_id=cam.id) }}">
-<select name="user_id">
-<option value="">— нет —</option>
-{% for u in users %}<option value="{{ u.id }}" {% if cam.user_id == u.id %}selected{% endif %}>{{ u.username }}</option>{% endfor %}
-</select>
-<button class="btn gray" type="submit">Назначить</button>
+{% for u in cam.users %}
+  <span class="badge ok">{{ u.username }}</span>
+  <form method="post" action="{{ url_for('admin_camera_revoke', camera_id=cam.id) }}" style="display:inline">
+    <input type="hidden" name="user_id" value="{{ u.id }}">
+    <button class="btn gray" type="submit">отозвать</button>
+  </form>
+  <br>
+{% else %}
+  <span class="muted">никому</span>
+{% endfor %}
+</td>
+<td>
+<form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow">
+<select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<button class="btn gray" type="submit">Выдать</button>
 </form>
 </td>
 <td>
+<form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
 <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Стоп запись" if cam.recording_enabled else "Старт запись" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }}?');"><button class="btn red" type="submit">Удалить</button></form>
+<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red" type="submit">Удалить</button></form>
 </td>
 </tr>
 {% endfor %}
 </table>
 
-<h2>Добавить камеру</h2>
+<h2>Добавить камеру в пул</h2>
 <form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow">
 <input name="name" placeholder="Название" required>
 <input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1">
-<select name="user_id"><option value="">— нет —</option>{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
 <button class="btn" type="submit">Добавить</button>
 </form>
+<p class="muted">Камера появится в пуле с выключенной записью. Запись включается кнопкой «Вкл запись».</p>
 </div>
 
 <div class="card">
@@ -1279,7 +1308,7 @@ def renew_due():
             (r["price"], new_ends.isoformat(sep=" "), r["tariff_id"], r["user_id"]),
         )
         conn.execute(
-            "INSERT INTO transaction (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)",
+            'INSERT INTO "transaction" (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)',
             (r["user_id"], -r["price"], f"Автопродление тарифа {r['tariff_name']}", now.isoformat(sep=" ")),
         )
         conn.commit()
@@ -1352,6 +1381,16 @@ cur.execute(
     """
 )
 
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS camera_access (
+        id INTEGER PRIMARY KEY,
+        camera_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL
+    )
+    """
+)
+
 def cols(table):
     return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -1367,8 +1406,21 @@ if "user" in tables:
 if "camera" in tables:
     c = cols("camera")
     if "recording_enabled" not in c:
-        cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 1")
+        cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 0")
         print("migration: camera += recording_enabled")
+
+    cur.execute(
+        """
+        INSERT INTO camera_access (camera_id, user_id)
+        SELECT id, user_id FROM camera
+        WHERE user_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM camera_access ca
+              WHERE ca.camera_id = camera.id AND ca.user_id = camera.user_id
+          )
+        """
+    )
+    print("migration: camera_access seeded from old owners")
 
 cur.execute("PRAGMA journal_mode=WAL")
 conn.commit()
@@ -1506,7 +1558,8 @@ echo "Версия системы: $(cat "$BASE/VERSION")"
 if [ -f "$APP/cctv.db" ]; then
     echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
     echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
-    echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM transaction;')"
+    echo "Доступов:      $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera_access;')"
+    echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM "transaction";')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
 echo "Пароль админа:  sudo cat /opt/cctv/admin_password.txt"
