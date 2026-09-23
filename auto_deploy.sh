@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.0"
+VERSION="2.1"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -43,7 +43,7 @@ if [ -f "$BASE/.env" ]; then
     ls -1t "$BACKUP"/env-* 2>/dev/null | tail -n +8 | xargs -r rm -f
 fi
 
-echo "=== requirements.txt (версии зафиксированы) ==="
+echo "=== requirements.txt ==="
 cat > "$APP/requirements.txt" <<'REQ_EOF'
 Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
@@ -197,6 +197,13 @@ def init_db():
 
 with app.app_context():
     init_db()
+
+
+def get_or_404(model, ident):
+    obj = db.session.get(model, ident)
+    if obj is None:
+        abort(404)
+    return obj
 
 
 def admin_required(f):
@@ -459,7 +466,7 @@ def admin_user_add():
 @app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
 @admin_required
 def admin_user_toggle(user_id):
-    user = db.session.get_or_404(User, user_id)
+    user = get_or_404(User, user_id)
     user.active = not user.active
     db.session.commit()
 
@@ -474,7 +481,7 @@ def admin_user_toggle(user_id):
 @app.route("/admin/user/<int:user_id>/delete", methods=["POST"])
 @admin_required
 def admin_user_delete(user_id):
-    user = db.session.get_or_404(User, user_id)
+    user = get_or_404(User, user_id)
 
     if user.id == current_user.id:
         flash("Нельзя удалить самого себя.")
@@ -493,6 +500,23 @@ def admin_user_delete(user_id):
     return redirect(url_for("admin_page"))
 
 
+@app.route("/admin/user/<int:user_id>/password", methods=["POST"])
+@admin_required
+def admin_user_password(user_id):
+    user = get_or_404(User, user_id)
+    password = request.form.get("password", "").strip()
+
+    if len(password) < 4:
+        flash("Пароль должен быть не короче 4 символов.")
+        return redirect(url_for("admin_page"))
+
+    user.password_hash = generate_password_hash(password)
+    db.session.commit()
+
+    flash(f"Пароль пользователя {user.username} изменён.")
+    return redirect(url_for("admin_page"))
+
+
 @app.route("/admin/user/topup", methods=["POST"])
 @admin_required
 def admin_topup():
@@ -507,7 +531,7 @@ def admin_topup():
         flash("Некорректные данные.")
         return redirect(url_for("admin_page"))
 
-    user = db.session.get_or_404(User, user_id)
+    user = get_or_404(User, user_id)
 
     user.balance += amount
 
@@ -527,7 +551,7 @@ def admin_topup():
 @app.route("/admin/user/<int:user_id>/tariff", methods=["POST"])
 @admin_required
 def admin_user_tariff(user_id):
-    user = db.session.get_or_404(User, user_id)
+    user = get_or_404(User, user_id)
     tariff_id = request.form.get("tariff_id", "")
 
     try:
@@ -536,7 +560,7 @@ def admin_user_tariff(user_id):
         flash("Не выбран тариф.")
         return redirect(url_for("admin_page"))
 
-    tariff = db.session.get_or_404(Tariff, tariff_id)
+    tariff = get_or_404(Tariff, tariff_id)
 
     ok, message = apply_tariff(user, tariff)
     flash(message)
@@ -581,7 +605,7 @@ def admin_tariff_add():
 @app.route("/admin/tariff/<int:tariff_id>/toggle", methods=["POST"])
 @admin_required
 def admin_tariff_toggle(tariff_id):
-    tariff = db.session.get_or_404(Tariff, tariff_id)
+    tariff = get_or_404(Tariff, tariff_id)
     tariff.is_active = not tariff.is_active
     db.session.commit()
     flash(f"Тариф {tariff.name}: {'включён' if tariff.is_active else 'выключен'}.")
@@ -630,7 +654,7 @@ def admin_camera_add():
 @app.route("/admin/camera/<int:camera_id>/assign", methods=["POST"])
 @admin_required
 def admin_camera_assign(camera_id):
-    camera = db.session.get_or_404(Camera, camera_id)
+    camera = get_or_404(Camera, camera_id)
     user_id = request.form.get("user_id", "").strip()
 
     if user_id:
@@ -656,7 +680,7 @@ def admin_camera_assign(camera_id):
 @app.route("/admin/camera/<int:camera_id>/toggle", methods=["POST"])
 @admin_required
 def admin_camera_toggle(camera_id):
-    camera = db.session.get_or_404(Camera, camera_id)
+    camera = get_or_404(Camera, camera_id)
     camera.active = not camera.active
     db.session.commit()
 
@@ -671,7 +695,7 @@ def admin_camera_toggle(camera_id):
 @app.route("/admin/camera/<int:camera_id>/recording", methods=["POST"])
 @admin_required
 def admin_camera_recording(camera_id):
-    camera = db.session.get_or_404(Camera, camera_id)
+    camera = get_or_404(Camera, camera_id)
     camera.recording_enabled = not camera.recording_enabled
     db.session.commit()
 
@@ -686,7 +710,7 @@ def admin_camera_recording(camera_id):
 @app.route("/admin/camera/<int:camera_id>/delete", methods=["POST"])
 @admin_required
 def admin_camera_delete(camera_id):
-    camera = db.session.get_or_404(Camera, camera_id)
+    camera = get_or_404(Camera, camera_id)
     name = camera.name
     db.session.delete(camera)
     db.session.commit()
@@ -744,7 +768,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.0</span>
+  <span class="badge warn">v2.1</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -901,7 +925,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.0</span></h1>
+<h1>Админка <span class="badge warn">v2.1</span></h1>
 
 <div class="card">
 <h2>Пользователи</h2>
@@ -934,6 +958,13 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <input name="username" placeholder="Логин" required>
 <input name="password" type="password" placeholder="Пароль" required>
 <button class="btn" type="submit">Создать</button>
+</form>
+
+<h2>Сменить пароль пользователю (включая себя)</h2>
+<form method="post" id="pass-form" class="formrow">
+<select name="user_id" id="pass-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<input type="password" name="password" placeholder="Новый пароль" required>
+<button class="btn" type="submit">Сменить пароль</button>
 </form>
 
 <h2>Баланс</h2>
@@ -1044,6 +1075,10 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 document.getElementById("tariff-form").addEventListener("submit", function () {
     var uid = document.getElementById("tariff-user").value;
     this.action = "/admin/user/" + uid + "/tariff";
+});
+document.getElementById("pass-form").addEventListener("submit", function () {
+    var uid = document.getElementById("pass-user").value;
+    this.action = "/admin/user/" + uid + "/password";
 });
 </script>
 {% endblock %}
@@ -1279,7 +1314,7 @@ ENV_EOF
     echo "Admin password: $ADMIN_PASSWORD" > "$BASE/admin_password.txt"
     chmod 600 "$BASE/admin_password.txt"
 else
-    echo ".env существует — оставляем прежним (пароль админа не изменится)."
+    echo ".env существует — оставляем прежним."
 fi
 
 echo "=== Виртуальное окружение ==="
@@ -1443,17 +1478,23 @@ systemctl enable --now cctv-worker.service
 systemctl enable --now cctv-billing.service
 systemctl restart nginx
 
-echo "=== Самопроверка ==="
+echo "=== Самопроверка С ВХОДОМ ПОД АДМИНОМ ==="
 sleep 3
 
-LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/login || true)
-ROUTE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8077/admin/camera/1/delete || true)
+set +e
+source "$BASE/.env"
+LOGIN_CODE=$(curl -s -c /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" --data "username=$ADMIN_USERNAME&password=$ADMIN_PASSWORD" http://127.0.0.1:8077/login)
+ADMIN_CODE=$(curl -s -b /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/admin)
+DASH_CODE=$(curl -s -b /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/)
+rm -f /tmp/cctv_check_cj
+set -e
 
-echo "login page: HTTP $LOGIN_CODE (ожидаем 200)"
-echo "post-маршрут админки: HTTP $ROUTE_CODE (ожидаем 302 = маршрут есть, редирект на логин)"
+echo "login POST:  $LOGIN_CODE (ожидаем 302)"
+echo "admin GET:   $ADMIN_CODE (ожидаем 200)"
+echo "dashboard:   $DASH_CODE (ожидаем 200)"
 
-if [ "$LOGIN_CODE" != "200" ] || [ "$ROUTE_CODE" = "404" ]; then
-    echo "!!! САМОПРОВЕРКА НЕ ПРОШЛА, последние логи:"
+if [ "$ADMIN_CODE" != "200" ] || [ "$DASH_CODE" != "200" ]; then
+    echo "!!! САМОПРОВЕРКА НЕ ПРОШЛА, логи:"
     journalctl -u cctv-web -n 30 --no-pager || true
     exit 1
 fi
@@ -1463,10 +1504,9 @@ echo "=== Готово ==="
 echo "Версия системы: $(cat "$BASE/VERSION")"
 
 if [ -f "$APP/cctv.db" ]; then
-    echo "Пользователей в базе: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
-    echo "Камер в базе:          $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
-    echo "Транзакций в базе:     $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM transaction;')"
+    echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
+    echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
+    echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM transaction;')"
 fi
-echo "Архив на диске:        $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
-echo "Бэкапы базы:           $BACKUP"
-echo "Пароль админа:         sudo cat /opt/cctv/admin_password.txt"
+echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
+echo "Пароль админа:  sudo cat /opt/cctv/admin_password.txt"
