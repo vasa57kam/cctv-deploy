@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.6"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.7"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
-mkdir -p "$APP/templates" "$WORKER" "$STORAGE/live" "$STORAGE/archive" "$STORAGE/logs" "$STORAGE/imports" "$STORAGE/previews" "$BACKUP"
+mkdir -p "$APP/templates" "$WORKER" "$STORAGE/live" "$STORAGE/archive" "$STORAGE/logs" "$STORAGE/previews" "$BACKUP"
 export DEBIAN_FRONTEND=noninteractive
 echo "=== Пакеты ==="
 apt-get update || echo "WARNING: apt update с ошибками, продолжаю"
@@ -19,6 +19,7 @@ Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
 Flask-Login==0.6.3
 gunicorn==22.0.0
+playwright==1.44.0
 REQ_EOF
 echo "=== app.py ==="
 cat > "$APP/app.py" <<'APP_EOF'
@@ -35,11 +36,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = Path("/opt/cctv"); STORAGE_DIR = BASE_DIR / "storage"
 LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
-IMPORT_DIR = STORAGE_DIR / "imports"; PREVIEW_DIR = STORAGE_DIR / "previews"
+PREVIEW_DIR = STORAGE_DIR / "previews"
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True); LIVE_DIR.mkdir(parents=True, exist_ok=True)
-ARCHIVE_DIR.mkdir(parents=True, exist_ok=True); IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+ARCHIVE_DIR.mkdir(parents=True, exist_ok=True); PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
@@ -251,7 +251,64 @@ def extract_candidates(html, base_url):
     for m in re.findall(r'["\'](/[^\s"\'<>\\]*\.m3u8[^\s"\'<>\\]*)["\']', html):
         u = urllib.parse.urljoin(base_url, m.replace("&amp;", "&"))
         if u not in found: found.append(u)
-    return found[:12]
+    for m in re.findall(r'https?://[^\s"\'<>\\]+/recording_status\.json[^\s"\'<>\\]*', html):
+        alt = m.replace("recording_status.json", "index.m3u8").replace("&amp;", "&")
+        if alt not in found: found.append(alt)
+    return found
+
+def browser_discover(url, cookie):
+    from playwright.sync_api import sync_playwright
+    cands = []
+    def add(u):
+        u = u.replace("&amp;", "&")
+        if u not in cands: cands.append(u)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            ignore_https_errors=True,
+        )
+        if cookie:
+            dom = urllib.parse.urlparse(url).hostname or ""
+            cookies = []
+            for part in cookie.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    cookies.append({"name": k, "value": v, "domain": dom, "path": "/"})
+            try: ctx.add_cookies(cookies)
+            except Exception: pass
+        page = ctx.new_page()
+        def on_request(req):
+            u = req.url
+            if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u):
+                add(u)
+        def on_response(resp):
+            try:
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct or "javascript" in ct:
+                    body = resp.text()
+                    for m in re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', body): add(m)
+                    for m in re.findall(r'https?://[^\s"\'\\]+/recording_status\.json[^\s"\'\\]*', body):
+                        add(m.replace("recording_status.json", "index.m3u8"))
+                    for m in re.findall(r'rtsp://[^\s"\'\\]+', body): add(m)
+            except Exception:
+                pass
+        page.on("request", on_request)
+        page.on("response", on_response)
+        try:
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(8000)
+        except Exception:
+            pass
+        browser.close()
+    return cands
 
 def probe_stream(url, idx):
     out = PREVIEW_DIR / f"cand_{idx}.jpg"
@@ -530,19 +587,9 @@ def admin_page():
         .order_by(PaymentRequest.id.desc()).limit(50).all()]
     debts = [{"d": d, "overdue": d.due_at < datetime.utcnow()} for d in PromisedDebt.query.filter_by(status="active").order_by(PromisedDebt.due_at).all()]
     settings = {k: get_setting(k) for k in DEFAULT_SETTINGS}
-    imports = sorted(IMPORT_DIR.glob("import_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
-    import_items = []
-    for lg in imports:
-        tail = ""
-        try:
-            with open(lg, "rb") as fh:
-                tail = fh.read()[-300:].decode("utf-8", "ignore")
-        except Exception:
-            pass
-        import_items.append({"name": lg.name, "tail": tail, "age": int(time.time() - lg.stat().st_mtime)})
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
-        settings=settings, methods=PAY_METHODS, import_items=import_items)
+        settings=settings, methods=PAY_METHODS)
 
 @app.route("/admin/discover", methods=["POST"])
 @admin_required
@@ -553,12 +600,18 @@ def admin_discover():
         flash("Укажите адрес страницы с плеером.")
         return admin_redirect("#discover")
     error = ""
-    html = ""
+    cands = []
     try:
-        html = fetch_page(base_url, cookie)
+        cands = browser_discover(base_url, cookie)
     except Exception as e:
-        error = f"Не удалось загрузить страницу: {e}"
-    cands = extract_candidates(html, base_url) if html else []
+        error = f"Браузерный парсер недоступен ({e}). Пробую простой разбор HTML."
+    if not cands:
+        try:
+            html = fetch_page(base_url, cookie)
+            cands = extract_candidates(html, base_url)
+        except Exception as e:
+            error = (error + " " if error else "") + f"Не удалось загрузить страницу: {e}"
+    cands = cands[:12]
     items = []
     for i, u in enumerate(cands, 1):
         items.append({"idx": i, "url": u, "ok": probe_stream(u, i)})
@@ -595,40 +648,6 @@ def admin_impersonate(user_id):
     login_user(user)
     flash(f"Вы вошли как {user.username}. Нажмите «Вернуться в админку» в шапке, когда закончите.")
     return redirect(url_for("dashboard"))
-
-@app.route("/admin/camera/<int:camera_id>/import", methods=["POST"])
-@admin_required
-def admin_import_archive(camera_id):
-    camera = get_or_404(Camera, camera_id)
-    url = request.form.get("url", "").strip() or camera.rtsp_url
-    date_s = request.form.get("date", "").strip()
-    time_s = request.form.get("time", "").strip() or "00:00"
-    try: minutes = max(1, int(request.form.get("minutes", "60")))
-    except ValueError: minutes = 60
-    as_is = request.form.get("as_is") == "1"
-    if not url or not date_s:
-        flash("Укажите URL источника и дату.")
-        return admin_redirect("#import")
-    try:
-        dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        flash("Неверная дата или время (нужно ГГГГ-ММ-ДД и ЧЧ:ММ).")
-        return admin_redirect("#import")
-    epoch = int(dt.timestamp())
-    final_url = url
-    if not as_is:
-        sep = "&" if ("?" in url) else "?"
-        final_url = f"{url}{sep}utcstart={epoch}&utclen={minutes * 60}"
-    out_dir = ARCHIVE_DIR / f"camera_{camera.id}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"import_{date_s}_{time_s.replace(':', '')}_{minutes}m.mp4"
-    log = IMPORT_DIR / f"import_{camera.id}_{epoch}.log"
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-i", final_url,
-           "-c", "copy", "-movflags", "+faststart", str(out)]
-    with open(log, "ab") as lf:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf, start_new_session=True)
-    flash(f"Импорт запущен: {date_s} {time_s}, {minutes} мин. Файл появится в архиве после завершения; лог: {log.name}")
-    return admin_redirect("#import")
 
 @app.route("/admin/settings", methods=["POST"])
 @admin_required
@@ -950,7 +969,7 @@ pre.log{background:#0b1229;border:1px solid #33415c;border-radius:8px;padding:8p
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.6</span>
+  <span class="badge warn">v3.7</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
@@ -1148,7 +1167,7 @@ echo "=== discover.html ==="
 cat > "$APP/templates/discover.html" <<'DISCOVER_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Поиск потоков: {{ base_url }}</h1>
+<h1>Найденные потоки: {{ base_url }}</h1>
 {% if error %}<p class="muted">{{ error }}</p>{% endif %}
 {% if items %}
 <div class="grid">
@@ -1157,7 +1176,7 @@ cat > "$APP/templates/discover.html" <<'DISCOVER_EOF'
     {% if it.ok %}
       <img src="{{ url_for('discover_preview', filename='cand_%d.jpg' % it.idx) }}" style="width:100%;border-radius:8px;">
     {% else %}
-      <p class="muted">Превью нет: поток недоступен с сервера или требует авторизацию</p>
+      <p class="muted">Превью нет: поток не открылся с сервера (токен/сеть/кодек)</p>
     {% endif %}
     <p class="muted" style="word-break:break-all;">{{ it.url }}</p>
     <form method="post" action="{{ url_for('admin_discover_attach') }}" class="formrow">
@@ -1170,8 +1189,9 @@ cat > "$APP/templates/discover.html" <<'DISCOVER_EOF'
   {% endfor %}
 </div>
 {% else %}
-<p class="muted">В коде страницы не найдено ссылок на потоки (m3u8/rtsp). Такое бывает, если плеер получает их через XHR/API
-или нужен Cookie. Скопируй URL потока вручную (DevTools → Network → фильтр m3u8) и подключи ниже.</p>
+<p class="muted">Потоки не найдены. Такое бывает, если плеер стартует только по клику «play» или страница требует логин.
+Попробуй: 1) вставить Cookie из браузера; 2) открыть на их сайте конкретную камеру и взять адрес этой страницы;
+3) подключить поток вручную ниже (DevTools → Network → фильтр m3u8).</p>
 {% endif %}
 <div class="card">
   <h2>Подключить поток вручную</h2>
@@ -1250,17 +1270,18 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.6</span></h1>
+<h1>Админка <span class="badge warn">v3.7</span></h1>
 
 <details class="card" id="discover">
-<summary>Поиск потоков на сайте (Flussonic / онлайн-камеры)</summary>
-<p class="muted">Укажи адрес страницы с плеером (например, https://moidom.ots-net.ru/service). Сервер загрузит страницу,
-найдёт ссылки потоков (m3u8/rtsp), проверит каждый и покажет превью кадра. Если сайт под логином — вставь Cookie из своего браузера.
-Поиск может занять до пары минут: каждый поток проверяется отдельно.</p>
+<summary>Парсер потоков с чужого сайта</summary>
+<p class="muted">Вставь адрес страницы, где крутится видео их камер. Сервер откроет её невидимым браузером,
+перехватит всё, что запрашивает их плеер (m3u8 / rtsp / mpd / ссылки из JSON API), проверит каждый поток
+и покажет превью кадра. Останется выбрать имя и нажать «Подключить». Если сайт под логином — вставь Cookie.
+Поиск занимает до ~1 минуты.</p>
 <form method="post" action="{{ url_for('admin_discover') }}" class="formrow">
-  <input name="base_url" placeholder="https://сайт/страница-с-плеером" style="flex:1" required>
-  <input name="cookie" placeholder="Cookie: (необязательно)" style="flex:1">
-  <button class="btn" type="submit">Найти потоки</button>
+  <input name="base_url" placeholder="https://сайт/страница-с-камерами" style="flex:1" required>
+  <input name="cookie" placeholder="Cookie: name=value; … (необязательно)" style="flex:1">
+  <button class="btn" type="submit">Найти и показать потоки</button>
 </form>
 </details>
 
@@ -1278,34 +1299,6 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% for item in processed_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td>
 <td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
 <td><form method="post" action="{{ url_for('admin_payment_hide', pr_id=item.p.id) }}" style="display:inline"><button class="btn gray mini" type="submit">Скрыть</button></form></td></tr>{% endfor %}</table>
-{% endif %}
-</details>
-
-<details class="card" id="import">
-<summary>Импорт архива с внешнего источника (Flussonic / HLS)</summary>
-<p class="muted">Выбери камеру-приёмник, вставь URL плейлиста источника, укажи дату/время начала и длительность.
-Сервер добавит параметры utcstart/utclen (формат Flussonic) и скачает кусок в архив камеры. Если URL уже с параметрами — отметь «URL как есть».</p>
-<form method="post" id="import-form" class="formrow">
-  <select name="camera_id" id="import-camera">{% for cam in cameras %}<option value="{{ cam.id }}">{{ cam.name }}</option>{% endfor %}</select>
-  <input name="url" placeholder="URL источника (если пусто — возьмётся URL камеры)" style="flex:1">
-  <input type="date" name="date" required>
-  <input type="time" name="time" value="00:00">
-  <input name="minutes" value="60" placeholder="Минут" style="width:90px;">
-  <label class="muted"><input type="checkbox" name="as_is" value="1"> URL как есть</label>
-  <button class="btn" type="submit">Запустить импорт</button>
-</form>
-<script>
-document.getElementById("import-form").addEventListener("submit", function () {
-  this.action = "/admin/camera/" + document.getElementById("import-camera").value + "/import";
-});
-</script>
-{% if import_items %}
-<h2>Последние импорты (логи)</h2>
-<table><tr><th>Лог</th><th>Свежесть</th><th>Хвост лога</th></tr>
-{% for item in import_items %}
-<tr><td>{{ item.name }}</td><td>{{ item.age }} с назад</td><td><pre class="log">{{ item.tail }}</pre></td></tr>
-{% endfor %}
-</table>
 {% endif %}
 </details>
 
@@ -1596,6 +1589,8 @@ echo "=== Виртуальное окружение ==="
 if [ ! -f "$BASE/venv/bin/activate" ]; then python3 -m venv "$BASE/venv"; fi
 "$BASE/venv/bin/pip" install --upgrade pip
 "$BASE/venv/bin/pip" install -r "$APP/requirements.txt"
+echo "=== Headless-браузер для парсера (первый раз долго, ~1-2 мин) ==="
+"$BASE/venv/bin/python" -m playwright install --with-deps chromium 2>/dev/null || "$BASE/venv/bin/python" -m playwright install chromium || echo "WARNING: chromium не установился, парсер будет работать в резервном режиме (разбор HTML)"
 echo "=== Миграция базы (идемпотентная) ==="
 if [ -f "$APP/cctv.db" ]; then
     python3 - "$APP/cctv.db" <<'PYMIG'
