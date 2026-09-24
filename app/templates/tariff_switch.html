@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Внимание: смена тарифа</h1>
+  <p>Вы переходите на тариф <b>{{ tariff.name }}</b>. Он разрешает не более <b>{{ tariff.max_cameras }}</b> активных камер(ы).
+     Сейчас у вас активных камер: <b>{{ enabled_items|length }}</b>.</p>
+  <p>Выберите, какие камеры останутся рабочими. Остальные не удалятся — они станут «недоступны по тарифу»,
+     и вы сможете включить их позже, если освободите слот или вернётесь на тариф выше.</p>
+  <form method="post" action="{{ url_for('tariff_switch_apply', tariff_id=tariff.id) }}">
+    <table>
+      <tr><th></th><th>Камера</th></tr>
+      {% for cam in enabled_items %}
+      <tr><td><input type="checkbox" name="camera_id" value="{{ cam.id }}" checked></td><td>{{ cam.name }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted">Отметьте не более {{ tariff.max_cameras }}. Цена спишется сразу.</p>
+    <button class="btn" type="submit">Переключить тариф</button>
+    <a class="btn gray" href="{{ url_for('dashboard') }}#tariffs">Отмена</a>
+  </form>
+</div>
+{% endblock %}
