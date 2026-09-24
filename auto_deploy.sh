@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.6"
+VERSION="2.7"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -115,6 +115,22 @@ PAY_METHODS = [
 ]
 
 
+DEFAULT_SETTINGS = {
+    "method_cash": "1",
+    "method_transfer": "1",
+    "method_card": "0",
+    "method_promised": "1",
+    "method_other": "0",
+    "transfer_instruction": (
+        "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). "
+        "В комментарии к заявке укажите дату перевода и последние 4 цифры карты."
+    ),
+    "promised_amount": "300",
+    "promised_repay_seconds": "604800",
+    "promised_fee_percent": "10",
+}
+
+
 def method_label(code):
     return dict(PAY_METHODS).get(code, code)
 
@@ -125,6 +141,13 @@ camera_access = db.Table(
     db.Column("camera_id", db.Integer, db.ForeignKey("camera.id"), nullable=False),
     db.Column("user_id", db.Integer, db.ForeignKey("user.id"), nullable=False),
 )
+
+
+class Setting(db.Model):
+    __tablename__ = "setting"
+
+    key = db.Column(db.String(80), primary_key=True)
+    value = db.Column(db.Text)
 
 
 class Tariff(db.Model):
@@ -202,9 +225,50 @@ class PaymentRequest(db.Model):
     user = db.relationship("User", backref="payment_requests")
 
 
+class PromisedDebt(db.Model):
+    __tablename__ = "promised_debt"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    principal = db.Column(db.Float, nullable=False)
+    repay_amount = db.Column(db.Float, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    due_at = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(10), default="active")
+    repaid_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship("User", backref="promised_debts")
+
+
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
+
+
+def get_setting(key, default=None):
+    row = db.session.get(Setting, key)
+    if row is None:
+        return DEFAULT_SETTINGS.get(key, default)
+    return row.value
+
+
+def set_setting(key, value):
+    row = db.session.get(Setting, key)
+    if row is None:
+        row = Setting(key=key, value=value)
+        db.session.add(row)
+    else:
+        row.value = value
+
+
+def available_methods():
+    result = []
+    for code, label in PAY_METHODS:
+        if code == "promised":
+            continue
+        if get_setting(f"method_{code}", "0") == "1":
+            result.append((code, label))
+    return result
 
 
 def init_db():
@@ -406,13 +470,37 @@ def dashboard():
         .limit(10).all()
     ]
 
+    methods = available_methods()
+    transfer_instruction = ""
+    if any(code == "transfer" for code, _ in methods):
+        transfer_instruction = get_setting("transfer_instruction", "") or ""
+
+    promised_enabled = get_setting("method_promised", "0") == "1"
+    try:
+        promised_amount = float(get_setting("promised_amount", "300") or 0)
+        promised_fee = float(get_setting("promised_fee_percent", "0") or 0)
+        promised_repay_seconds = int(get_setting("promised_repay_seconds", "604800") or 0)
+    except ValueError:
+        promised_amount, promised_fee, promised_repay_seconds = 300.0, 0.0, 604800
+
+    active_debt = PromisedDebt.query.filter_by(
+        user_id=current_user.id, status="active"
+    ).first()
+
     return render_template(
         "dashboard.html",
         cameras=cameras,
         sub_active=subscription_active(current_user),
         tariff_options=tariff_options,
         my_requests=my_requests,
-        methods=PAY_METHODS,
+        methods=methods,
+        transfer_instruction=transfer_instruction,
+        promised_enabled=promised_enabled,
+        promised_amount=promised_amount,
+        promised_fee=promised_fee,
+        promised_repay_seconds=promised_repay_seconds,
+        promised_repay_label=interval_label(promised_repay_seconds),
+        active_debt=active_debt,
     )
 
 
@@ -430,8 +518,9 @@ def payment_request():
         return redirect(url_for("dashboard"))
 
     method = request.form.get("method", "other")
-    if method not in dict(PAY_METHODS):
-        method = "other"
+    if method not in [code for code, _ in available_methods()]:
+        flash("Способ пополнения недоступен.")
+        return redirect(url_for("dashboard"))
 
     comment = request.form.get("comment", "").strip()
 
@@ -448,6 +537,56 @@ def payment_request():
     db.session.commit()
 
     flash("Заявка создана. Администратор подтвердит пополнение.")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/promised/connect", methods=["POST"])
+@login_required
+def promised_connect():
+    if get_setting("method_promised", "0") != "1":
+        flash("Обещанный платёж отключён администратором.")
+        return redirect(url_for("dashboard"))
+
+    active = PromisedDebt.query.filter_by(
+        user_id=current_user.id, status="active"
+    ).first()
+    if active:
+        flash("У вас уже есть активный обещанный платёж.")
+        return redirect(url_for("dashboard"))
+
+    try:
+        amount = float(get_setting("promised_amount", "300"))
+        repay_seconds = int(get_setting("promised_repay_seconds", "604800"))
+        fee = float(get_setting("promised_fee_percent", "0"))
+    except ValueError:
+        flash("Обещанный платёж неправильно настроен.")
+        return redirect(url_for("dashboard"))
+
+    now = datetime.utcnow()
+    repay_amount = round(amount * (1 + fee / 100.0), 2)
+
+    current_user.balance += amount
+    db.session.add(Transaction(
+        user_id=current_user.id,
+        amount=amount,
+        reason="Обещанный платёж: зачислено",
+    ))
+
+    debt = PromisedDebt(
+        user_id=current_user.id,
+        principal=amount,
+        repay_amount=repay_amount,
+        created_at=now,
+        due_at=now + timedelta(seconds=repay_seconds),
+        status="active",
+    )
+    db.session.add(debt)
+    db.session.commit()
+
+    flash(
+        f"Обещанный платёж {amount:.2f} подключён. "
+        f"К возврату {repay_amount:.2f} до {debt.due_at:%d.%m.%Y %H:%M}."
+    )
     return redirect(url_for("dashboard"))
 
 
@@ -562,6 +701,15 @@ def admin_page():
         .limit(20).all()
     ]
 
+    debts = [
+        {"d": d, "overdue": d.due_at < datetime.utcnow()}
+        for d in PromisedDebt.query
+        .filter_by(status="active")
+        .order_by(PromisedDebt.due_at).all()
+    ]
+
+    settings = {key: get_setting(key) for key in DEFAULT_SETTINGS}
+
     return render_template(
         "admin.html",
         users=users,
@@ -570,8 +718,37 @@ def admin_page():
         transactions=transactions,
         pending_requests=pending_requests,
         processed_requests=processed_requests,
+        debts=debts,
+        settings=settings,
         methods=PAY_METHODS,
     )
+
+
+@app.route("/admin/settings", methods=["POST"])
+@admin_required
+def admin_settings():
+    for code, _ in PAY_METHODS:
+        set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
+
+    set_setting("transfer_instruction", request.form.get("transfer_instruction", "").strip())
+
+    try:
+        promised_amount = float(request.form.get("promised_amount", "300"))
+        repay_seconds = int(request.form.get("promised_repay_seconds", "604800"))
+        fee = float(request.form.get("promised_fee_percent", "0"))
+        if promised_amount <= 0 or repay_seconds <= 0 or fee < 0:
+            raise ValueError
+    except ValueError:
+        flash("Некорректные параметры обещанного платежа.")
+        return redirect(url_for("admin_page"))
+
+    set_setting("promised_amount", str(promised_amount))
+    set_setting("promised_repay_seconds", str(repay_seconds))
+    set_setting("promised_fee_percent", str(fee))
+    db.session.commit()
+
+    flash("Настройки пополнения и обещанного платежа сохранены.")
+    return redirect(url_for("admin_page"))
 
 
 @app.route("/admin/user/add", methods=["POST"])
@@ -672,6 +849,9 @@ def admin_user_delete(user_id):
 
     for pr in list(user.payment_requests):
         db.session.delete(pr)
+
+    for debt in list(user.promised_debts):
+        db.session.delete(debt)
 
     db.session.execute(
         camera_access.delete().where(camera_access.c.user_id == user.id)
@@ -1065,7 +1245,7 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 .btn.red{background:#7f1d1d;color:#fecaca;}
 table{width:100%;border-collapse:collapse;font-size:14px;}
 td,th{padding:8px 10px;border-bottom:1px solid #2b3b57;text-align:left;vertical-align:top;}
-input,select{background:#0b1229;border:1px solid #33415c;color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;}
+input,select,textarea{background:#0b1229;border:1px solid #33415c;color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;}
 .messages{margin:0 0 14px;padding:0;}
 .messages li{background:#3b1d1d;color:#fecaca;list-style:none;padding:8px 12px;border-radius:8px;margin-bottom:6px;}
 .muted{color:var(--muted);font-size:13px;}
@@ -1078,7 +1258,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.6</span>
+  <span class="badge warn">v2.7</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -1153,6 +1333,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 
 <div class="card">
   <h2>Пополнить баланс</h2>
+  {% if methods %}
   <form method="post" action="{{ url_for('payment_request') }}" class="formrow">
     <input name="amount" placeholder="Сумма" required>
     <select name="method">
@@ -1161,7 +1342,12 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
     <input name="comment" placeholder="Комментарий / номер перевода" style="flex:1">
     <button class="btn" type="submit">Создать заявку</button>
   </form>
-  <p class="muted">Заявка уходит администратору. После подтверждения сумма упадёт на баланс.</p>
+  {% if transfer_instruction %}
+    <p class="muted" style="white-space:pre-line">{{ transfer_instruction }}</p>
+  {% endif %}
+  {% else %}
+  <p class="muted">Способы пополнения сейчас отключены администратором.</p>
+  {% endif %}
   {% if my_requests %}
   <table>
     <tr><th>ID</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Статус</th></tr>
@@ -1181,6 +1367,26 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   </table>
   {% endif %}
 </div>
+
+{% if promised_enabled %}
+<div class="card">
+  <h2>Обещанный платёж</h2>
+  {% if active_debt %}
+    <p><span class="badge warn">долг</span>
+       К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р.
+       до {{ active_debt.due_at.strftime("%d.%m.%Y %H:%M") }}.
+       Списывается автоматически с баланса.</p>
+  {% else %}
+    <p class="muted">Можно получить {{ "%.2f"|format(promised_amount) }} р. сейчас.
+       Вернуть нужно {{ "%.2f"|format(promised_amount * (1 + promised_fee / 100)) }} р.
+       в течение {{ promised_repay_label }}. Списывается автоматически.</p>
+    <form method="post" action="{{ url_for('promised_connect') }}"
+          onsubmit="return confirm('Подключить обещанный платёж?');">
+      <button class="btn" type="submit">Подключить обещанный платёж</button>
+    </form>
+  {% endif %}
+</div>
+{% endif %}
 
 <div class="card">
   <h2>Тарифы: подключить / продлить</h2>
@@ -1293,7 +1499,59 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.6</span></h1>
+<h1>Админка <span class="badge warn">v2.7</span></h1>
+
+<div class="card">
+<h2>Настройки пополнения и обещанного платежа</h2>
+<form method="post" action="{{ url_for('admin_settings') }}">
+  <p>
+  {% for code, label in methods %}
+    <label style="margin-right:16px;">
+      <input type="checkbox" name="method_{{ code }}" value="1"
+        {% if settings['method_' + code] == '1' %}checked{% endif %}> {{ label }}
+    </label>
+  {% endfor %}
+  </p>
+  <p class="muted">Инструкция для «Перевод по номеру» (показывается пользователям):</p>
+  <textarea name="transfer_instruction" rows="3" style="width:100%;">{{ settings['transfer_instruction'] }}</textarea>
+  <div class="formrow" style="margin-top:10px;">
+    <input name="promised_amount" value="{{ settings['promised_amount'] }}" placeholder="Сумма обещанного">
+    <select name="promised_repay_seconds">
+      {% if settings['promised_repay_seconds'] not in ['3600', '86400', '259200', '604800', '1209600'] %}
+      <option value="{{ settings['promised_repay_seconds'] }}" selected>{{ settings['promised_repay_seconds'] }} сек (тек.)</option>
+      {% endif %}
+      <option value="3600" {% if settings['promised_repay_seconds'] == '3600' %}selected{% endif %}>через 1 час</option>
+      <option value="86400" {% if settings['promised_repay_seconds'] == '86400' %}selected{% endif %}>через 1 день</option>
+      <option value="259200" {% if settings['promised_repay_seconds'] == '259200' %}selected{% endif %}>через 3 дня</option>
+      <option value="604800" {% if settings['promised_repay_seconds'] == '604800' %}selected{% endif %}>через 7 дней</option>
+      <option value="1209600" {% if settings['promised_repay_seconds'] == '1209600' %}selected{% endif %}>через 14 дней</option>
+    </select>
+    <input name="promised_fee_percent" value="{{ settings['promised_fee_percent'] }}" placeholder="Комиссия % (0 = без)">
+    <button class="btn" type="submit">Сохранить</button>
+  </div>
+</form>
+
+<h2>Активные обещанные платежи</h2>
+{% if debts %}
+<table>
+<tr><th>Пользователь</th><th>Взял</th><th>К возврату</th><th>До</th><th>Статус</th></tr>
+{% for item in debts %}
+<tr>
+<td>{{ item.d.user.username }}</td>
+<td>{{ "%.2f"|format(item.d.principal) }}</td>
+<td>{{ "%.2f"|format(item.d.repay_amount) }}</td>
+<td>{{ item.d.due_at.strftime("%d.%m.%Y %H:%M") }}</td>
+<td>
+  {% if item.overdue %}<span class="badge bad">просрочен, ждём баланс</span>
+  {% else %}<span class="badge warn">активен</span>{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p class="muted">Активных обещанных платежей нет.</p>
+{% endif %}
+</div>
 
 <div class="card">
 <h2>Заявки на пополнение</h2>
@@ -1722,7 +1980,7 @@ for cid in list(procs.keys()):
     stop_camera(cid)
 WORKER_EOF
 
-echo "=== billing.py (тик 1 сек, учёт доверительного лимита) ==="
+echo "=== billing.py (тик 1 сек: интервалы, кредит, обещанный) ==="
 cat > "$WORKER/billing.py" <<'BILLING_EOF'
 import sqlite3
 import time
@@ -1741,6 +1999,7 @@ def tick():
     conn.row_factory = sqlite3.Row
 
     now = datetime.utcnow()
+    now_str = now.isoformat(sep=" ")
 
     rows = conn.execute(
         """
@@ -1785,9 +2044,35 @@ def tick():
         )
         conn.execute(
             'INSERT INTO "transaction" (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)',
-            (r["user_id"], -r["price"], f"Списание по тарифу {r['tariff_name']} (интервал {interval} с)", now.isoformat(sep=" ")),
+            (r["user_id"], -r["price"], f"Списание по тарифу {r['tariff_name']} (интервал {interval} с)", now_str),
         )
         conn.commit()
+
+    debts = conn.execute(
+        """
+        SELECT d.id, d.user_id, d.repay_amount, u.balance
+        FROM promised_debt d
+        JOIN user u ON u.id = d.user_id
+        WHERE d.status = 'active' AND d.due_at <= ?
+        """,
+        (now_str,),
+    ).fetchall()
+
+    for d in debts:
+        if d["balance"] >= d["repay_amount"]:
+            conn.execute(
+                "UPDATE user SET balance = balance - ? WHERE id = ?",
+                (d["repay_amount"], d["user_id"]),
+            )
+            conn.execute(
+                'INSERT INTO "transaction" (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)',
+                (d["user_id"], -d["repay_amount"], "Возврат обещанного платежа (с комиссией)", now_str),
+            )
+            conn.execute(
+                "UPDATE promised_debt SET status = 'repaid', repaid_at = ? WHERE id = ?",
+                (now_str, d["id"]),
+            )
+            conn.commit()
 
     conn.close()
 
@@ -1877,6 +2162,30 @@ cur.execute(
         status VARCHAR(10) DEFAULT 'pending',
         created_at TIMESTAMP,
         processed_at TIMESTAMP
+    )
+    """
+)
+
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS setting (
+        key VARCHAR(80) PRIMARY KEY,
+        value TEXT
+    )
+    """
+)
+
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS promised_debt (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        principal FLOAT NOT NULL,
+        repay_amount FLOAT NOT NULL,
+        created_at TIMESTAMP,
+        due_at TIMESTAMP,
+        status VARCHAR(10) DEFAULT 'active',
+        repaid_at TIMESTAMP
     )
     """
 )
@@ -2058,8 +2367,8 @@ echo "Версия системы: $(cat "$BASE/VERSION")"
 if [ -f "$APP/cctv.db" ]; then
     echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
     echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
-    echo "Доступов:      $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera_access;')"
     echo "Заявок:        $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM payment_request;')"
+    echo "Обещанных:     $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM promised_debt;')"
     echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM "transaction";')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
