@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.1"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.2"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
@@ -148,6 +148,9 @@ def get_or_404(model, ident):
     if obj is None: abort(404)
     return obj
 
+def admin_redirect(anchor):
+    return redirect(url_for("admin_page") + anchor)
+
 def interval_label(seconds):
     seconds = int(seconds or 0)
     if seconds <= 0: return "—"
@@ -246,7 +249,7 @@ def dashboard():
     tariff_options = [{"tariff": t, "label": interval_label(t.interval_seconds)} for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()]
     my_requests = [{"p": p, "label": method_label(p.method)} for p in PaymentRequest.query.filter_by(user_id=current_user.id).order_by(PaymentRequest.id.desc()).limit(10).all()]
     methods = available_methods()
-    transfer_instruction = get_setting("transfer_instruction", "") or "" if any(c == "transfer" for c, _ in methods) else ""
+    transfer_instruction = get_setting("transfer_instruction", "") or ""
     promised_enabled = get_setting("method_promised", "0") == "1"
     try:
         promised_amount = float(get_setting("promised_amount", "300") or 0)
@@ -265,57 +268,60 @@ def dashboard():
 @login_required
 def payment_request():
     try: amount = float(request.form.get("amount", "0"))
-    except ValueError: flash("Некорректная сумма."); return redirect(url_for("dashboard"))
-    if amount <= 0: flash("Сумма должна быть больше нуля."); return redirect(url_for("dashboard"))
+    except ValueError: flash("Некорректная сумма."); return redirect(url_for("dashboard") + "#topup")
+    if amount <= 0: flash("Сумма должна быть больше нуля."); return redirect(url_for("dashboard") + "#topup")
     method = request.form.get("method", "other")
-    if method not in [c for c, _ in available_methods()]: flash("Способ пополнения недоступен."); return redirect(url_for("dashboard"))
+    if method not in [c for c, _ in available_methods()]: flash("Способ пополнения недоступен."); return redirect(url_for("dashboard") + "#topup")
     comment = request.form.get("comment", "").strip()
     db.session.add(PaymentRequest(user_id=current_user.id, amount=amount, method=method, comment=comment, status="pending", created_at=datetime.utcnow()))
     db.session.commit()
     flash("Заявка создана. Администратор подтвердит пополнение.")
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("dashboard") + "#topup")
 
 @app.route("/promised/connect", methods=["POST"])
 @login_required
 def promised_connect():
-    if get_setting("method_promised", "0") != "1": flash("Обещанный платёж отключён администратором."); return redirect(url_for("dashboard"))
-    if PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first(): flash("У вас уже есть активный обещанный платёж."); return redirect(url_for("dashboard"))
+    anchor = url_for("dashboard") + "#promised"
+    if get_setting("method_promised", "0") != "1": flash("Обещанный платёж отключён администратором."); return redirect(anchor)
+    if PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first(): flash("У вас уже есть активный обещанный платёж."); return redirect(anchor)
     try:
         amount = float(get_setting("promised_amount", "300")); repay_seconds = int(get_setting("promised_repay_seconds", "604800")); fee = float(get_setting("promised_fee_percent", "0"))
-    except ValueError: flash("Обещанный платёж неправильно настроен."); return redirect(url_for("dashboard"))
+    except ValueError: flash("Обещанный платёж неправильно настроен."); return redirect(anchor)
     now = datetime.utcnow(); repay_amount = round(amount * (1 + fee / 100.0), 2)
     current_user.balance += amount
     db.session.add(Transaction(user_id=current_user.id, amount=amount, reason="Обещанный платёж: зачислено"))
     db.session.add(PromisedDebt(user_id=current_user.id, principal=amount, repay_amount=repay_amount, created_at=now, due_at=now + timedelta(seconds=repay_seconds), status="active"))
     db.session.commit()
     flash(f"Обещанный платёж {amount:.2f} подключён. К возврату {repay_amount:.2f} до {now + timedelta(seconds=repay_seconds):%d.%m.%Y %H:%M}.")
-    return redirect(url_for("dashboard"))
+    return redirect(anchor)
 
 @app.route("/promised/repay", methods=["POST"])
 @login_required
 def promised_repay():
+    anchor = url_for("dashboard") + "#promised"
     debt = PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first()
-    if not debt: flash("Активного обещанного платежа нет."); return redirect(url_for("dashboard"))
+    if not debt: flash("Активного обещанного платежа нет."); return redirect(anchor)
     if current_user.balance < debt.repay_amount:
-        flash(f"Недостаточно баланса для возврата: нужно {debt.repay_amount:.2f}."); return redirect(url_for("dashboard"))
+        flash(f"Недостаточно баланса для возврата: нужно {debt.repay_amount:.2f}."); return redirect(anchor)
     current_user.balance -= debt.repay_amount
     db.session.add(Transaction(user_id=current_user.id, amount=-debt.repay_amount, reason="Досрочный возврат обещанного платежа"))
     debt.status = "repaid"; debt.repaid_at = datetime.utcnow()
     db.session.commit()
     flash(f"Обещанный платёж погашен досрочно: {debt.repay_amount:.2f}.")
-    return redirect(url_for("dashboard"))
+    return redirect(anchor)
 
 @app.route("/tariff/choose", methods=["POST"])
 @login_required
 def tariff_choose():
+    anchor = url_for("dashboard") + "#tariffs"
     try: tariff_id = int(request.form.get("tariff_id", ""))
-    except ValueError: flash("Не выбран тариф."); return redirect(url_for("dashboard"))
+    except ValueError: flash("Не выбран тариф."); return redirect(anchor)
     tariff = get_or_404(Tariff, tariff_id)
-    if not tariff.is_active: flash("Тариф недоступен."); return redirect(url_for("dashboard"))
+    if not tariff.is_active: flash("Тариф недоступен."); return redirect(anchor)
     if enabled_count(current_user) > tariff.max_cameras:
         return redirect(url_for("tariff_switch_page", tariff_id=tariff.id))
     ok, message = apply_tariff(current_user, tariff); flash(message)
-    return redirect(url_for("dashboard"))
+    return redirect(anchor)
 
 @app.route("/tariff/switch/<int:tariff_id>")
 @login_required
@@ -324,46 +330,48 @@ def tariff_switch_page(tariff_id):
     enabled_items = enabled_cameras(current_user)
     if len(enabled_items) <= tariff.max_cameras:
         ok, message = apply_tariff(current_user, tariff); flash(message)
-        return redirect(url_for("dashboard"))
+        return redirect(url_for("dashboard") + "#tariffs")
     return render_template("tariff_switch.html", tariff=tariff, enabled_items=enabled_items)
 
 @app.route("/tariff/switch/<int:tariff_id>/apply", methods=["POST"])
 @login_required
 def tariff_switch_apply(tariff_id):
+    anchor = url_for("dashboard") + "#tariffs"
     tariff = get_or_404(Tariff, tariff_id)
     chosen = {int(x) for x in request.form.getlist("camera_id") if x.strip().isdigit()}
     if len(chosen) > tariff.max_cameras:
         flash(f"Можно оставить не более {tariff.max_cameras} камер(ы)."); return redirect(url_for("tariff_switch_page", tariff_id=tariff.id))
     ok, message = apply_tariff(current_user, tariff)
     if not ok:
-        flash(message); return redirect(url_for("dashboard"))
+        flash(message); return redirect(anchor)
     for cam in current_user.cameras:
         db.session.execute(camera_access.update().where(
             camera_access.c.user_id == current_user.id, camera_access.c.camera_id == cam.id
         ).values(enabled=(cam.id in chosen)))
     db.session.commit()
     flash(message + " Лишние камеры помечены как недоступные по тарифу.")
-    return redirect(url_for("dashboard"))
+    return redirect(anchor)
 
 @app.route("/camera/<int:camera_id>/set_enabled", methods=["POST"])
 @login_required
 def camera_set_enabled(camera_id):
+    anchor = url_for("dashboard") + "#cameras"
     camera = get_or_404(Camera, camera_id)
     row = user_link(current_user.id, camera.id)
     if row is None: abort(403)
     want = request.form.get("enabled") == "1"
     if want:
         if current_user.tariff is None:
-            flash("Нет подключённого тарифа."); return redirect(url_for("dashboard"))
+            flash("Нет подключённого тарифа."); return redirect(anchor)
         if enabled_count(current_user) >= current_user.tariff.max_cameras:
             flash(f"Лимит тарифа: {current_user.tariff.max_cameras} камер(ы). Сначала отключите другую камеру.")
-            return redirect(url_for("dashboard"))
+            return redirect(anchor)
         db.session.execute(camera_access.update().where(camera_access.c.id == row.id).values(enabled=True))
     else:
         db.session.execute(camera_access.update().where(camera_access.c.id == row.id).values(enabled=False))
     db.session.commit()
     flash(f"Камера {camera.name}: {'включена в работу' if want else 'отключена (слот освобождён)'}.")
-    return redirect(url_for("dashboard"))
+    return redirect(anchor)
 
 @app.route("/camera/<int:camera_id>")
 @login_required
@@ -418,125 +426,141 @@ def admin_settings():
     try:
         pa = float(request.form.get("promised_amount", "300")); rs = int(request.form.get("promised_repay_seconds", "604800")); fee = float(request.form.get("promised_fee_percent", "0"))
         if pa <= 0 or rs <= 0 or fee < 0: raise ValueError
-    except ValueError: flash("Некорректные параметры обещанного платежа."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Некорректные параметры обещанного платежа."); return admin_redirect("#settings")
     set_setting("promised_amount", str(pa)); set_setting("promised_repay_seconds", str(rs)); set_setting("promised_fee_percent", str(fee))
     db.session.commit(); flash("Настройки пополнения и обещанного платежа сохранены.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#settings")
 
 @app.route("/admin/promised/<int:debt_id>/cancel", methods=["POST"])
 @admin_required
 def admin_promised_cancel(debt_id):
     debt = get_or_404(PromisedDebt, debt_id)
-    if debt.status != "active": flash("Этот обещанный платёж уже закрыт."); return redirect(url_for("admin_page"))
+    if debt.status != "active": flash("Этот обещанный платёж уже закрыт."); return admin_redirect("#settings")
     debt.status = "cancelled"; debt.repaid_at = datetime.utcnow()
     db.session.commit()
     flash(f"Обещанный платёж {debt.user.username} на {debt.repay_amount:.2f} убран администратором.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#settings")
 
 @app.route("/admin/user/add", methods=["POST"])
 @admin_required
 def admin_user_add():
     username = request.form.get("username", "").strip(); password = request.form.get("password", "").strip()
-    if not username or not password: flash("Укажите логин и пароль."); return redirect(url_for("admin_page"))
-    if User.query.filter_by(username=username).first(): flash("Такой пользователь уже существует."); return redirect(url_for("admin_page"))
+    if not username or not password: flash("Укажите логин и пароль."); return admin_redirect("#users")
+    if User.query.filter_by(username=username).first(): flash("Такой пользователь уже существует."); return admin_redirect("#users")
     db.session.add(User(username=username, password_hash=generate_password_hash(password), active=True, admin=False, balance=0.0))
     db.session.commit(); flash(f"Пользователь {username} создан.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/edit", methods=["POST"])
 @admin_required
 def admin_user_edit(user_id):
     user = get_or_404(User, user_id); username = request.form.get("username", "").strip()
-    if not username: flash("Пустой логин."); return redirect(url_for("admin_page"))
+    if not username: flash("Пустой логин."); return admin_redirect("#users")
     ex = User.query.filter_by(username=username).first()
-    if ex and ex.id != user.id: flash("Такой логин уже занят."); return redirect(url_for("admin_page"))
+    if ex and ex.id != user.id: flash("Такой логин уже занят."); return admin_redirect("#users")
     user.username = username; db.session.commit(); flash("Пользователь обновлён.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/credit", methods=["POST"])
 @admin_required
 def admin_user_credit(user_id):
     user = get_or_404(User, user_id)
     try: limit = float(request.form.get("credit_limit", "0"))
-    except ValueError: flash("Некорректный лимит."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Некорректный лимит."); return admin_redirect("#users")
     user.credit_limit = max(0.0, limit); db.session.commit()
     flash(f"Доверительный лимит {user.username}: {user.credit_limit:.2f}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
 @admin_required
 def admin_user_toggle(user_id):
     user = get_or_404(User, user_id)
-    if user.id == current_user.id and user.active: flash("Нельзя заблокировать самого себя."); return redirect(url_for("admin_page"))
+    if user.id == current_user.id and user.active: flash("Нельзя заблокировать самого себя."); return admin_redirect("#users")
     user.active = not user.active; db.session.commit()
     flash(f"Пользователь {user.username} {'разблокирован' if user.active else 'заблокирован'}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/delete", methods=["POST"])
 @admin_required
 def admin_user_delete(user_id):
     user = get_or_404(User, user_id)
-    if user.id == current_user.id: flash("Нельзя удалить самого себя."); return redirect(url_for("admin_page"))
+    if user.id == current_user.id: flash("Нельзя удалить самого себя."); return admin_redirect("#users")
     for t in list(user.transactions): db.session.delete(t)
     for pr in list(user.payment_requests): db.session.delete(pr)
     for d in list(user.promised_debts): db.session.delete(d)
     db.session.execute(camera_access.delete().where(camera_access.c.user_id == user.id))
     db.session.delete(user); db.session.commit()
     flash(f"Пользователь {user.username} удалён. Камеры остались в общем пуле.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/password", methods=["POST"])
 @admin_required
 def admin_user_password(user_id):
     user = get_or_404(User, user_id); password = request.form.get("password", "").strip()
-    if len(password) < 4: flash("Пароль должен быть не короче 4 символов."); return redirect(url_for("admin_page"))
+    if len(password) < 4: flash("Пароль должен быть не короче 4 символов."); return admin_redirect("#users")
     user.password_hash = generate_password_hash(password); db.session.commit()
     flash(f"Пароль пользователя {user.username} изменён.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/topup", methods=["POST"])
 @admin_required
 def admin_topup():
     try:
         user_id = int(request.form.get("user_id", "")); amount = float(request.form.get("amount", ""))
-    except ValueError: flash("Некорректные данные."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Некорректные данные."); return admin_redirect("#users")
     user = get_or_404(User, user_id); user.balance += amount
     reason = request.form.get("reason", "").strip() or method_label(request.form.get("method", "other"))
     db.session.add(Transaction(user_id=user.id, amount=amount, reason=f"Пополнение ({reason})"))
     db.session.commit(); flash(f"Баланс пользователя {user.username} изменён на {amount}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/tariff", methods=["POST"])
 @admin_required
 def admin_user_tariff(user_id):
     user = get_or_404(User, user_id)
     try: tariff_id = int(request.form.get("tariff_id", ""))
-    except ValueError: flash("Не выбран тариф."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Не выбран тариф."); return admin_redirect("#users")
     tariff = get_or_404(Tariff, tariff_id)
     if enabled_count(user) > tariff.max_cameras:
         flash(f"У {user.username} активных камер больше, чем разрешает тариф {tariff.name}. Сначала отзовите лишние доступы.")
-        return redirect(url_for("admin_page"))
+        return admin_redirect("#cameras")
     ok, message = apply_tariff(user, tariff); flash(message)
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#users")
 
 @app.route("/admin/payment/<int:pr_id>/approve", methods=["POST"])
 @admin_required
 def admin_payment_approve(pr_id):
     pr = get_or_404(PaymentRequest, pr_id)
-    if pr.status != "pending": flash("Заявка уже обработана."); return redirect(url_for("admin_page"))
+    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
     pr.status = "approved"; pr.processed_at = datetime.utcnow(); pr.user.balance += pr.amount
     db.session.add(Transaction(user_id=pr.user_id, amount=pr.amount, reason=f"Пополнение ({method_label(pr.method)})" + (f": {pr.comment}" if pr.comment else "")))
     db.session.commit(); flash(f"Пополнение {pr.amount:.2f} для {pr.user.username} подтверждено.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#requests")
 
 @app.route("/admin/payment/<int:pr_id>/reject", methods=["POST"])
 @admin_required
 def admin_payment_reject(pr_id):
     pr = get_or_404(PaymentRequest, pr_id)
-    if pr.status != "pending": flash("Заявка уже обработана."); return redirect(url_for("admin_page"))
+    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
     pr.status = "rejected"; pr.processed_at = datetime.utcnow(); db.session.commit()
     flash("Заявка отклонена.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#requests")
+
+@app.route("/admin/transaction/<int:tx_id>/delete", methods=["POST"])
+@admin_required
+def admin_transaction_delete(tx_id):
+    tx = get_or_404(Transaction, tx_id)
+    db.session.delete(tx); db.session.commit()
+    flash("Транзакция удалена.")
+    return admin_redirect("#transactions")
+
+@app.route("/admin/transactions/clear", methods=["POST"])
+@admin_required
+def admin_transactions_clear():
+    n = Transaction.query.delete()
+    db.session.commit()
+    flash(f"История транзакций очищена ({n} шт.). Балансы не изменились.")
+    return admin_redirect("#transactions")
 
 @app.route("/admin/tariff/add", methods=["POST"])
 @admin_required
@@ -545,11 +569,11 @@ def admin_tariff_add():
     try:
         price = float(request.form.get("price", "0")); iv = int(request.form.get("interval_seconds", "2592000"))
         mc = int(request.form.get("max_cameras", "1")); ad = int(request.form.get("archive_days", "7"))
-    except ValueError: flash("Некорректные числа в тарифе."); return redirect(url_for("admin_page"))
-    if not name or price <= 0 or iv <= 0: flash("Название, цена и интервал должны быть положительными."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Некорректные числа в тарифе."); return admin_redirect("#tariffs")
+    if not name or price <= 0 or iv <= 0: flash("Название, цена и интервал должны быть положительными."); return admin_redirect("#tariffs")
     db.session.add(Tariff(name=name, price=price, period_days=max(1, iv // 86400) if iv >= 86400 else 1, interval_seconds=iv, max_cameras=mc, archive_days=ad, is_active=True))
     db.session.commit(); flash(f"Тариф {name} добавлен ({interval_label(iv)}).")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#tariffs")
 
 @app.route("/admin/tariff/<int:tariff_id>/edit", methods=["POST"])
 @admin_required
@@ -558,87 +582,87 @@ def admin_tariff_edit(tariff_id):
     try:
         price = float(request.form.get("price", "0")); iv = int(request.form.get("interval_seconds", "2592000"))
         mc = int(request.form.get("max_cameras", "1")); ad = int(request.form.get("archive_days", "7"))
-    except ValueError: flash("Некорректные числа в тарифе."); return redirect(url_for("admin_page"))
-    if not name or price <= 0 or iv <= 0: flash("Название, цена и интервал должны быть положительными."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Некорректные числа в тарифе."); return admin_redirect("#tariffs")
+    if not name or price <= 0 or iv <= 0: flash("Название, цена и интервал должны быть положительными."); return admin_redirect("#tariffs")
     tariff.name = name; tariff.price = price; tariff.interval_seconds = iv
     tariff.period_days = max(1, iv // 86400) if iv >= 86400 else 1; tariff.max_cameras = mc; tariff.archive_days = ad
     db.session.commit(); flash(f"Тариф {name} обновлён ({interval_label(iv)}).")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#tariffs")
 
 @app.route("/admin/tariff/<int:tariff_id>/toggle", methods=["POST"])
 @admin_required
 def admin_tariff_toggle(tariff_id):
     tariff = get_or_404(Tariff, tariff_id); tariff.is_active = not tariff.is_active; db.session.commit()
     flash(f"Тариф {tariff.name}: {'включён' if tariff.is_active else 'выключен'}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#tariffs")
 
 @app.route("/admin/tariff/<int:tariff_id>/delete", methods=["POST"])
 @admin_required
 def admin_tariff_delete(tariff_id):
     tariff = get_or_404(Tariff, tariff_id)
-    if tariff.users: flash(f"Тариф {tariff.name} нельзя удалить: на нём есть пользователи."); return redirect(url_for("admin_page"))
+    if tariff.users: flash(f"Тариф {tariff.name} нельзя удалить: на нём есть пользователи."); return admin_redirect("#tariffs")
     name = tariff.name; db.session.delete(tariff); db.session.commit()
     flash(f"Тариф {name} удалён.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#tariffs")
 
 @app.route("/admin/camera/add", methods=["POST"])
 @admin_required
 def admin_camera_add():
     name = request.form.get("name", "").strip(); rtsp_url = request.form.get("rtsp_url", "").strip()
-    if not name or not rtsp_url: flash("Укажите название камеры и RTSP."); return redirect(url_for("admin_page"))
+    if not name or not rtsp_url: flash("Укажите название камеры и RTSP."); return admin_redirect("#cameras")
     db.session.add(Camera(name=name, rtsp_url=rtsp_url, active=True, recording_enabled=False))
     db.session.commit(); flash(f"Камера {name} добавлена в пул. Запись выключена, включи кнопкой.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/edit", methods=["POST"])
 @admin_required
 def admin_camera_edit(camera_id):
     camera = get_or_404(Camera, camera_id); name = request.form.get("name", "").strip(); rtsp_url = request.form.get("rtsp_url", "").strip()
-    if not name or not rtsp_url: flash("Укажите название и RTSP."); return redirect(url_for("admin_page"))
+    if not name or not rtsp_url: flash("Укажите название и RTSP."); return admin_redirect("#cameras")
     camera.name = name; camera.rtsp_url = rtsp_url; db.session.commit()
     flash(f"Камера {name} обновлена. Воркер подхватит за несколько секунд.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/grant", methods=["POST"])
 @admin_required
 def admin_camera_grant(camera_id):
     camera = get_or_404(Camera, camera_id)
     try: user_id = int(request.form.get("user_id", ""))
-    except ValueError: flash("Не выбран пользователь."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Не выбран пользователь."); return admin_redirect("#cameras")
     user = get_or_404(User, user_id)
-    if user_link(user.id, camera.id) is not None: flash("Доступ уже выдан."); return redirect(url_for("admin_page"))
-    if not can_add_camera_to_user(user): flash(f"У {user.username} лимит камер по тарифу или нет тарифа."); return redirect(url_for("admin_page"))
+    if user_link(user.id, camera.id) is not None: flash("Доступ уже выдан."); return admin_redirect("#cameras")
+    if not can_add_camera_to_user(user): flash(f"У {user.username} лимит камер по тарифу или нет тарифа."); return admin_redirect("#cameras")
     db.session.execute(camera_access.insert().values(camera_id=camera.id, user_id=user.id, enabled=True))
     db.session.commit()
     flash(f"Доступ к {camera.name} выдан пользователю {user.username}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/revoke", methods=["POST"])
 @admin_required
 def admin_camera_revoke(camera_id):
     camera = get_or_404(Camera, camera_id)
     try: user_id = int(request.form.get("user_id", ""))
-    except ValueError: flash("Не выбран пользователь."); return redirect(url_for("admin_page"))
+    except ValueError: flash("Не выбран пользователь."); return admin_redirect("#cameras")
     row = user_link(user_id, camera.id)
-    if row is None: flash("У этого пользователя не было доступа."); return redirect(url_for("admin_page"))
+    if row is None: flash("У этого пользователя не было доступа."); return admin_redirect("#cameras")
     db.session.execute(camera_access.delete().where(camera_access.c.id == row.id))
     db.session.commit()
     flash(f"Доступ к {camera.name} отозван.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/toggle", methods=["POST"])
 @admin_required
 def admin_camera_toggle(camera_id):
     camera = get_or_404(Camera, camera_id); camera.active = not camera.active; db.session.commit()
     flash(f"Камера {camera.name} {'включена' if camera.active else 'выключена'}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/recording", methods=["POST"])
 @admin_required
 def admin_camera_recording(camera_id):
     camera = get_or_404(Camera, camera_id); camera.recording_enabled = not camera.recording_enabled; db.session.commit()
     flash(f"Камера {camera.name}: запись {'ВКЛЮЧЕНА' if camera.recording_enabled else 'выключена'}.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/delete", methods=["POST"])
 @admin_required
@@ -647,7 +671,7 @@ def admin_camera_delete(camera_id):
     db.session.execute(camera_access.delete().where(camera_access.c.camera_id == camera.id))
     db.session.delete(camera); db.session.commit()
     flash(f"Камера {name} удалена из пула. Файлы архива останутся на диске.")
-    return redirect(url_for("admin_page"))
+    return admin_redirect("#cameras")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
@@ -674,7 +698,12 @@ header .spacer{flex:1}
 .badge.bad{background:#3b1d1d;color:var(--bad);}
 .badge.warn{background:#3b341a;color:var(--warn);}
 main{padding:20px;max-width:1100px;margin:0 auto;}
-.card{background:var(--card);border:1px solid #2b3b57;border-radius:14px;padding:18px;margin-bottom:18px;}
+.card,details.card{background:var(--card);border:1px solid #2b3b57;border-radius:14px;padding:18px;margin-bottom:18px;}
+summary{cursor:pointer;font-size:17px;font-weight:600;}
+summary::-webkit-details-marker{display:none;}
+summary::before{content:"▸ ";color:var(--accent);}
+details[open] > summary::before{content:"▾ ";}
+details[open] > summary{margin-bottom:12px;}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px;}
 .cam{background:#16233c;border:1px solid #2b3b57;border-radius:12px;padding:14px;}
 .cam h3{margin:0 0 8px;font-size:16px;}
@@ -682,6 +711,7 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 .btn:hover{filter:brightness(1.1);}
 .btn.gray{background:#334155;color:var(--text);}
 .btn.red{background:#7f1d1d;color:#fecaca;}
+.btn.mini{padding:4px 8px;font-size:12px;}
 table{width:100%;border-collapse:collapse;font-size:14px;}
 td,th{padding:8px 10px;border-bottom:1px solid #2b3b57;text-align:left;vertical-align:top;}
 input,select,textarea{background:#0b1229;border:1px solid #33415c;color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;}
@@ -697,7 +727,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.1</span>
+  <span class="badge warn">v3.2</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -715,6 +745,17 @@ h2{font-size:17px;margin:0 0 12px;}
 {% endwith %}
 {% block content %}{% endblock %}
 </main>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var h = window.location.hash;
+  if (!h) return;
+  var el = document.querySelector(h);
+  if (el) {
+    if (el.tagName === "DETAILS") el.open = true;
+    setTimeout(function () { el.scrollIntoView({block: "start"}); }, 60);
+  }
+});
+</script>
 </body>
 </html>
 BASE_EOF
@@ -737,7 +778,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 {% extends "base.html" %}
 {% block content %}
 {% if not current_user.admin %}
-<div class="card">
+<div class="card" id="subscribe">
   <h2>Подписка</h2>
   {% if current_user.tariff %}
     <p>Тариф: <b>{{ current_user.tariff.name }}</b> (камер: {{ current_user.tariff.max_cameras }}, архив: {{ current_user.tariff.archive_days }} дн.)</p>
@@ -751,12 +792,27 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   {% if methods %}
   <form method="post" action="{{ url_for('payment_request') }}" class="formrow">
     <input name="amount" placeholder="Сумма" required>
-    <select name="method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select>
+    <select name="method" id="topup-method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select>
     <input name="comment" placeholder="Комментарий / номер перевода" style="flex:1">
     <button class="btn" type="submit">Создать заявку</button>
   </form>
-  {% if transfer_instruction %}<p class="muted" style="white-space:pre-line"><b>Как оплатить:</b> {{ transfer_instruction }}</p>{% endif %}
-  {% else %}<p class="muted">Способы пополнения сейчас отключены администратором.</p>{% endif %}
+  <p class="muted" id="hint-box" style="white-space:pre-line"></p>
+  <script>
+  (function () {
+    var hints = {
+      {% for code, label in methods %}
+      "{{ code }}": {% if code == "transfer" %}{{ transfer_instruction | tojson }}{% elif code == "cash" %}"Оплатите наличными и создайте заявку — администратор подтвердит поступление."{% elif code == "card" %}"Онлайн-оплата картой появится после подключения платёжного шлюза."{% else %}"Укажите реквизиты или комментарий к заявке — администратор свяжется для подтверждения."{% endif %},
+      {% endfor %}
+    };
+    var sel = document.getElementById("topup-method");
+    var box = document.getElementById("hint-box");
+    function upd() { box.textContent = hints[sel.value] || ""; }
+    if (sel) { sel.addEventListener("change", upd); upd(); }
+  })();
+  </script>
+  {% else %}
+  <p class="muted">Способы пополнения сейчас отключены администратором.</p>
+  {% endif %}
   {% if my_requests %}
   <table>
     <tr><th>ID</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Статус</th></tr>
@@ -768,7 +824,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   {% endif %}
 </div>
 {% if promised_enabled %}
-<div class="card">
+<div class="card" id="promised">
   <h2>Обещанный платёж</h2>
   {% if active_debt %}
     <p><span class="badge warn">долг</span> К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р. до {{ active_debt.due_at.strftime("%d.%m.%Y %H:%M") }}. Списывается автоматически с баланса.</p>
@@ -783,7 +839,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   {% endif %}
 </div>
 {% endif %}
-<div class="card">
+<div class="card" id="tariffs">
   <h2>Тарифы: подключить / продлить</h2>
   <table>
     <tr><th>Тариф</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th></th></tr>
@@ -798,6 +854,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   <p class="muted">Если на новом тарифе разрешено меньше камер, чем у вас подключено, система попросит выбрать, какие останутся рабочими.</p>
 </div>
 {% endif %}
+<div id="cameras">
 <h1>Мои камеры</h1>
 {% if current_user.admin %}
   {% if cameras %}
@@ -837,6 +894,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   </div>
   {% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
 {% endif %}
+</div>
 {% endblock %}
 DASH_EOF
 echo "=== tariff_switch.html ==="
@@ -858,7 +916,7 @@ cat > "$APP/templates/tariff_switch.html" <<'SWITCH_EOF'
     </table>
     <p class="muted">Отметьте не более {{ tariff.max_cameras }}. Цена тарифа {{ "%.2f"|format(tariff.price) }} р. спишется сразу.</p>
     <button class="btn" type="submit">Переключить тариф</button>
-    <a class="btn gray" href="{{ url_for('dashboard') }}">Отмена</a>
+    <a class="btn gray" href="{{ url_for('dashboard') }}#tariffs">Отмена</a>
   </form>
 </div>
 {% endblock %}
@@ -904,12 +962,93 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.1</span></h1>
-<div class="card">
-<h2>Настройки пополнения и обещанного платежа</h2>
+<h1>Админка <span class="badge warn">v3.2</span></h1>
+
+<details class="card" id="requests" {% if pending_requests %}open{% endif %}>
+<summary>Заявки на пополнение {% if pending_requests %}<span class="badge warn">новых: {{ pending_requests|length }}</span>{% endif %}</summary>
+{% if pending_requests %}
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Действия</th></tr>
+{% for item in pending_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td><td>{{ item.p.comment or "" }}</td>
+<td><form method="post" action="{{ url_for('admin_payment_approve', pr_id=item.p.id) }}" style="display:inline"><button class="btn" type="submit">Подтвердить</button></form>
+<form method="post" action="{{ url_for('admin_payment_reject', pr_id=item.p.id) }}" style="display:inline"><button class="btn red" type="submit">Отклонить</button></form></td></tr>{% endfor %}</table>
+{% else %}<p class="muted">Новых заявок нет.</p>{% endif %}
+{% if processed_requests %}
+<h2>История заявок</h2>
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th></tr>
+{% for item in processed_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td>
+<td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td></tr>{% endfor %}</table>
+{% endif %}
+</details>
+
+<details class="card" id="cameras" open>
+<summary>Камеры (общий пул) — {{ cameras|length }}</summary>
+<table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
+{% for cam in cameras %}
+<tr><td>{{ cam.id }}</td><td>{{ cam.name }}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
+<td>{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %} {% if cam.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</td>
+<td>{% for u in cam.users %}<span class="badge ok">{{ u.username }}</span> <form method="post" action="{{ url_for('admin_camera_revoke', camera_id=cam.id) }}" style="display:inline"><input type="hidden" name="user_id" value="{{ u.id }}"><button class="btn gray mini" type="submit">отозвать</button></form><br>{% else %}<span class="muted">никому</span>{% endfor %}</td>
+<td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn gray" type="submit">Выдать</button></form></td>
+<td><form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red mini" type="submit">Удалить</button></form></td></tr>
+<tr><td colspan="6" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://..." style="flex:1"><button class="btn gray" type="submit">Сохранить камеру</button></form></td></tr>
+{% endfor %}
+</table>
+<h2>Добавить камеру в пул</h2>
+<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1"><button class="btn" type="submit">Добавить</button></form>
+</details>
+
+<details class="card" id="users">
+<summary>Пользователи — {{ users|length }}</summary>
+<table><tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Лимит</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
+{% for u in users %}
+<tr><td>{{ u.id }}</td><td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td><td>{{ "%.2f"|format(u.balance) }}</td><td>{{ "%.2f"|format(u.credit_limit or 0) }}</td>
+<td>{{ u.tariff.name if u.tariff else "—" }}</td><td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
+<td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Блок" if u.active else "Разблок" }}</button></form>
+{% if not u.admin %}<form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }}? Камеры останутся в пуле.');"><button class="btn red mini" type="submit">Удалить</button></form>{% endif %}</td></tr>
+<tr><td colspan="8" class="muted">
+  <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;"><input name="username" value="{{ u.username }}" placeholder="Новый логин"><button class="btn gray mini" type="submit">Переименовать</button></form>
+  <form method="post" action="{{ url_for('admin_user_credit', user_id=u.id) }}" class="formrow" style="margin:4px 0 0 0;"><input name="credit_limit" value="{{ u.credit_limit or 0 }}" placeholder="Доверительный лимит"><button class="btn gray mini" type="submit">Задать лимит</button></form>
+</td></tr>
+{% endfor %}
+</table>
+<h2>Добавить пользователя</h2>
+<form method="post" action="{{ url_for('admin_user_add') }}" class="formrow"><input name="username" placeholder="Логин" required><input name="password" type="password" placeholder="Пароль" required><button class="btn" type="submit">Создать</button></form>
+<h2>Сменить пароль пользователю (включая себя)</h2>
+<form method="post" id="pass-form" class="formrow"><select name="user_id" id="pass-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input type="password" name="password" placeholder="Новый пароль" required><button class="btn" type="submit">Сменить пароль</button></form>
+<h2>Пополнить баланс вручную</h2>
+<form method="post" action="{{ url_for('admin_topup') }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input name="amount" placeholder="100 или -100" required><select name="method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select><input name="reason" placeholder="Причина (необязательно)"><button class="btn" type="submit">Применить</button></form>
+<h2>Подключить тариф пользователю (списание с баланса)</h2>
+<form method="post" id="tariff-form" class="formrow"><select name="user_id" id="tariff-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select><button class="btn" type="submit">Подключить</button></form>
+</details>
+
+<details class="card" id="tariffs">
+<summary>Тарифы — {{ tariffs|length }}</summary>
+<table><tr><th>Название</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th>Статус</th><th></th></tr>
+{% for t in tariffs %}
+<tr><td>{{ t.name }}</td><td>{{ t.price }}</td>
+<td>{% if t.interval_seconds % 2592000 == 0 %}{{ t.interval_seconds // 2592000 }} мес{% elif t.interval_seconds % 86400 == 0 %}{{ t.interval_seconds // 86400 }} дн{% elif t.interval_seconds % 3600 == 0 %}{{ t.interval_seconds // 3600 }} ч{% elif t.interval_seconds % 60 == 0 %}{{ t.interval_seconds // 60 }} мин{% else %}{{ t.interval_seconds }} сек{% endif %}</td>
+<td>{{ t.max_cameras }}</td><td>{{ t.archive_days }} дн.</td><td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_tariff_delete', tariff_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить тариф {{ t.name }}?');"><button class="btn red mini" type="submit">Удалить</button></form></td></tr>
+<tr><td colspan="7" class="muted"><form method="post" action="{{ url_for('admin_tariff_edit', tariff_id=t.id) }}" class="formrow" style="margin:0;">
+<input name="name" value="{{ t.name }}" placeholder="Название"><input name="price" value="{{ t.price }}" placeholder="Цена">
+<select name="interval_seconds">{% if t.interval_seconds not in [1,60,3600,86400,2592000] %}<option value="{{ t.interval_seconds }}" selected>{{ t.interval_seconds }} сек (тек.)</option>{% endif %}<option value="1" {% if t.interval_seconds == 1 %}selected{% endif %}>посекундно</option><option value="60" {% if t.interval_seconds == 60 %}selected{% endif %}>поминутно</option><option value="3600" {% if t.interval_seconds == 3600 %}selected{% endif %}>почасово</option><option value="86400" {% if t.interval_seconds == 86400 %}selected{% endif %}>подневно</option><option value="2592000" {% if t.interval_seconds == 2592000 %}selected{% endif %}>помесячно</option></select>
+<input name="max_cameras" value="{{ t.max_cameras }}" placeholder="Камер"><input name="archive_days" value="{{ t.archive_days }}" placeholder="Архив дней"><button class="btn gray" type="submit">Сохранить тариф</button></form></td></tr>
+{% endfor %}
+</table>
+<h2>Добавить тариф</h2>
+<form method="post" action="{{ url_for('admin_tariff_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="price" placeholder="Цена за интервал" required>
+<select name="interval_seconds"><option value="1">посекундно</option><option value="60">поминутно</option><option value="3600">почасово</option><option value="86400">подневно</option><option value="2592000" selected>помесячно</option></select>
+<input name="max_cameras" placeholder="Камер" value="1"><input name="archive_days" placeholder="Архив дней" value="7"><button class="btn" type="submit">Добавить</button></form>
+</details>
+
+<details class="card" id="settings">
+<summary>Настройки пополнения и обещанного платежа</summary>
 <form method="post" action="{{ url_for('admin_settings') }}">
   <p>{% for code, label in methods %}<label style="margin-right:16px;"><input type="checkbox" name="method_{{ code }}" value="1" {% if settings['method_' + code] == '1' %}checked{% endif %}> {{ label }}</label>{% endfor %}</p>
-  <p class="muted">Инструкция для «Перевод по номеру» (показывается пользователям в блоке пополнения):</p>
+  <p class="muted">Инструкция для «Перевод по номеру» (показывается пользователям при выборе этого способа):</p>
   <textarea name="transfer_instruction" rows="3" style="width:100%;">{{ settings['transfer_instruction'] }}</textarea>
   <div class="formrow" style="margin-top:10px;">
     <input name="promised_amount" value="{{ settings['promised_amount'] }}" placeholder="Сумма обещанного">
@@ -931,91 +1070,21 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <table><tr><th>Пользователь</th><th>Взял</th><th>К возврату</th><th>До</th><th>Статус</th><th></th></tr>
 {% for item in debts %}<tr><td>{{ item.d.user.username }}</td><td>{{ "%.2f"|format(item.d.principal) }}</td><td>{{ "%.2f"|format(item.d.repay_amount) }}</td><td>{{ item.d.due_at.strftime("%d.%m.%Y %H:%M") }}</td>
 <td>{% if item.overdue %}<span class="badge bad">просрочен</span>{% else %}<span class="badge warn">активен</span>{% endif %}</td>
-<td><form method="post" action="{{ url_for('admin_promised_cancel', debt_id=item.d.id) }}" style="display:inline" onsubmit="return confirm('Убрать обещанный платёж (списать долг)?');"><button class="btn red" type="submit">Убрать</button></form></td></tr>{% endfor %}</table>
+<td><form method="post" action="{{ url_for('admin_promised_cancel', debt_id=item.d.id) }}" style="display:inline" onsubmit="return confirm('Убрать обещанный платёж (списать долг)?');"><button class="btn red mini" type="submit">Убрать</button></form></td></tr>{% endfor %}</table>
 {% else %}<p class="muted">Активных обещанных платежей нет.</p>{% endif %}
-</div>
-<div class="card">
-<h2>Заявки на пополнение</h2>
-{% if pending_requests %}
-<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Действия</th></tr>
-{% for item in pending_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td><td>{{ item.p.comment or "" }}</td>
-<td><form method="post" action="{{ url_for('admin_payment_approve', pr_id=item.p.id) }}" style="display:inline"><button class="btn" type="submit">Подтвердить</button></form>
-<form method="post" action="{{ url_for('admin_payment_reject', pr_id=item.p.id) }}" style="display:inline"><button class="btn red" type="submit">Отклонить</button></form></td></tr>{% endfor %}</table>
-{% else %}<p class="muted">Новых заявок нет.</p>{% endif %}
-{% if processed_requests %}
-<h2>История заявок</h2>
-<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th></tr>
-{% for item in processed_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td>
-<td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td></tr>{% endfor %}</table>
-{% endif %}
-</div>
-<div class="card">
-<h2>Пользователи</h2>
-<table><tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Лимит</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
-{% for u in users %}
-<tr><td>{{ u.id }}</td><td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td><td>{{ "%.2f"|format(u.balance) }}</td><td>{{ "%.2f"|format(u.credit_limit or 0) }}</td>
-<td>{{ u.tariff.name if u.tariff else "—" }}</td><td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
-<td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
-<td><form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Блок" if u.active else "Разблок" }}</button></form>
-{% if not u.admin %}<form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }}? Камеры останутся в пуле.');"><button class="btn red" type="submit">Удалить</button></form>{% endif %}</td></tr>
-<tr><td colspan="8" class="muted">
-  <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;"><input name="username" value="{{ u.username }}" placeholder="Новый логин"><button class="btn gray" type="submit">Переименовать</button></form>
-  <form method="post" action="{{ url_for('admin_user_credit', user_id=u.id) }}" class="formrow" style="margin:4px 0 0 0;"><input name="credit_limit" value="{{ u.credit_limit or 0 }}" placeholder="Доверительный лимит"><button class="btn gray" type="submit">Задать лимит</button></form>
-</td></tr>
-{% endfor %}
+</details>
+
+<details class="card" id="transactions">
+<summary>Транзакции (последние 50)</summary>
+<form method="post" action="{{ url_for('admin_transactions_clear') }}" style="margin-bottom:10px;" onsubmit="return confirm('Очистить ВСЮ историю транзакций? Балансы не изменятся.');">
+  <button class="btn red" type="submit">Очистить всё</button>
+</form>
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Причина</th><th>Дата</th><th></th></tr>
+{% for t in transactions %}<tr><td>{{ t.id }}</td><td>{{ t.user.username if t.user else "—" }}</td><td>{{ "%.2f"|format(t.amount) }}</td><td>{{ t.reason }}</td><td>{{ t.created_at.strftime("%d.%m.%Y %H:%M:%S") if t.created_at else "" }}</td>
+<td><form method="post" action="{{ url_for('admin_transaction_delete', tx_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить транзакцию #{{ t.id }}?');"><button class="btn red mini" type="submit">✕</button></form></td></tr>{% endfor %}
 </table>
-<h2>Добавить пользователя</h2>
-<form method="post" action="{{ url_for('admin_user_add') }}" class="formrow"><input name="username" placeholder="Логин" required><input name="password" type="password" placeholder="Пароль" required><button class="btn" type="submit">Создать</button></form>
-<h2>Сменить пароль пользователю (включая себя)</h2>
-<form method="post" id="pass-form" class="formrow"><select name="user_id" id="pass-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input type="password" name="password" placeholder="Новый пароль" required><button class="btn" type="submit">Сменить пароль</button></form>
-<h2>Пополнить баланс вручную</h2>
-<form method="post" action="{{ url_for('admin_topup') }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input name="amount" placeholder="100 или -100" required><select name="method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select><input name="reason" placeholder="Причина (необязательно)"><button class="btn" type="submit">Применить</button></form>
-<h2>Подключить тариф пользователю (списание с баланса)</h2>
-<form method="post" id="tariff-form" class="formrow"><select name="user_id" id="tariff-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select><button class="btn" type="submit">Подключить</button></form>
-</div>
-<div class="card">
-<h2>Камеры (общий пул)</h2>
-<table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
-{% for cam in cameras %}
-<tr><td>{{ cam.id }}</td><td>{{ cam.name }}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
-<td>{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %} {% if cam.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</td>
-<td>{% for u in cam.users %}<span class="badge ok">{{ u.username }}</span> <form method="post" action="{{ url_for('admin_camera_revoke', camera_id=cam.id) }}" style="display:inline"><input type="hidden" name="user_id" value="{{ u.id }}"><button class="btn gray" type="submit">отозвать</button></form><br>{% else %}<span class="muted">никому</span>{% endfor %}</td>
-<td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn gray" type="submit">Выдать</button></form></td>
-<td><form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red" type="submit">Удалить</button></form></td></tr>
-<tr><td colspan="6" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://..." style="flex:1"><button class="btn gray" type="submit">Сохранить камеру</button></form></td></tr>
-{% endfor %}
-</table>
-<h2>Добавить камеру в пул</h2>
-<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1"><button class="btn" type="submit">Добавить</button></form>
-</div>
-<div class="card">
-<h2>Тарифы</h2>
-<table><tr><th>Название</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th>Статус</th><th></th></tr>
-{% for t in tariffs %}
-<tr><td>{{ t.name }}</td><td>{{ t.price }}</td>
-<td>{% if t.interval_seconds % 2592000 == 0 %}{{ t.interval_seconds // 2592000 }} мес{% elif t.interval_seconds % 86400 == 0 %}{{ t.interval_seconds // 86400 }} дн{% elif t.interval_seconds % 3600 == 0 %}{{ t.interval_seconds // 3600 }} ч{% elif t.interval_seconds % 60 == 0 %}{{ t.interval_seconds // 60 }} мин{% else %}{{ t.interval_seconds }} сек{% endif %}</td>
-<td>{{ t.max_cameras }}</td><td>{{ t.archive_days }} дн.</td><td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
-<td><form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
-<form method="post" action="{{ url_for('admin_tariff_delete', tariff_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить тариф {{ t.name }}?');"><button class="btn red" type="submit">Удалить</button></form></td></tr>
-<tr><td colspan="7" class="muted"><form method="post" action="{{ url_for('admin_tariff_edit', tariff_id=t.id) }}" class="formrow" style="margin:0;">
-<input name="name" value="{{ t.name }}" placeholder="Название"><input name="price" value="{{ t.price }}" placeholder="Цена">
-<select name="interval_seconds">{% if t.interval_seconds not in [1,60,3600,86400,2592000] %}<option value="{{ t.interval_seconds }}" selected>{{ t.interval_seconds }} сек (тек.)</option>{% endif %}<option value="1" {% if t.interval_seconds == 1 %}selected{% endif %}>посекундно</option><option value="60" {% if t.interval_seconds == 60 %}selected{% endif %}>поминутно</option><option value="3600" {% if t.interval_seconds == 3600 %}selected{% endif %}>почасово</option><option value="86400" {% if t.interval_seconds == 86400 %}selected{% endif %}>подневно</option><option value="2592000" {% if t.interval_seconds == 2592000 %}selected{% endif %}>помесячно</option></select>
-<input name="max_cameras" value="{{ t.max_cameras }}" placeholder="Камер"><input name="archive_days" value="{{ t.archive_days }}" placeholder="Архив дней"><button class="btn gray" type="submit">Сохранить тариф</button></form></td></tr>
-{% endfor %}
-</table>
-<h2>Добавить тариф</h2>
-<form method="post" action="{{ url_for('admin_tariff_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="price" placeholder="Цена за интервал" required>
-<select name="interval_seconds"><option value="1">посекундно</option><option value="60">поминутно</option><option value="3600">почасово</option><option value="86400">подневно</option><option value="2592000" selected>помесячно</option></select>
-<input name="max_cameras" placeholder="Камер" value="1"><input name="archive_days" placeholder="Архив дней" value="7"><button class="btn" type="submit">Добавить</button></form>
-</div>
-<div class="card">
-<h2>Транзакции</h2>
-<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Причина</th><th>Дата</th></tr>
-{% for t in transactions %}<tr><td>{{ t.id }}</td><td>{{ t.user.username if t.user else "—" }}</td><td>{{ "%.2f"|format(t.amount) }}</td><td>{{ t.reason }}</td><td>{{ t.created_at.strftime("%d.%m.%Y %H:%M:%S") if t.created_at else "" }}</td></tr>{% endfor %}
-</table>
-</div>
+</details>
+
 <script>
 document.getElementById("tariff-form").addEventListener("submit", function () { this.action = "/admin/user/" + document.getElementById("tariff-user").value + "/tariff"; });
 document.getElementById("pass-form").addEventListener("submit", function () { this.action = "/admin/user/" + document.getElementById("pass-user").value + "/password"; });
@@ -1301,7 +1370,7 @@ for i in 1 2 3; do
     sleep 2
 done
 if [ -n "$STOPPED_CONTAINERS" ]; then
-    echo "Остановленные контейнеры:$STOPPED_CONTAINERS (автостарт отключён, после перезагрузки не встанут)"
+    echo "Остановленные контейнеры:$STOPPED_CONTAINERS (автостарт отключён)"
 fi
 if ss -tln | grep -q ':80 '; then
     echo "WARNING: порт 80 всё ещё занят — переключаю сайт на 8090"
@@ -1360,6 +1429,6 @@ echo "Версия системы: $(cat "$BASE/VERSION"), сайт слушае
 if [ -f "$APP/cctv.db" ]; then
     echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
     echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
-    echo "Доступов:      $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera_access;')"
+    echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM \"transaction\";')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
