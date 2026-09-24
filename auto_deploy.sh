@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.4"
+VERSION="2.5"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -121,6 +121,7 @@ class Tariff(db.Model):
     name = db.Column(db.String(80), nullable=False)
     price = db.Column(db.Float, nullable=False)
     period_days = db.Column(db.Integer, default=30)
+    interval_seconds = db.Column(db.Integer, default=2592000)
     max_cameras = db.Column(db.Integer, default=1)
     archive_days = db.Column(db.Integer, default=7)
     is_active = db.Column(db.Boolean, default=True)
@@ -182,9 +183,9 @@ def init_db():
 
     if Tariff.query.count() == 0:
         db.session.add_all([
-            Tariff(name="Старт", price=290, period_days=30, max_cameras=1, archive_days=3),
-            Tariff(name="Базовый", price=690, period_days=30, max_cameras=3, archive_days=7),
-            Tariff(name="Бизнес", price=1990, period_days=30, max_cameras=10, archive_days=7),
+            Tariff(name="Старт", price=290, period_days=30, interval_seconds=2592000, max_cameras=1, archive_days=3),
+            Tariff(name="Базовый", price=690, period_days=30, interval_seconds=2592000, max_cameras=3, archive_days=7),
+            Tariff(name="Бизнес", price=1990, period_days=30, interval_seconds=2592000, max_cameras=10, archive_days=7),
         ])
         db.session.commit()
 
@@ -213,6 +214,21 @@ def get_or_404(model, ident):
     if obj is None:
         abort(404)
     return obj
+
+
+def interval_label(seconds):
+    seconds = int(seconds or 0)
+    if seconds <= 0:
+        return "—"
+    if seconds % 2592000 == 0:
+        return f"{seconds // 2592000} мес"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400} дн"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} ч"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} мин"
+    return f"{seconds} сек"
 
 
 def admin_required(f):
@@ -296,16 +312,16 @@ def apply_tariff(user, tariff):
     db.session.add(Transaction(
         user_id=user.id,
         amount=-tariff.price,
-        reason=f"Подключение тарифа {tariff.name}",
+        reason=f"Списание по тарифу {tariff.name} ({interval_label(tariff.interval_seconds)})",
     ))
 
     user.tariff_id = tariff.id
-    user.subscription_ends_at = base + timedelta(days=tariff.period_days)
+    user.subscription_ends_at = base + timedelta(seconds=tariff.interval_seconds or 2592000)
     db.session.commit()
 
     return True, (
         f"Тариф {tariff.name} подключён до "
-        f"{user.subscription_ends_at:%d.%m.%Y}"
+        f"{user.subscription_ends_at:%d.%m.%Y %H:%M:%S}"
     )
 
 
@@ -348,11 +364,37 @@ def dashboard():
     else:
         cameras = [c for c in current_user.cameras if c.active]
 
+    tariff_options = [
+        {"tariff": t, "label": interval_label(t.interval_seconds)}
+        for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()
+    ]
+
     return render_template(
         "dashboard.html",
         cameras=cameras,
         sub_active=subscription_active(current_user),
+        tariff_options=tariff_options,
     )
+
+
+@app.route("/tariff/choose", methods=["POST"])
+@login_required
+def tariff_choose():
+    try:
+        tariff_id = int(request.form.get("tariff_id", ""))
+    except ValueError:
+        flash("Не выбран тариф.")
+        return redirect(url_for("dashboard"))
+
+    tariff = get_or_404(Tariff, tariff_id)
+
+    if not tariff.is_active:
+        flash("Тариф недоступен.")
+        return redirect(url_for("dashboard"))
+
+    ok, message = apply_tariff(current_user, tariff)
+    flash(message)
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/camera/<int:camera_id>")
@@ -470,6 +512,27 @@ def admin_user_add():
     return redirect(url_for("admin_page"))
 
 
+@app.route("/admin/user/<int:user_id>/edit", methods=["POST"])
+@admin_required
+def admin_user_edit(user_id):
+    user = get_or_404(User, user_id)
+    username = request.form.get("username", "").strip()
+
+    if not username:
+        flash("Пустой логин.")
+        return redirect(url_for("admin_page"))
+
+    exists = User.query.filter_by(username=username).first()
+    if exists and exists.id != user.id:
+        flash("Такой логин уже занят.")
+        return redirect(url_for("admin_page"))
+
+    user.username = username
+    db.session.commit()
+    flash("Пользователь обновлён.")
+    return redirect(url_for("admin_page"))
+
+
 @app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
 @admin_required
 def admin_user_toggle(user_id):
@@ -583,21 +646,22 @@ def admin_tariff_add():
 
     try:
         price = float(request.form.get("price", "0"))
-        period_days = int(request.form.get("period_days", "30"))
+        interval_seconds = int(request.form.get("interval_seconds", "2592000"))
         max_cameras = int(request.form.get("max_cameras", "1"))
         archive_days = int(request.form.get("archive_days", "7"))
     except ValueError:
         flash("Некорректные числа в тарифе.")
         return redirect(url_for("admin_page"))
 
-    if not name or price <= 0:
-        flash("Укажите название и цену.")
+    if not name or price <= 0 or interval_seconds <= 0:
+        flash("Название, цена и интервал должны быть положительными.")
         return redirect(url_for("admin_page"))
 
     tariff = Tariff(
         name=name,
         price=price,
-        period_days=period_days,
+        period_days=max(1, interval_seconds // 86400) if interval_seconds >= 86400 else 1,
+        interval_seconds=interval_seconds,
         max_cameras=max_cameras,
         archive_days=archive_days,
         is_active=True,
@@ -606,7 +670,38 @@ def admin_tariff_add():
     db.session.add(tariff)
     db.session.commit()
 
-    flash(f"Тариф {name} добавлен.")
+    flash(f"Тариф {name} добавлен ({interval_label(interval_seconds)}).")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/tariff/<int:tariff_id>/edit", methods=["POST"])
+@admin_required
+def admin_tariff_edit(tariff_id):
+    tariff = get_or_404(Tariff, tariff_id)
+    name = request.form.get("name", "").strip()
+
+    try:
+        price = float(request.form.get("price", "0"))
+        interval_seconds = int(request.form.get("interval_seconds", "2592000"))
+        max_cameras = int(request.form.get("max_cameras", "1"))
+        archive_days = int(request.form.get("archive_days", "7"))
+    except ValueError:
+        flash("Некорректные числа в тарифе.")
+        return redirect(url_for("admin_page"))
+
+    if not name or price <= 0 or interval_seconds <= 0:
+        flash("Название, цена и интервал должны быть положительными.")
+        return redirect(url_for("admin_page"))
+
+    tariff.name = name
+    tariff.price = price
+    tariff.interval_seconds = interval_seconds
+    tariff.period_days = max(1, interval_seconds // 86400) if interval_seconds >= 86400 else 1
+    tariff.max_cameras = max_cameras
+    tariff.archive_days = archive_days
+    db.session.commit()
+
+    flash(f"Тариф {name} обновлён ({interval_label(interval_seconds)}).")
     return redirect(url_for("admin_page"))
 
 
@@ -641,6 +736,25 @@ def admin_camera_add():
     db.session.commit()
 
     flash(f"Камера {name} добавлена в пул. Запись выключена, включи кнопкой.")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/camera/<int:camera_id>/edit", methods=["POST"])
+@admin_required
+def admin_camera_edit(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    name = request.form.get("name", "").strip()
+    rtsp_url = request.form.get("rtsp_url", "").strip()
+
+    if not name or not rtsp_url:
+        flash("Укажите название и RTSP.")
+        return redirect(url_for("admin_page"))
+
+    camera.name = name
+    camera.rtsp_url = rtsp_url
+    db.session.commit()
+
+    flash(f"Камера {name} обновлена. Воркер подхватит за несколько секунд.")
     return redirect(url_for("admin_page"))
 
 
@@ -790,7 +904,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.4</span>
+  <span class="badge warn">v2.5</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -848,16 +962,41 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
        архив: {{ current_user.tariff.archive_days }} дн.)</p>
     {% if sub_active %}
       <p><span class="badge ok">активна</span>
-         до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y") }}</p>
+         оплачено до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") }}</p>
     {% else %}
       <p><span class="badge bad">истекла</span>
-         пополните баланс и попросите администратора продлить тариф</p>
+         пополните баланс и подключите тариф ниже</p>
     {% endif %}
   {% else %}
     <p><span class="badge warn">тариф не подключён</span>
-       обратитесь к администратору</p>
+       выберите тариф в списке ниже</p>
   {% endif %}
-  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.</p>
+  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.
+     Списания идут автоматически с интервалом тарифа.</p>
+</div>
+
+<div class="card">
+  <h2>Тарифы: подключить / продлить</h2>
+  <table>
+    <tr><th>Тариф</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th></th></tr>
+    {% for opt in tariff_options %}
+    <tr>
+      <td>{{ opt.tariff.name }}
+          {% if current_user.tariff_id == opt.tariff.id %}<span class="badge ok">текущий</span>{% endif %}</td>
+      <td>{{ "%.2f"|format(opt.tariff.price) }} р.</td>
+      <td>{{ opt.label }}</td>
+      <td>{{ opt.tariff.max_cameras }}</td>
+      <td>{{ opt.tariff.archive_days }} дн.</td>
+      <td>
+        <form method="post" action="{{ url_for('tariff_choose') }}" style="display:inline"
+              onsubmit="return confirm('Подключить/продлить тариф {{ opt.tariff.name }}? Цена спишется с баланса.');">
+          <input type="hidden" name="tariff_id" value="{{ opt.tariff.id }}">
+          <button class="btn" type="submit">{{ "Продлить" if current_user.tariff_id == opt.tariff.id else "Подключить" }}</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
 </div>
 {% endif %}
 
@@ -947,19 +1086,19 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.4</span></h1>
+<h1>Админка <span class="badge warn">v2.5</span></h1>
 
 <div class="card">
 <h2>Пользователи</h2>
 <table>
-<tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Тариф</th><th>До</th><th>Статус</th><th>Действия</th></tr>
+<tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
 {% for u in users %}
 <tr>
 <td>{{ u.id }}</td>
 <td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td>
 <td>{{ "%.2f"|format(u.balance) }}</td>
 <td>{{ u.tariff.name if u.tariff else "—" }}</td>
-<td>{{ u.subscription_ends_at.strftime("%d.%m.%Y") if u.subscription_ends_at else "—" }}</td>
+<td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
 <td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
 <td>
   <form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline">
@@ -970,6 +1109,14 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
     <button class="btn red" type="submit">Удалить</button>
   </form>
   {% endif %}
+</td>
+</tr>
+<tr>
+<td colspan="7" class="muted">
+  <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;">
+    <input name="username" value="{{ u.username }}" placeholder="Новый логин">
+    <button class="btn gray" type="submit">Переименовать</button>
+  </form>
 </td>
 </tr>
 {% endfor %}
@@ -997,13 +1144,12 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <button class="btn" type="submit">Применить</button>
 </form>
 
-<h2>Подключить тариф (списание с баланса)</h2>
+<h2>Подключить тариф пользователю (списание с баланса)</h2>
 <form method="post" id="tariff-form" class="formrow">
 <select name="user_id" id="tariff-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
 <select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select>
 <button class="btn" type="submit">Подключить</button>
 </form>
-<p class="muted">Деньги списываются сразу; срок считается от текущей даты окончания, если подписка ещё активна.</p>
 </div>
 
 <div class="card">
@@ -1042,6 +1188,15 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red" type="submit">Удалить</button></form>
 </td>
 </tr>
+<tr>
+<td colspan="6" class="muted">
+  <form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;">
+    <input name="name" value="{{ cam.name }}" placeholder="Название">
+    <input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://..." style="flex:1">
+    <button class="btn gray" type="submit">Сохранить камеру</button>
+  </form>
+</td>
+</tr>
 {% endfor %}
 </table>
 
@@ -1051,23 +1206,49 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1">
 <button class="btn" type="submit">Добавить</button>
 </form>
-<p class="muted">Камера появится в пуле с выключенной записью. Запись включается кнопкой «Вкл запись».</p>
 </div>
 
 <div class="card">
 <h2>Тарифы</h2>
 <table>
-<tr><th>Название</th><th>Цена</th><th>Дней</th><th>Камер</th><th>Архив</th><th>Статус</th><th></th></tr>
+<tr><th>Название</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th>Статус</th><th></th></tr>
 {% for t in tariffs %}
 <tr>
 <td>{{ t.name }}</td>
 <td>{{ t.price }}</td>
-<td>{{ t.period_days }}</td>
+<td>
+  {% if t.interval_seconds % 2592000 == 0 %}{{ t.interval_seconds // 2592000 }} мес
+  {% elif t.interval_seconds % 86400 == 0 %}{{ t.interval_seconds // 86400 }} дн
+  {% elif t.interval_seconds % 3600 == 0 %}{{ t.interval_seconds // 3600 }} ч
+  {% elif t.interval_seconds % 60 == 0 %}{{ t.interval_seconds // 60 }} мин
+  {% else %}{{ t.interval_seconds }} сек{% endif %}
+</td>
 <td>{{ t.max_cameras }}</td>
 <td>{{ t.archive_days }} дн.</td>
 <td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
 <td>
 <form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
+</td>
+</tr>
+<tr>
+<td colspan="7" class="muted">
+  <form method="post" action="{{ url_for('admin_tariff_edit', tariff_id=t.id) }}" class="formrow" style="margin:0;">
+    <input name="name" value="{{ t.name }}" placeholder="Название">
+    <input name="price" value="{{ t.price }}" placeholder="Цена">
+    <select name="interval_seconds">
+      {% if t.interval_seconds not in [1, 60, 3600, 86400, 2592000] %}
+      <option value="{{ t.interval_seconds }}" selected>{{ t.interval_seconds }} сек (тек.)</option>
+      {% endif %}
+      <option value="1" {% if t.interval_seconds == 1 %}selected{% endif %}>посекундно</option>
+      <option value="60" {% if t.interval_seconds == 60 %}selected{% endif %}>поминутно</option>
+      <option value="3600" {% if t.interval_seconds == 3600 %}selected{% endif %}>почасово</option>
+      <option value="86400" {% if t.interval_seconds == 86400 %}selected{% endif %}>подневно</option>
+      <option value="2592000" {% if t.interval_seconds == 2592000 %}selected{% endif %}>помесячно</option>
+    </select>
+    <input name="max_cameras" value="{{ t.max_cameras }}" placeholder="Камер">
+    <input name="archive_days" value="{{ t.archive_days }}" placeholder="Архив дней">
+    <button class="btn gray" type="submit">Сохранить тариф</button>
+  </form>
 </td>
 </tr>
 {% endfor %}
@@ -1076,12 +1257,19 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <h2>Добавить тариф</h2>
 <form method="post" action="{{ url_for('admin_tariff_add') }}" class="formrow">
 <input name="name" placeholder="Название" required>
-<input name="price" placeholder="Цена" required>
-<input name="period_days" placeholder="Дней" value="30">
+<input name="price" placeholder="Цена за интервал" required>
+<select name="interval_seconds">
+  <option value="1">посекундно</option>
+  <option value="60">поминутно</option>
+  <option value="3600">почасово</option>
+  <option value="86400">подневно</option>
+  <option value="2592000" selected>помесячно</option>
+</select>
 <input name="max_cameras" placeholder="Камер" value="1">
 <input name="archive_days" placeholder="Архив дней" value="7">
 <button class="btn" type="submit">Добавить</button>
 </form>
+<p class="muted">Цена списывается сразу при подключении и далее каждый интервал, пока хватает баланса. Кончился баланс — доступ гаснет сам.</p>
 </div>
 
 <div class="card">
@@ -1094,7 +1282,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <td>{{ t.user.username if t.user else "—" }}</td>
 <td>{{ "%.2f"|format(t.amount) }}</td>
 <td>{{ t.reason }}</td>
-<td>{{ t.created_at.strftime("%d.%m.%Y %H:%M") if t.created_at else "" }}</td>
+<td>{{ t.created_at.strftime("%d.%m.%Y %H:%M:%S") if t.created_at else "" }}</td>
 </tr>
 {% endfor %}
 </table>
@@ -1113,7 +1301,7 @@ document.getElementById("pass-form").addEventListener("submit", function () {
 {% endblock %}
 ADMIN_EOF
 
-echo "=== worker.py (v2.4: перезапуск при смене конфига + логи) ==="
+echo "=== worker.py ==="
 cat > "$WORKER/worker.py" <<'WORKER_EOF'
 import sqlite3
 import subprocess
@@ -1272,7 +1460,7 @@ for cid in list(procs.keys()):
     stop_camera(cid)
 WORKER_EOF
 
-echo "=== billing.py ==="
+echo "=== billing.py (тик раз в секунду) ==="
 cat > "$WORKER/billing.py" <<'BILLING_EOF'
 import sqlite3
 import time
@@ -1283,7 +1471,7 @@ from pathlib import Path
 DB_PATH = Path("/opt/cctv/app/cctv.db")
 
 
-def renew_due():
+def tick():
     if not DB_PATH.exists():
         return
 
@@ -1301,7 +1489,7 @@ def renew_due():
                t.id AS tariff_id,
                t.name AS tariff_name,
                t.price,
-               t.period_days
+               t.interval_seconds
         FROM user u
         JOIN tariff t ON t.id = u.tariff_id
         WHERE u.active = 1
@@ -1316,38 +1504,37 @@ def renew_due():
         except (ValueError, TypeError):
             continue
 
-        if ends > now + timedelta(days=1):
+        if ends > now:
             continue
 
+        interval = int(r["interval_seconds"] or 2592000)
+
         if r["balance"] < r["price"]:
-            print(f"[billing] {r['username']}: не хватает баланса для продления {r['tariff_name']}", flush=True)
             continue
 
         base = ends if ends > now else now
-        new_ends = base + timedelta(days=r["period_days"])
+        new_ends = base + timedelta(seconds=interval)
 
         conn.execute(
-            "UPDATE user SET balance = balance - ?, subscription_ends_at = ?, tariff_id = ? WHERE id = ?",
-            (r["price"], new_ends.isoformat(sep=" "), r["tariff_id"], r["user_id"]),
+            "UPDATE user SET balance = balance - ?, subscription_ends_at = ? WHERE id = ?",
+            (r["price"], new_ends.isoformat(sep=" "), r["user_id"]),
         )
         conn.execute(
             'INSERT INTO "transaction" (user_id, amount, reason, created_at) VALUES (?, ?, ?, ?)',
-            (r["user_id"], -r["price"], f"Автопродление тарифа {r['tariff_name']}", now.isoformat(sep=" ")),
+            (r["user_id"], -r["price"], f"Списание по тарифу {r['tariff_name']} (интервал {interval} с)", now.isoformat(sep=" ")),
         )
         conn.commit()
-
-        print(f"[billing] {r['username']}: продлён {r['tariff_name']} до {new_ends}", flush=True)
 
     conn.close()
 
 
 while True:
     try:
-        renew_due()
+        tick()
     except Exception as e:
         print("[billing] error:", e, flush=True)
 
-    time.sleep(3600)
+    time.sleep(1)
 BILLING_EOF
 
 echo "=== .env (не трогаем, если есть) ==="
@@ -1397,6 +1584,7 @@ cur.execute(
         name VARCHAR(80) NOT NULL,
         price FLOAT NOT NULL,
         period_days INTEGER,
+        interval_seconds INTEGER,
         max_cameras INTEGER,
         archive_days INTEGER,
         is_active BOOLEAN
@@ -1416,6 +1604,13 @@ cur.execute(
 
 def cols(table):
     return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+
+if "tariff" in tables:
+    tc = cols("tariff")
+    if "interval_seconds" not in tc:
+        cur.execute("ALTER TABLE tariff ADD COLUMN interval_seconds INTEGER")
+        cur.execute("UPDATE tariff SET interval_seconds = COALESCE(period_days,30)*86400 WHERE interval_seconds IS NULL")
+        print("migration: tariff += interval_seconds")
 
 if "user" in tables:
     u = cols("user")
