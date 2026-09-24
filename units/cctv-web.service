@@ -1,0 +1,14 @@
+[Unit]
+Description=CCTV Flask web
+After=network.target
+[Service]
+Type=simple
+User=cctv
+Group=cctv
+WorkingDirectory=/opt/cctv/app
+EnvironmentFile=/opt/cctv/.env
+ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --threads 4 --timeout 180 --bind 127.0.0.1:8077 app:app
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
