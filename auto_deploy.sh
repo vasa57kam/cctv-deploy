@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="2.9"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.0"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
@@ -56,7 +56,8 @@ def method_label(code): return dict(PAY_METHODS).get(code, code)
 camera_access = db.Table("camera_access",
     db.Column("id", db.Integer, primary_key=True),
     db.Column("camera_id", db.Integer, db.ForeignKey("camera.id"), nullable=False),
-    db.Column("user_id", db.Integer, db.ForeignKey("user.id"), nullable=False))
+    db.Column("user_id", db.Integer, db.ForeignKey("user.id"), nullable=False),
+    db.Column("enabled", db.Boolean, default=True))
 
 class Setting(db.Model):
     __tablename__ = "setting"
@@ -167,10 +168,22 @@ def admin_required(f):
 def subscription_active(user):
     return user.subscription_ends_at is not None and user.subscription_ends_at > datetime.utcnow()
 
+def user_link(user_id, camera_id):
+    return db.session.execute(camera_access.select().where(
+        camera_access.c.user_id == user_id, camera_access.c.camera_id == camera_id)).fetchone()
+
+def enabled_cameras(user):
+    rows = db.session.execute(camera_access.select().where(
+        camera_access.c.user_id == user.id, camera_access.c.enabled == True).order_by(camera_access.c.camera_id)).fetchall()
+    return [db.session.get(Camera, r.camera_id) for r in rows if db.session.get(Camera, r.camera_id)]
+
+def enabled_count(user): return len(enabled_cameras(user))
+
 def can_view_camera(camera):
     if current_user.admin: return True
     if not camera.active: return False
-    if current_user not in camera.users: return False
+    row = user_link(current_user.id, camera.id)
+    if row is None or not row.enabled: return False
     if not current_user.is_active: return False
     return subscription_active(current_user)
 
@@ -183,7 +196,7 @@ def get_camera_or_403(camera_id):
 def can_add_camera_to_user(user):
     if user is None: return True
     if user.tariff is None: return False
-    return len(user.cameras) < user.tariff.max_cameras
+    return enabled_count(user) < user.tariff.max_cameras
 
 def camera_archive_days(camera):
     vals = [u.tariff.archive_days for u in camera.users if u.tariff is not None and u.tariff.archive_days]
@@ -225,7 +238,12 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    cameras = Camera.query.order_by(Camera.id.desc()).all() if current_user.admin else [c for c in current_user.cameras if c.active]
+    if current_user.admin:
+        cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
+    else:
+        cameras = []
+        cam_items = [{"camera": c, "enabled": bool((user_link(current_user.id, c.id) or {}).enabled if user_link(current_user.id, c.id) else False)} for c in current_user.cameras]
+        cam_items = [{"camera": c, "enabled": bool(user_link(current_user.id, c.id).enabled)} for c in current_user.cameras]
     tariff_options = [{"tariff": t, "label": interval_label(t.interval_seconds)} for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()]
     my_requests = [{"p": p, "label": method_label(p.method)} for p in PaymentRequest.query.filter_by(user_id=current_user.id).order_by(PaymentRequest.id.desc()).limit(10).all()]
     methods = available_methods()
@@ -238,7 +256,8 @@ def dashboard():
     except ValueError:
         promised_amount, promised_fee, promised_repay_seconds = 300.0, 0.0, 604800
     active_debt = PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first()
-    return render_template("dashboard.html", cameras=cameras, sub_active=subscription_active(current_user),
+    return render_template("dashboard.html", cameras=cameras, cam_items=cam_items,
+        user_enabled_count=enabled_count(current_user), sub_active=subscription_active(current_user),
         tariff_options=tariff_options, my_requests=my_requests, methods=methods, transfer_instruction=transfer_instruction,
         promised_enabled=promised_enabled, promised_amount=promised_amount, promised_fee=promised_fee,
         promised_repay_seconds=promised_repay_seconds, promised_repay_label=interval_label(promised_repay_seconds), active_debt=active_debt)
@@ -273,6 +292,20 @@ def promised_connect():
     flash(f"Обещанный платёж {amount:.2f} подключён. К возврату {repay_amount:.2f} до {now + timedelta(seconds=repay_seconds):%d.%m.%Y %H:%M}.")
     return redirect(url_for("dashboard"))
 
+@app.route("/promised/repay", methods=["POST"])
+@login_required
+def promised_repay():
+    debt = PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first()
+    if not debt: flash("Активного обещанного платежа нет."); return redirect(url_for("dashboard"))
+    if current_user.balance < debt.repay_amount:
+        flash(f"Недостаточно баланса для возврата: нужно {debt.repay_amount:.2f}."); return redirect(url_for("dashboard"))
+    current_user.balance -= debt.repay_amount
+    db.session.add(Transaction(user_id=current_user.id, amount=-debt.repay_amount, reason="Досрочный возврат обещанного платежа"))
+    debt.status = "repaid"; debt.repaid_at = datetime.utcnow()
+    db.session.commit()
+    flash(f"Обещанный платёж погашен досрочно: {debt.repay_amount:.2f}.")
+    return redirect(url_for("dashboard"))
+
 @app.route("/tariff/choose", methods=["POST"])
 @login_required
 def tariff_choose():
@@ -280,7 +313,57 @@ def tariff_choose():
     except ValueError: flash("Не выбран тариф."); return redirect(url_for("dashboard"))
     tariff = get_or_404(Tariff, tariff_id)
     if not tariff.is_active: flash("Тариф недоступен."); return redirect(url_for("dashboard"))
+    if enabled_count(current_user) > tariff.max_cameras:
+        return redirect(url_for("tariff_switch_page", tariff_id=tariff.id))
     ok, message = apply_tariff(current_user, tariff); flash(message)
+    return redirect(url_for("dashboard"))
+
+@app.route("/tariff/switch/<int:tariff_id>")
+@login_required
+def tariff_switch_page(tariff_id):
+    tariff = get_or_404(Tariff, tariff_id)
+    enabled_items = enabled_cameras(current_user)
+    if len(enabled_items) <= tariff.max_cameras:
+        ok, message = apply_tariff(current_user, tariff); flash(message)
+        return redirect(url_for("dashboard"))
+    return render_template("tariff_switch.html", tariff=tariff, enabled_items=enabled_items)
+
+@app.route("/tariff/switch/<int:tariff_id>/apply", methods=["POST"])
+@login_required
+def tariff_switch_apply(tariff_id):
+    tariff = get_or_404(Tariff, tariff_id)
+    chosen = {int(x) for x in request.form.getlist("camera_id") if x.strip().isdigit()}
+    if len(chosen) > tariff.max_cameras:
+        flash(f"Можно оставить не более {tariff.max_cameras} камер(ы)."); return redirect(url_for("tariff_switch_page", tariff_id=tariff.id))
+    ok, message = apply_tariff(current_user, tariff)
+    if not ok:
+        flash(message); return redirect(url_for("dashboard"))
+    for cam in current_user.cameras:
+        db.session.execute(camera_access.update().where(
+            camera_access.c.user_id == current_user.id, camera_access.c.camera_id == cam.id
+        ).values(enabled=(cam.id in chosen)))
+    db.session.commit()
+    flash(message + " Лишние камеры помечены как недоступные по тарифу.")
+    return redirect(url_for("dashboard"))
+
+@app.route("/camera/<int:camera_id>/set_enabled", methods=["POST"])
+@login_required
+def camera_set_enabled(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    row = user_link(current_user.id, camera.id)
+    if row is None: abort(403)
+    want = request.form.get("enabled") == "1"
+    if want:
+        if current_user.tariff is None:
+            flash("Нет подключённого тарифа."); return redirect(url_for("dashboard"))
+        if enabled_count(current_user) >= current_user.tariff.max_cameras:
+            flash(f"Лимит тарифа: {current_user.tariff.max_cameras} камер(ы). Сначала отключите другую камеру.")
+            return redirect(url_for("dashboard"))
+        db.session.execute(camera_access.update().where(camera_access.c.id == row.id).values(enabled=True))
+    else:
+        db.session.execute(camera_access.update().where(camera_access.c.id == row.id).values(enabled=False))
+    db.session.commit()
+    flash(f"Камера {camera.name}: {'включена в работу' if want else 'отключена (слот освобождён)'}.")
     return redirect(url_for("dashboard"))
 
 @app.route("/camera/<int:camera_id>")
@@ -339,6 +422,16 @@ def admin_settings():
     except ValueError: flash("Некорректные параметры обещанного платежа."); return redirect(url_for("admin_page"))
     set_setting("promised_amount", str(pa)); set_setting("promised_repay_seconds", str(rs)); set_setting("promised_fee_percent", str(fee))
     db.session.commit(); flash("Настройки пополнения и обещанного платежа сохранены.")
+    return redirect(url_for("admin_page"))
+
+@app.route("/admin/promised/<int:debt_id>/cancel", methods=["POST"])
+@admin_required
+def admin_promised_cancel(debt_id):
+    debt = get_or_404(PromisedDebt, debt_id)
+    if debt.status != "active": flash("Этот обещанный платёж уже закрыт."); return redirect(url_for("admin_page"))
+    debt.status = "cancelled"; debt.repaid_at = datetime.utcnow()
+    db.session.commit()
+    flash(f"Обещанный платёж {debt.user.username} на {debt.repay_amount:.2f} убран администратором.")
     return redirect(url_for("admin_page"))
 
 @app.route("/admin/user/add", methods=["POST"])
@@ -420,7 +513,11 @@ def admin_user_tariff(user_id):
     user = get_or_404(User, user_id)
     try: tariff_id = int(request.form.get("tariff_id", ""))
     except ValueError: flash("Не выбран тариф."); return redirect(url_for("admin_page"))
-    ok, message = apply_tariff(user, get_or_404(Tariff, tariff_id)); flash(message)
+    tariff = get_or_404(Tariff, tariff_id)
+    if enabled_count(user) > tariff.max_cameras:
+        flash(f"У {user.username} активных камер больше, чем разрешает тариф {tariff.name}. Сначала отзовите лишние доступы.")
+        return redirect(url_for("admin_page"))
+    ok, message = apply_tariff(user, tariff); flash(message)
     return redirect(url_for("admin_page"))
 
 @app.route("/admin/payment/<int:pr_id>/approve", methods=["POST"])
@@ -510,9 +607,10 @@ def admin_camera_grant(camera_id):
     try: user_id = int(request.form.get("user_id", ""))
     except ValueError: flash("Не выбран пользователь."); return redirect(url_for("admin_page"))
     user = get_or_404(User, user_id)
-    if camera in user.cameras: flash("Доступ уже выдан."); return redirect(url_for("admin_page"))
+    if user_link(user.id, camera.id) is not None: flash("Доступ уже выдан."); return redirect(url_for("admin_page"))
     if not can_add_camera_to_user(user): flash(f"У {user.username} лимит камер по тарифу или нет тарифа."); return redirect(url_for("admin_page"))
-    user.cameras.append(camera); db.session.commit()
+    db.session.execute(camera_access.insert().values(camera_id=camera.id, user_id=user.id, enabled=True))
+    db.session.commit()
     flash(f"Доступ к {camera.name} выдан пользователю {user.username}.")
     return redirect(url_for("admin_page"))
 
@@ -522,11 +620,11 @@ def admin_camera_revoke(camera_id):
     camera = get_or_404(Camera, camera_id)
     try: user_id = int(request.form.get("user_id", ""))
     except ValueError: flash("Не выбран пользователь."); return redirect(url_for("admin_page"))
-    user = get_or_404(User, user_id)
-    if camera in user.cameras:
-        user.cameras.remove(camera); db.session.commit()
-        flash(f"Доступ к {camera.name} отозван у {user.username}.")
-    else: flash("У этого пользователя не было доступа.")
+    row = user_link(user_id, camera.id)
+    if row is None: flash("У этого пользователя не было доступа."); return redirect(url_for("admin_page"))
+    db.session.execute(camera_access.delete().where(camera_access.c.id == row.id))
+    db.session.commit()
+    flash(f"Доступ к {camera.name} отозван.")
     return redirect(url_for("admin_page"))
 
 @app.route("/admin/camera/<int:camera_id>/toggle", methods=["POST"])
@@ -600,12 +698,12 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.9</span>
+  <span class="badge warn">v3.0</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
     <span class="spacer"></span>
-    {% if not current_user.admin %}<span class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.</span>{% endif %}
+    {% if not current_user.admin %}<a class="muted" href="/#topup">Баланс: {{ "%.2f"|format(current_user.balance) }} р. → пополнить</a>{% endif %}
     <a href="{{ url_for('logout') }}">Выход ({{ current_user.username }})</a>
   {% else %}
     <span class="spacer"></span>
@@ -647,9 +745,9 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
     {% if sub_active %}<p><span class="badge ok">активна</span> оплачено до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") }}</p>
     {% else %}<p><span class="badge bad">истекла</span> пополните баланс и подключите тариф ниже</p>{% endif %}
   {% else %}<p><span class="badge warn">тариф не подключён</span> выберите тариф в списке ниже</p>{% endif %}
-  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.{% if current_user.credit_limit %} Доверительный лимит: {{ "%.2f"|format(current_user.credit_limit) }} р.{% endif %}</p>
+  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.{% if current_user.credit_limit %} Доверительный лимит: {{ "%.2f"|format(current_user.credit_limit) }} р.{% endif %} Активных камер: {{ user_enabled_count }}.</p>
 </div>
-<div class="card">
+<div class="card" id="topup">
   <h2>Пополнить баланс</h2>
   {% if methods %}
   <form method="post" action="{{ url_for('payment_request') }}" class="formrow">
@@ -658,7 +756,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
     <input name="comment" placeholder="Комментарий / номер перевода" style="flex:1">
     <button class="btn" type="submit">Создать заявку</button>
   </form>
-  {% if transfer_instruction %}<p class="muted" style="white-space:pre-line">{{ transfer_instruction }}</p>{% endif %}
+  {% if transfer_instruction %}<p class="muted" style="white-space:pre-line"><b>Как оплатить:</b> {{ transfer_instruction }}</p>{% endif %}
   {% else %}<p class="muted">Способы пополнения сейчас отключены администратором.</p>{% endif %}
   {% if my_requests %}
   <table>
@@ -675,8 +773,11 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   <h2>Обещанный платёж</h2>
   {% if active_debt %}
     <p><span class="badge warn">долг</span> К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р. до {{ active_debt.due_at.strftime("%d.%m.%Y %H:%M") }}. Списывается автоматически с баланса.</p>
+    <form method="post" action="{{ url_for('promised_repay') }}" class="formrow" onsubmit="return confirm('Вернуть долг досрочно?');">
+      <button class="btn gray" type="submit">Вернуть досрочно {{ "%.2f"|format(active_debt.repay_amount) }} р.</button>
+    </form>
   {% else %}
-    <p class="muted">Можно получить {{ "%.2f"|format(promised_amount) }} р. сейчас. Вернуть нужно {{ "%.2f"|format(promised_amount * (1 + promised_fee / 100)) }} р. в течение {{ promised_repay_label }}. Списывается автоматически.</p>
+    <p class="muted">Можно получить {{ "%.2f"|format(promised_amount) }} р. сейчас. Вернуть нужно {{ "%.2f"|format(promised_amount * (1 + promised_fee / 100)) }} р. в течение {{ promised_repay_label }}. Списывается автоматически, можно вернуть досрочно.</p>
     <form method="post" action="{{ url_for('promised_connect') }}" onsubmit="return confirm('Подключить обещанный платёж?');">
       <button class="btn" type="submit">Подключить обещанный платёж</button>
     </form>
@@ -695,23 +796,75 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
       <button class="btn" type="submit">{{ "Продлить" if current_user.tariff_id == opt.tariff.id else "Подключить" }}</button></form></td></tr>
     {% endfor %}
   </table>
+  <p class="muted">Если на новом тарифе разрешено меньше камер, чем у вас подключено, система попросит выбрать, какие останутся рабочими.</p>
 </div>
 {% endif %}
 <h1>Мои камеры</h1>
-{% if cameras %}
-<div class="grid">
-  {% for camera in cameras %}
-  <div class="cam">
-    <h3>{{ camera.name }}</h3>
-    <p>{% if camera.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
-       {% if camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</p>
-    <a class="btn" href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
+{% set items = cam_items if not current_user.admin else [] %}
+{% if current_user.admin %}
+  {% if cameras %}
+  <div class="grid">
+    {% for camera in cameras %}
+    <div class="cam">
+      <h3>{{ camera.name }}</h3>
+      <p>{% if camera.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
+         {% if camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</p>
+      <a class="btn" href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
+    </div>
+    {% endfor %}
   </div>
-  {% endfor %}
-</div>
-{% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+  {% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+{% else %}
+  {% if cam_items %}
+  <div class="grid">
+    {% for item in cam_items %}
+    <div class="cam">
+      <h3>{{ item.camera.name }}</h3>
+      <p>{% if item.enabled %}<span class="badge ok">работает</span>{% else %}<span class="badge bad">недоступна по тарифу</span>{% endif %}
+         {% if item.camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</p>
+      {% if item.enabled %}
+        <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
+        <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline">
+          <input type="hidden" name="enabled" value="0">
+          <button class="btn gray" type="submit">Отключить</button>
+        </form>
+      {% else %}
+        <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline">
+          <input type="hidden" name="enabled" value="1">
+          <button class="btn gray" type="submit">Включить</button>
+        </form>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+{% endif %}
 {% endblock %}
 DASH_EOF
+echo "=== tariff_switch.html ==="
+cat > "$APP/templates/tariff_switch.html" <<'SWITCH_EOF'
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Внимание: смена тарифа</h1>
+  <p>Вы переходите на тариф <b>{{ tariff.name }}</b>. Он разрешает не более <b>{{ tariff.max_cameras }}</b> активных камер(ы).
+     Сейчас у вас активных камер: <b>{{ enabled_items|length }}</b>.</p>
+  <p>Выберите, какие камеры останутся рабочими. Остальные не удалятся — они станут
+     «недоступны по тарифу», и вы сможете включить их позже, если освободите слот или вернётесь на тариф выше.</p>
+  <form method="post" action="{{ url_for('tariff_switch_apply', tariff_id=tariff.id) }}">
+    <table>
+      <tr><th></th><th>Камера</th></tr>
+      {% for cam in enabled_items %}
+      <tr><td><input type="checkbox" name="camera_id" value="{{ cam.id }}" checked></td><td>{{ cam.name }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted">Отметьте не более {{ tariff.max_cameras }}. Цена тарифа {{ "%.2f"|format(tariff.price) }} р. спишется сразу.</p>
+    <button class="btn" type="submit">Переключить тариф</button>
+    <a class="btn gray" href="{{ url_for('dashboard') }}">Отмена</a>
+  </form>
+</div>
+{% endblock %}
+SWITCH_EOF
 echo "=== camera.html ==="
 cat > "$APP/templates/camera.html" <<'CAM_EOF'
 {% extends "base.html" %}
@@ -753,12 +906,12 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v2.9</span></h1>
+<h1>Админка <span class="badge warn">v3.0</span></h1>
 <div class="card">
 <h2>Настройки пополнения и обещанного платежа</h2>
 <form method="post" action="{{ url_for('admin_settings') }}">
   <p>{% for code, label in methods %}<label style="margin-right:16px;"><input type="checkbox" name="method_{{ code }}" value="1" {% if settings['method_' + code] == '1' %}checked{% endif %}> {{ label }}</label>{% endfor %}</p>
-  <p class="muted">Инструкция для «Перевод по номеру» (показывается пользователям):</p>
+  <p class="muted">Инструкция для «Перевод по номеру» (показывается пользователям в блоке пополнения):</p>
   <textarea name="transfer_instruction" rows="3" style="width:100%;">{{ settings['transfer_instruction'] }}</textarea>
   <div class="formrow" style="margin-top:10px;">
     <input name="promised_amount" value="{{ settings['promised_amount'] }}" placeholder="Сумма обещанного">
@@ -770,15 +923,17 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
       <option value="604800" {% if settings['promised_repay_seconds'] == '604800' %}selected{% endif %}>через 7 дней</option>
       <option value="1209600" {% if settings['promised_repay_seconds'] == '1209600' %}selected{% endif %}>через 14 дней</option>
     </select>
-    <input name="promised_fee_percent" value="{{ settings['promised_fee_percent'] }}" placeholder="Комиссия % (0 = без)">
+    <label class="muted">Комиссия обещанного, % (0 = без комиссии):
+      <input name="promised_fee_percent" value="{{ settings['promised_fee_percent'] }}" style="width:90px;"></label>
     <button class="btn" type="submit">Сохранить</button>
   </div>
 </form>
 <h2>Активные обещанные платежи</h2>
 {% if debts %}
-<table><tr><th>Пользователь</th><th>Взял</th><th>К возврату</th><th>До</th><th>Статус</th></tr>
+<table><tr><th>Пользователь</th><th>Взял</th><th>К возврату</th><th>До</th><th>Статус</th><th></th></tr>
 {% for item in debts %}<tr><td>{{ item.d.user.username }}</td><td>{{ "%.2f"|format(item.d.principal) }}</td><td>{{ "%.2f"|format(item.d.repay_amount) }}</td><td>{{ item.d.due_at.strftime("%d.%m.%Y %H:%M") }}</td>
-<td>{% if item.overdue %}<span class="badge bad">просрочен, ждём баланс</span>{% else %}<span class="badge warn">активен</span>{% endif %}</td></tr>{% endfor %}</table>
+<td>{% if item.overdue %}<span class="badge bad">просрочен</span>{% else %}<span class="badge warn">активен</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_promised_cancel', debt_id=item.d.id) }}" style="display:inline" onsubmit="return confirm('Убрать обещанный платёж (списать долг)?');"><button class="btn red" type="submit">Убрать</button></form></td></tr>{% endfor %}</table>
 {% else %}<p class="muted">Активных обещанных платежей нет.</p>{% endif %}
 </div>
 <div class="card">
@@ -900,7 +1055,7 @@ def cleanup_archives():
         conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
         for row in conn.execute("SELECT id FROM camera").fetchall():
             cid = row["id"]
-            days = conn.execute("SELECT MAX(t.archive_days) AS d FROM camera_access ca JOIN user u ON u.id=ca.user_id JOIN tariff t ON t.id=u.tariff_id WHERE ca.camera_id=?", (cid,)).fetchone()["d"]
+            days = conn.execute("SELECT MAX(t.archive_days) AS d FROM camera_access ca JOIN user u ON u.id=ca.user_id JOIN tariff t ON t.id=u.tariff_id WHERE ca.camera_id=? AND ca.enabled=1", (cid,)).fetchone()["d"]
             days = days or 7
             cutoff = time.time() - days * 86400
             d = ARCHIVE_DIR / f"camera_{cid}"
@@ -1042,7 +1197,7 @@ import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1]); cur = conn.cursor()
 tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 cur.execute("CREATE TABLE IF NOT EXISTS tariff (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL, price FLOAT NOT NULL, period_days INTEGER, interval_seconds INTEGER, max_cameras INTEGER, archive_days INTEGER, is_active BOOLEAN)")
-cur.execute("CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, user_id INTEGER NOT NULL)")
+cur.execute("CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, user_id INTEGER NOT NULL, enabled BOOLEAN DEFAULT 1)")
 cur.execute("CREATE TABLE IF NOT EXISTS payment_request (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount FLOAT NOT NULL, method VARCHAR(20), comment TEXT, status VARCHAR(10) DEFAULT 'pending', created_at TIMESTAMP, processed_at TIMESTAMP)")
 cur.execute("CREATE TABLE IF NOT EXISTS setting (key VARCHAR(80) PRIMARY KEY, value TEXT)")
 cur.execute("CREATE TABLE IF NOT EXISTS promised_debt (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, principal FLOAT NOT NULL, repay_amount FLOAT NOT NULL, created_at TIMESTAMP, due_at TIMESTAMP, status VARCHAR(10) DEFAULT 'active', repaid_at TIMESTAMP)")
@@ -1061,7 +1216,12 @@ if "user" in tables:
 if "camera" in tables:
     c = cols("camera")
     if "recording_enabled" not in c: cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 0"); print("migration: camera += recording_enabled")
-    cur.execute("INSERT INTO camera_access (camera_id, user_id) SELECT id, user_id FROM camera WHERE user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM camera_access ca WHERE ca.camera_id = camera.id AND ca.user_id = camera.user_id)")
+if "camera_access" in tables:
+    ca = cols("camera_access")
+    if "enabled" not in ca:
+        cur.execute("ALTER TABLE camera_access ADD COLUMN enabled BOOLEAN DEFAULT 1")
+        print("migration: camera_access += enabled")
+    cur.execute("INSERT INTO camera_access (camera_id, user_id, enabled) SELECT id, user_id, 1 FROM camera WHERE user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM camera_access ca WHERE ca.camera_id = camera.id AND ca.user_id = camera.user_id)")
     print("migration: camera_access seeded from old owners")
 cur.execute("PRAGMA journal_mode=WAL").fetchall()
 conn.commit(); conn.close(); print("migration ok")
@@ -1177,22 +1337,13 @@ if ! systemctl restart nginx; then
     sleep 1
     systemctl start nginx
 fi
-echo "=== Самопроверка С ВХОДОМ ПОД АДМИНОМ ==="
+echo "=== Самопроверка ==="
 sleep 3
-set +e
-source "$BASE/.env"
-LOGIN_CODE=$(curl -s -c /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" --data "username=$ADMIN_USERNAME&password=$ADMIN_PASSWORD" http://127.0.0.1:8077/login)
-ADMIN_CODE=$(curl -s -b /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/admin)
-DASH_CODE=$(curl -s -b /tmp/cctv_check_cj -o /dev/null -w "%{http_code}" http://127.0.0.1:8077/)
-SITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$NGINX_LISTEN/)
-rm -f /tmp/cctv_check_cj
-set -e
-echo "login POST: $LOGIN_CODE (ожидаем 302, либо 200 если пароль админа менялся вручную)"
-echo "admin GET:  $ADMIN_CODE"
-echo "dashboard:  $DASH_CODE"
-echo "site nginx: $SITE_CODE (ожидаем 302)"
-if [ "$SITE_CODE" != "302" ] && [ "$SITE_CODE" != "200" ]; then
-    echo "!!! nginx не отвечает на $NGINX_LISTEN, логи:"
+SITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$NGINX_LISTEN/login)
+echo "site login page: $SITE_CODE (ожидаем 200)"
+if [ "$SITE_CODE" != "200" ]; then
+    echo "!!! сайт не отвечает, логи:"
+    journalctl -u cctv-web -n 20 --no-pager || true
     journalctl -u nginx -n 20 --no-pager || true
     exit 1
 fi
@@ -1202,6 +1353,6 @@ echo "Версия системы: $(cat "$BASE/VERSION"), сайт слушае
 if [ -f "$APP/cctv.db" ]; then
     echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
     echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
-    echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM "transaction";')"
+    echo "Доступов:      $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera_access;')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
