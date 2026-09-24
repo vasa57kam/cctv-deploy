@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.4"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.6"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
-mkdir -p "$APP/templates" "$WORKER" "$STORAGE/live" "$STORAGE/archive" "$STORAGE/logs" "$BACKUP"
+mkdir -p "$APP/templates" "$WORKER" "$STORAGE/live" "$STORAGE/archive" "$STORAGE/logs" "$STORAGE/imports" "$STORAGE/previews" "$BACKUP"
 export DEBIAN_FRONTEND=noninteractive
 echo "=== Пакеты ==="
 apt-get update || echo "WARNING: apt update с ошибками, продолжаю"
@@ -22,18 +22,24 @@ gunicorn==22.0.0
 REQ_EOF
 echo "=== app.py ==="
 cat > "$APP/app.py" <<'APP_EOF'
-import os, time
+import os, re, time
+import urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
+import subprocess
 from flask import Flask, render_template, request, redirect, url_for, abort, send_from_directory, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = Path("/opt/cctv"); STORAGE_DIR = BASE_DIR / "storage"
-LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"; DB_PATH = BASE_DIR / "app" / "cctv.db"
-DB_PATH.parent.mkdir(parents=True, exist_ok=True); LIVE_DIR.mkdir(parents=True, exist_ok=True); ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
+IMPORT_DIR = STORAGE_DIR / "imports"; PREVIEW_DIR = STORAGE_DIR / "previews"
+DB_PATH = BASE_DIR / "app" / "cctv.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True); LIVE_DIR.mkdir(parents=True, exist_ok=True)
+ARCHIVE_DIR.mkdir(parents=True, exist_ok=True); IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
@@ -225,6 +231,38 @@ def apply_tariff(user, tariff):
     db.session.commit()
     return True, f"Тариф {tariff.name} подключён до {user.subscription_ends_at:%d.%m.%Y %H:%M:%S}"
 
+def fetch_page(url, cookie):
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+    if cookie: headers["Cookie"] = cookie
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+def extract_candidates(html, base_url):
+    found = []
+    pats = [
+        r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*',
+        r'rtsp://[^\s"\'<>\\]+',
+    ]
+    for p in pats:
+        for m in re.findall(p, html):
+            u = m.replace("&amp;", "&")
+            if u not in found: found.append(u)
+    for m in re.findall(r'["\'](/[^\s"\'<>\\]*\.m3u8[^\s"\'<>\\]*)["\']', html):
+        u = urllib.parse.urljoin(base_url, m.replace("&amp;", "&"))
+        if u not in found: found.append(u)
+    return found[:12]
+
+def probe_stream(url, idx):
+    out = PREVIEW_DIR / f"cand_{idx}.jpg"
+    if out.exists(): out.unlink()
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url, "-frames:v", "1", "-y", str(out)]
+    try:
+        subprocess.run(cmd, timeout=12, capture_output=True)
+    except subprocess.TimeoutExpired:
+        return False
+    return out.exists() and out.stat().st_size > 0
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user.is_authenticated: return redirect(url_for("dashboard"))
@@ -259,9 +297,7 @@ def stop_impersonation():
 @app.route("/")
 @login_required
 def dashboard():
-    if current_user.admin and not session.get("impersonator"):
-        cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
-    elif current_user.admin:
+    if current_user.admin:
         cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
     else:
         cameras = []
@@ -494,8 +530,58 @@ def admin_page():
         .order_by(PaymentRequest.id.desc()).limit(50).all()]
     debts = [{"d": d, "overdue": d.due_at < datetime.utcnow()} for d in PromisedDebt.query.filter_by(status="active").order_by(PromisedDebt.due_at).all()]
     settings = {k: get_setting(k) for k in DEFAULT_SETTINGS}
+    imports = sorted(IMPORT_DIR.glob("import_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+    import_items = []
+    for lg in imports:
+        tail = ""
+        try:
+            with open(lg, "rb") as fh:
+                tail = fh.read()[-300:].decode("utf-8", "ignore")
+        except Exception:
+            pass
+        import_items.append({"name": lg.name, "tail": tail, "age": int(time.time() - lg.stat().st_mtime)})
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
-        tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts, settings=settings, methods=PAY_METHODS)
+        tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
+        settings=settings, methods=PAY_METHODS, import_items=import_items)
+
+@app.route("/admin/discover", methods=["POST"])
+@admin_required
+def admin_discover():
+    base_url = request.form.get("base_url", "").strip()
+    cookie = request.form.get("cookie", "").strip()
+    if not base_url:
+        flash("Укажите адрес страницы с плеером.")
+        return admin_redirect("#discover")
+    error = ""
+    html = ""
+    try:
+        html = fetch_page(base_url, cookie)
+    except Exception as e:
+        error = f"Не удалось загрузить страницу: {e}"
+    cands = extract_candidates(html, base_url) if html else []
+    items = []
+    for i, u in enumerate(cands, 1):
+        items.append({"idx": i, "url": u, "ok": probe_stream(u, i)})
+    return render_template("discover.html", items=items, error=error, base_url=base_url)
+
+@app.route("/admin/discover/preview/<path:filename>")
+@admin_required
+def discover_preview(filename):
+    return send_from_directory(str(PREVIEW_DIR), filename, conditional=True)
+
+@app.route("/admin/discover/attach", methods=["POST"])
+@admin_required
+def admin_discover_attach():
+    url = request.form.get("url", "").strip()
+    name = request.form.get("name", "").strip() or f"Источник {len(Camera.query.all()) + 1}"
+    rec = request.form.get("recording") == "1"
+    if not url:
+        flash("Нет URL потока.")
+        return admin_redirect("#discover")
+    db.session.add(Camera(name=name, rtsp_url=url, active=True, recording_enabled=rec))
+    db.session.commit()
+    flash(f"Камера «{name}» подключена из внешнего источника." + (" Запись архива включена." if rec else " Запись выключена (включи кнопкой в пуле)."))
+    return admin_redirect("#cameras")
 
 @app.route("/admin/user/<int:user_id>/impersonate", methods=["POST"])
 @admin_required
@@ -509,6 +595,40 @@ def admin_impersonate(user_id):
     login_user(user)
     flash(f"Вы вошли как {user.username}. Нажмите «Вернуться в админку» в шапке, когда закончите.")
     return redirect(url_for("dashboard"))
+
+@app.route("/admin/camera/<int:camera_id>/import", methods=["POST"])
+@admin_required
+def admin_import_archive(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    url = request.form.get("url", "").strip() or camera.rtsp_url
+    date_s = request.form.get("date", "").strip()
+    time_s = request.form.get("time", "").strip() or "00:00"
+    try: minutes = max(1, int(request.form.get("minutes", "60")))
+    except ValueError: minutes = 60
+    as_is = request.form.get("as_is") == "1"
+    if not url or not date_s:
+        flash("Укажите URL источника и дату.")
+        return admin_redirect("#import")
+    try:
+        dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        flash("Неверная дата или время (нужно ГГГГ-ММ-ДД и ЧЧ:ММ).")
+        return admin_redirect("#import")
+    epoch = int(dt.timestamp())
+    final_url = url
+    if not as_is:
+        sep = "&" if ("?" in url) else "?"
+        final_url = f"{url}{sep}utcstart={epoch}&utclen={minutes * 60}"
+    out_dir = ARCHIVE_DIR / f"camera_{camera.id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"import_{date_s}_{time_s.replace(':', '')}_{minutes}m.mp4"
+    log = IMPORT_DIR / f"import_{camera.id}_{epoch}.log"
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-i", final_url,
+           "-c", "copy", "-movflags", "+faststart", str(out)]
+    with open(log, "ab") as lf:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf, start_new_session=True)
+    flash(f"Импорт запущен: {date_s} {time_s}, {minutes} мин. Файл появится в архиве после завершения; лог: {log.name}")
+    return admin_redirect("#import")
 
 @app.route("/admin/settings", methods=["POST"])
 @admin_required
@@ -710,7 +830,7 @@ def admin_tariff_delete(tariff_id):
 @admin_required
 def admin_camera_add():
     name = request.form.get("name", "").strip(); rtsp_url = request.form.get("rtsp_url", "").strip()
-    if not name or not rtsp_url: flash("Укажите название камеры и RTSP."); return admin_redirect("#cameras")
+    if not name or not rtsp_url: flash("Укажите название и RTSP/HLS.")
     db.session.add(Camera(name=name, rtsp_url=rtsp_url, active=True, recording_enabled=False))
     db.session.commit(); flash(f"Камера {name} добавлена в пул. Запись выключена, включи кнопкой.")
     return admin_redirect("#cameras")
@@ -719,7 +839,7 @@ def admin_camera_add():
 @admin_required
 def admin_camera_edit(camera_id):
     camera = get_or_404(Camera, camera_id); name = request.form.get("name", "").strip(); rtsp_url = request.form.get("rtsp_url", "").strip()
-    if not name or not rtsp_url: flash("Укажите название и RTSP."); return admin_redirect("#cameras")
+    if not name or not rtsp_url: flash("Укажите название и RTSP/HLS."); return admin_redirect("#cameras")
     camera.name = name; camera.rtsp_url = rtsp_url; db.session.commit()
     flash(f"Камера {name} обновлена. Воркер подхватит за несколько секунд.")
     return admin_redirect("#cameras")
@@ -824,12 +944,13 @@ video{width:100%;border-radius:10px;background:#000;}
 .formrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;}
 h1{font-size:22px;margin:0 0 16px;}
 h2{font-size:17px;margin:0 0 12px;}
+pre.log{background:#0b1229;border:1px solid #33415c;border-radius:8px;padding:8px;font-size:12px;overflow-x:auto;}
 </style>
 </head>
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.4</span>
+  <span class="badge warn">v3.6</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
@@ -1023,6 +1144,47 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 </div>
 {% endblock %}
 DASH_EOF
+echo "=== discover.html ==="
+cat > "$APP/templates/discover.html" <<'DISCOVER_EOF'
+{% extends "base.html" %}
+{% block content %}
+<h1>Поиск потоков: {{ base_url }}</h1>
+{% if error %}<p class="muted">{{ error }}</p>{% endif %}
+{% if items %}
+<div class="grid">
+  {% for it in items %}
+  <div class="cam">
+    {% if it.ok %}
+      <img src="{{ url_for('discover_preview', filename='cand_%d.jpg' % it.idx) }}" style="width:100%;border-radius:8px;">
+    {% else %}
+      <p class="muted">Превью нет: поток недоступен с сервера или требует авторизацию</p>
+    {% endif %}
+    <p class="muted" style="word-break:break-all;">{{ it.url }}</p>
+    <form method="post" action="{{ url_for('admin_discover_attach') }}" class="formrow">
+      <input type="hidden" name="url" value="{{ it.url }}">
+      <input name="name" placeholder="Название камеры" value="Источник {{ it.idx }}">
+      <label class="muted"><input type="checkbox" name="recording" value="1"> писать архив</label>
+      <button class="btn" type="submit">Подключить</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="muted">В коде страницы не найдено ссылок на потоки (m3u8/rtsp). Такое бывает, если плеер получает их через XHR/API
+или нужен Cookie. Скопируй URL потока вручную (DevTools → Network → фильтр m3u8) и подключи ниже.</p>
+{% endif %}
+<div class="card">
+  <h2>Подключить поток вручную</h2>
+  <form method="post" action="{{ url_for('admin_discover_attach') }}" class="formrow">
+    <input name="url" placeholder="https://…/index.m3u8?token=… или rtsp://…" style="flex:1" required>
+    <input name="name" placeholder="Название камеры">
+    <label class="muted"><input type="checkbox" name="recording" value="1"> писать архив</label>
+    <button class="btn" type="submit">Подключить</button>
+  </form>
+</div>
+<p><a class="btn gray" href="{{ url_for('admin_page') }}#discover">Вернуться в админку</a></p>
+{% endblock %}
+DISCOVER_EOF
 echo "=== tariff_switch.html ==="
 cat > "$APP/templates/tariff_switch.html" <<'SWITCH_EOF'
 {% extends "base.html" %}
@@ -1088,7 +1250,19 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.4</span></h1>
+<h1>Админка <span class="badge warn">v3.6</span></h1>
+
+<details class="card" id="discover">
+<summary>Поиск потоков на сайте (Flussonic / онлайн-камеры)</summary>
+<p class="muted">Укажи адрес страницы с плеером (например, https://moidom.ots-net.ru/service). Сервер загрузит страницу,
+найдёт ссылки потоков (m3u8/rtsp), проверит каждый и покажет превью кадра. Если сайт под логином — вставь Cookie из своего браузера.
+Поиск может занять до пары минут: каждый поток проверяется отдельно.</p>
+<form method="post" action="{{ url_for('admin_discover') }}" class="formrow">
+  <input name="base_url" placeholder="https://сайт/страница-с-плеером" style="flex:1" required>
+  <input name="cookie" placeholder="Cookie: (необязательно)" style="flex:1">
+  <button class="btn" type="submit">Найти потоки</button>
+</form>
+</details>
 
 <details class="card" id="requests" {% if pending_requests %}open{% endif %}>
 <summary>Заявки на пополнение {% if pending_requests %}<span class="badge warn">новых: {{ pending_requests|length }}</span>{% endif %}</summary>
@@ -1107,6 +1281,34 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% endif %}
 </details>
 
+<details class="card" id="import">
+<summary>Импорт архива с внешнего источника (Flussonic / HLS)</summary>
+<p class="muted">Выбери камеру-приёмник, вставь URL плейлиста источника, укажи дату/время начала и длительность.
+Сервер добавит параметры utcstart/utclen (формат Flussonic) и скачает кусок в архив камеры. Если URL уже с параметрами — отметь «URL как есть».</p>
+<form method="post" id="import-form" class="formrow">
+  <select name="camera_id" id="import-camera">{% for cam in cameras %}<option value="{{ cam.id }}">{{ cam.name }}</option>{% endfor %}</select>
+  <input name="url" placeholder="URL источника (если пусто — возьмётся URL камеры)" style="flex:1">
+  <input type="date" name="date" required>
+  <input type="time" name="time" value="00:00">
+  <input name="minutes" value="60" placeholder="Минут" style="width:90px;">
+  <label class="muted"><input type="checkbox" name="as_is" value="1"> URL как есть</label>
+  <button class="btn" type="submit">Запустить импорт</button>
+</form>
+<script>
+document.getElementById("import-form").addEventListener("submit", function () {
+  this.action = "/admin/camera/" + document.getElementById("import-camera").value + "/import";
+});
+</script>
+{% if import_items %}
+<h2>Последние импорты (логи)</h2>
+<table><tr><th>Лог</th><th>Свежесть</th><th>Хвост лога</th></tr>
+{% for item in import_items %}
+<tr><td>{{ item.name }}</td><td>{{ item.age }} с назад</td><td><pre class="log">{{ item.tail }}</pre></td></tr>
+{% endfor %}
+</table>
+{% endif %}
+</details>
+
 <details class="card" id="cameras" open>
 <summary>Камеры (общий пул) — {{ cameras|length }}</summary>
 <table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
@@ -1118,11 +1320,11 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <td><form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
 <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
 <form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red mini" type="submit">Удалить</button></form></td></tr>
-<tr><td colspan="6" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://..." style="flex:1"><button class="btn gray" type="submit">Сохранить камеру</button></form></td></tr>
+<tr><td colspan="6" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://… или https://…/index.m3u8" style="flex:1"><button class="btn gray" type="submit">Сохранить камеру</button></form></td></tr>
 {% endfor %}
 </table>
 <h2>Добавить камеру в пул</h2>
-<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream" required style="flex:1"><button class="btn" type="submit">Добавить</button></form>
+<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="rtsp_url" placeholder="rtsp://login:pass@ip/stream или HLS m3u8" required style="flex:1"><button class="btn" type="submit">Добавить</button></form>
 </details>
 
 <details class="card" id="users">
@@ -1454,7 +1656,7 @@ User=cctv
 Group=cctv
 WorkingDirectory=/opt/cctv/app
 EnvironmentFile=/opt/cctv/.env
-ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8077 app:app
+ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --timeout 180 --bind 127.0.0.1:8077 app:app
 Restart=always
 RestartSec=3
 [Install]
