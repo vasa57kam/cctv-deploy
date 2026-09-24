@@ -1,0 +1,5 @@
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-Login==0.6.3
+gunicorn==22.0.0
+playwright==1.44.0
