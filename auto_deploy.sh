@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.8"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.9"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
-systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
+systemctl stop cctv-web cctv-worker cctv-billing cctv-browserd 2>/dev/null || true
 mkdir -p "$APP/templates" "$WORKER" "$STORAGE/live" "$STORAGE/archive" "$STORAGE/logs" "$STORAGE/previews" "$BACKUP"
 export DEBIAN_FRONTEND=noninteractive
 echo "=== Пакеты ==="
@@ -23,7 +23,7 @@ playwright==1.44.0
 REQ_EOF
 echo "=== app.py ==="
 cat > "$APP/app.py" <<'APP_EOF'
-import os, re, time
+import os, re, time, json
 import urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,6 +38,7 @@ BASE_DIR = Path("/opt/cctv"); STORAGE_DIR = BASE_DIR / "storage"
 LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
 PREVIEW_DIR = STORAGE_DIR / "previews"
 DB_PATH = BASE_DIR / "app" / "cctv.db"
+DAEMON_URL = "http://127.0.0.1:8099/"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True); LIVE_DIR.mkdir(parents=True, exist_ok=True)
 ARCHIVE_DIR.mkdir(parents=True, exist_ok=True); PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
@@ -256,84 +257,11 @@ def extract_candidates(html, base_url):
         if alt not in found: found.append(alt)
     return found
 
-BROWSER_STATE = {"lock": False, "pw": None, "browser": None, "ctx": None, "page": None, "cands": [], "url": ""}
-SHOT_PATH = PREVIEW_DIR / "browser_shot.png"
-
-def _add_cand(u):
-    u = u.replace("&amp;", "&")
-    if u not in BROWSER_STATE["cands"]: BROWSER_STATE["cands"].append(u)
-
-def _attach_listeners(page):
-    def on_request(req):
-        u = req.url
-        if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u): _add_cand(u)
-    def on_response(resp):
-        try:
-            ct = resp.headers.get("content-type", "")
-            if ("json" in ct) or ("javascript" in ct):
-                body = resp.text()
-                for m in re.findall(STREAM_PAT_M3U8, body): _add_cand(m)
-                for m in re.findall(STREAM_PAT_RTSP, body): _add_cand(m)
-                for m in re.findall(STREAM_PAT_STATUS, body): _add_cand(m.replace("recording_status.json", "index.m3u8"))
-        except Exception:
-            pass
-    page.on("request", on_request)
-    page.on("response", on_response)
-
-def _browser_close():
-    for k in ("page", "ctx", "browser"):
-        obj = BROWSER_STATE.get(k)
-        if obj is not None:
-            try: obj.close()
-            except Exception: pass
-    pw = BROWSER_STATE.get("pw")
-    if pw is not None:
-        try: pw.stop()
-        except Exception: pass
-    BROWSER_STATE.update(lock=False, pw=None, browser=None, ctx=None, page=None, cands=[])
-
-def browser_discover(url, cookie):
-    from playwright.sync_api import sync_playwright
-    cands = []
-    def add(u):
-        u = u.replace("&amp;", "&")
-        if u not in cands: cands.append(u)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
-        ctx = browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36", ignore_https_errors=True)
-        if cookie:
-            dom = urllib.parse.urlparse(url).hostname or ""
-            cookies = []
-            for part in cookie.split(";"):
-                if "=" in part:
-                    k, v = part.strip().split("=", 1)
-                    cookies.append({"name": k, "value": v, "domain": dom, "path": "/"})
-            try: ctx.add_cookies(cookies)
-            except Exception: pass
-        page = ctx.new_page()
-        def on_request(req):
-            u = req.url
-            if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u): add(u)
-        def on_response(resp):
-            try:
-                ct = resp.headers.get("content-type", "")
-                if ("json" in ct) or ("javascript" in ct):
-                    body = resp.text()
-                    for m in re.findall(STREAM_PAT_M3U8, body): add(m)
-                    for m in re.findall(STREAM_PAT_RTSP, body): add(m)
-                    for m in re.findall(STREAM_PAT_STATUS, body): add(m.replace("recording_status.json", "index.m3u8"))
-            except Exception:
-                pass
-        page.on("request", on_request)
-        page.on("response", on_response)
-        try: page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        except Exception: pass
-        try: page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception: pass
-        try: page.wait_for_timeout(8000)
-        except Exception: pass
-        browser.close()
-    return cands
+def daemon_call(payload, timeout=180):
+    req = urllib.request.Request(DAEMON_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
 
 def probe_stream(url, idx):
     out = PREVIEW_DIR / f"cand_{idx}.jpg"
@@ -612,98 +540,86 @@ def admin_page():
         .order_by(PaymentRequest.id.desc()).limit(50).all()]
     debts = [{"d": d, "overdue": d.due_at < datetime.utcnow()} for d in PromisedDebt.query.filter_by(status="active").order_by(PromisedDebt.due_at).all()]
     settings = {k: get_setting(k) for k in DEFAULT_SETTINGS}
+    browser_active = False
+    try:
+        browser_active = bool(daemon_call({"cmd": "status"}, timeout=5).get("active"))
+    except Exception:
+        browser_active = False
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
-        settings=settings, methods=PAY_METHODS)
+        settings=settings, methods=PAY_METHODS, browser_active=browser_active)
 
 @app.route("/admin/browser")
 @admin_required
 def admin_browser_page():
-    return render_template("browser.html", active=BROWSER_STATE["lock"], burl=BROWSER_STATE["url"])
+    active = False; burl = ""
+    try:
+        st = daemon_call({"cmd": "status"}, timeout=5)
+        active = bool(st.get("active")); burl = st.get("url", "")
+    except Exception:
+        flash("Демон браузера не отвечает. Проверь сервис cctv-browserd.")
+    return render_template("browser.html", active=active, burl=burl)
 
 @app.route("/admin/browser/start", methods=["POST"])
 @admin_required
 def admin_browser_start():
-    if BROWSER_STATE["lock"]:
-        flash("Сессия уже открыта: заверши её или отмени.")
-        return redirect(url_for("admin_browser_page"))
     url = request.form.get("url", "").strip()
     if not url:
         flash("Укажи адрес сайта.")
         return redirect(url_for("admin_browser_page"))
     try:
-        from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
-        ctx = browser.new_context(viewport={"width": 1280, "height": 800}, ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
-        page = ctx.new_page()
-        _attach_listeners(page)
-        try: page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        except Exception: pass
-        page.wait_for_timeout(2500)
-        page.screenshot(path=str(SHOT_PATH))
-        BROWSER_STATE.update(lock=True, pw=pw, browser=browser, ctx=ctx, page=page, cands=[], url=url)
-        flash("Браузер открыт. Войди на сайт через скриншот и нажми «Готово, найти потоки».")
+        r = daemon_call({"cmd": "start", "url": url, "cookie": ""})
+        if r.get("ok"):
+            flash("Браузер открыт. Войди на сайт через скриншот и нажми «Готово, найти потоки».")
+        else:
+            flash(f"Ошибка браузера: {r.get('error')}")
     except Exception as e:
-        flash(f"Не удалось открыть браузер: {e}")
+        flash(f"Демон браузера недоступен: {e}")
     return redirect(url_for("admin_browser_page"))
 
 @app.route("/admin/browser/action", methods=["POST"])
 @admin_required
 def admin_browser_action():
-    if not BROWSER_STATE["lock"]:
-        flash("Нет активной сессии браузера.")
-        return redirect(url_for("admin_browser_page"))
-    page = BROWSER_STATE["page"]
-    act = request.form.get("act", "wait")
     try:
-        if act == "click":
-            x = int(float(request.form.get("x", "0"))); y = int(float(request.form.get("y", "0")))
-            page.mouse.click(x, y)
-        elif act == "type":
-            page.keyboard.type(request.form.get("text", ""), delay=30)
-        elif act == "enter":
-            page.keyboard.press("Enter")
-        elif act == "tab":
-            page.keyboard.press("Tab")
-        elif act == "back":
-            page.go_back()
-        elif act == "scroll":
-            page.mouse.wheel(0, 400)
-        page.wait_for_timeout(1800)
-        page.screenshot(path=str(SHOT_PATH))
+        r = daemon_call({"cmd": "action", "act": request.form.get("act", "wait"),
+            "x": request.form.get("x", "0"), "y": request.form.get("y", "0"),
+            "text": request.form.get("text", "")}, timeout=60)
+        if not r.get("ok"): flash(f"Ошибка действия: {r.get('error')}")
     except Exception as e:
-        flash(f"Ошибка действия: {e}")
+        flash(f"Демон браузера недоступен: {e}")
     return redirect(url_for("admin_browser_page"))
 
 @app.route("/admin/browser/finish", methods=["POST"])
 @admin_required
 def admin_browser_finish():
-    if not BROWSER_STATE["lock"]:
-        flash("Нет активной сессии браузера.")
+    base_url = ""
+    try:
+        st = daemon_call({"cmd": "status"}, timeout=5)
+        base_url = st.get("url", "")
+        r = daemon_call({"cmd": "finish"}, timeout=120)
+        cands = r.get("cands", [])[:12]
+    except Exception as e:
+        flash(f"Демон браузера недоступен: {e}")
         return redirect(url_for("admin_browser_page"))
-    page = BROWSER_STATE["page"]
-    base_url = BROWSER_STATE["url"]
-    try: page.wait_for_timeout(3000)
-    except Exception: pass
-    cands = list(BROWSER_STATE["cands"])[:12]
-    _browser_close()
     items = [{"idx": i, "url": u, "ok": probe_stream(u, i)} for i, u in enumerate(cands, 1)]
-    err = "" if items else "Потоки не пойманы. Попробуй после входа нажать на их плеере play и повторить «Готово»."
+    err = "" if items else "Потоки не пойманы. После входа нажми на их плеере play и повтори «Готово»."
     return render_template("discover.html", items=items, error=err, base_url=base_url)
 
 @app.route("/admin/browser/cancel", methods=["POST"])
 @admin_required
 def admin_browser_cancel():
-    _browser_close()
-    flash("Сессия браузера закрыта.")
+    try:
+        daemon_call({"cmd": "cancel"}, timeout=30)
+        flash("Сессия браузера закрыта.")
+    except Exception as e:
+        flash(f"Демон браузера недоступен: {e}")
     return redirect(url_for("admin_browser_page"))
 
 @app.route("/admin/browser/shot.png")
 @admin_required
 def admin_browser_shot():
-    if SHOT_PATH.exists():
+    p = PREVIEW_DIR / "browser_shot.png"
+    if p.exists():
         resp = send_from_directory(str(PREVIEW_DIR), "browser_shot.png")
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -720,7 +636,8 @@ def admin_discover():
     error = ""
     cands = []
     try:
-        cands = browser_discover(base_url, cookie)
+        r = daemon_call({"cmd": "discover", "url": base_url, "cookie": cookie}, timeout=180)
+        cands = r.get("cands", [])
     except Exception as e:
         error = f"Браузерный парсер недоступен ({e}). Пробую простой разбор HTML."
     if not cands:
@@ -1032,6 +949,141 @@ def admin_camera_delete(camera_id):
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
 APP_EOF
+echo "=== browserd.py (демон удалённого браузера) ==="
+cat > "$WORKER/browserd.py" <<'BROWSERD_EOF'
+import json, re
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright
+
+SHOT = "/opt/cctv/storage/previews/browser_shot.png"
+M3U8 = r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*'
+RTSP = r'rtsp://[^\s"\'\\]+'
+STATUS = r'https?://[^\s"\'\\]+/recording_status\.json[^\s"\'\\]*'
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+class D:
+    pw = None; browser = None; ctx = None; page = None; cands = []; url = ""
+
+def add(u):
+    u = u.replace("&amp;", "&")
+    if u not in D.cands: D.cands.append(u)
+
+def attach(page):
+    def on_req(req):
+        u = req.url
+        if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u): add(u)
+    def on_resp(resp):
+        try:
+            ct = resp.headers.get("content-type", "")
+            if ("json" in ct) or ("javascript" in ct):
+                b = resp.text()
+                for m in re.findall(M3U8, b): add(m)
+                for m in re.findall(RTSP, b): add(m)
+                for m in re.findall(STATUS, b): add(m.replace("recording_status.json", "index.m3u8"))
+        except Exception:
+            pass
+    page.on("request", on_req)
+    page.on("response", on_resp)
+
+def ensure_pw():
+    if D.pw is None:
+        D.pw = sync_playwright().start()
+    return D.pw
+
+def close_all():
+    for attr in ("page", "ctx", "browser"):
+        obj = getattr(D, attr)
+        if obj is not None:
+            try: obj.close()
+            except Exception: pass
+            setattr(D, attr, None)
+
+def start(url, cookie):
+    close_all()
+    D.cands = []; D.url = url
+    pw = ensure_pw()
+    D.browser = pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
+    D.ctx = D.browser.new_context(viewport={"width": 1280, "height": 800}, ignore_https_errors=True, user_agent=UA)
+    if cookie:
+        dom = urlparse(url).hostname or ""
+        cookies = []
+        for part in cookie.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                cookies.append({"name": k, "value": v, "domain": dom, "path": "/"})
+        try: D.ctx.add_cookies(cookies)
+        except Exception: pass
+    D.page = D.ctx.new_page()
+    attach(D.page)
+    try: D.page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    except Exception: pass
+    D.page.wait_for_timeout(2500)
+    D.page.screenshot(path=SHOT)
+    return {"ok": True}
+
+def action(act, x, y, text):
+    if D.page is None: return {"ok": False, "error": "no session"}
+    p = D.page
+    try:
+        if act == "click": p.mouse.click(int(x), int(y))
+        elif act == "type": p.keyboard.type(text or "", delay=30)
+        elif act == "enter": p.keyboard.press("Enter")
+        elif act == "tab": p.keyboard.press("Tab")
+        elif act == "back": p.go_back()
+        elif act == "scroll": p.mouse.wheel(0, 400)
+        p.wait_for_timeout(1800)
+        p.screenshot(path=SHOT)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def finish(extra_wait=3000):
+    if D.page is None: return {"ok": False, "cands": []}
+    try: D.page.wait_for_timeout(extra_wait)
+    except Exception: pass
+    cands = list(D.cands)[:12]
+    close_all()
+    D.cands = []
+    return {"ok": True, "cands": cands}
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(ln) or b"{}")
+        cmd = body.get("cmd")
+        try:
+            if cmd == "start":
+                self._send(start(body.get("url", ""), body.get("cookie", "")))
+            elif cmd == "action":
+                self._send(action(body.get("act"), body.get("x", 0), body.get("y", 0), body.get("text", "")))
+            elif cmd == "finish":
+                self._send(finish())
+            elif cmd == "discover":
+                start(body.get("url", ""), body.get("cookie", ""))
+                D.page.wait_for_timeout(8000)
+                self._send(finish(1000))
+            elif cmd == "cancel":
+                close_all(); D.cands = []
+                self._send({"ok": True})
+            elif cmd == "status":
+                self._send({"ok": True, "active": D.page is not None, "url": D.url})
+            else:
+                self._send({"ok": False, "error": "unknown cmd"})
+        except Exception as e:
+            self._send({"ok": False, "error": str(e)})
+    def log_message(self, *a): pass
+
+if __name__ == "__main__":
+    HTTPServer(("127.0.0.1", 8099), H).serve_forever()
+BROWSERD_EOF
 echo "=== base.html ==="
 cat > "$APP/templates/base.html" <<'BASE_EOF'
 <!doctype html>
@@ -1086,7 +1138,7 @@ pre.log{background:#0b1229;border:1px solid #33415c;border-radius:8px;padding:8p
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.8</span>
+  <span class="badge warn">v3.9</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
@@ -1142,7 +1194,7 @@ cat > "$APP/templates/browser.html" <<'BROWSER_EOF'
 {% block content %}
 <h1>Вход на сайт через окно браузера</h1>
 {% if active %}
-<p class="muted">Адрес: {{ burl }}. Кликай по скриншоту как по настоящему экрану, вводи текст кнопкой «Ввести текст», Enter — кнопкой. Обновление кадра — после каждого действия или кнопкой «Ждать/обновить».</p>
+<p class="muted">Адрес: {{ burl }}. Кликай по скриншоту как по настоящему экрану, вводи текст кнопкой «Ввести текст», Enter — кнопкой. Кадр обновляется после каждого действия.</p>
 <img id="shot" src="{{ url_for('admin_browser_shot') }}?t={{ range(1000000)|random }}">
 <script>
 document.getElementById("shot").addEventListener("click", function (e) {
@@ -1440,13 +1492,14 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.8</span></h1>
+<h1>Админка <span class="badge warn">v3.9</span></h1>
 
 <details class="card" id="discover">
 <summary>Парсер потоков с чужого сайта</summary>
 <p class="muted">Два способа: 1) «Войти через окно браузера» — сервер откроет браузер, ты сам войдёшь на сайт,
 и система перехватит потоки их плеера (рекомендуется для сайтов с логином);
-2) быстрый парсер по адресу страницы + Cookie вручную.</p>
+2) быстрый парсер по адресу страницы + Cookie вручную.
+{% if browser_active %}<span class="badge warn">сейчас открыта сессия браузера</span>{% endif %}</p>
 <form method="post" action="{{ url_for('admin_discover') }}" class="formrow">
   <input name="base_url" placeholder="https://сайт/страница-с-камерами" style="flex:1" required>
   <input name="cookie" placeholder="Cookie: name=value; … (необязательно)" style="flex:1">
@@ -1759,7 +1812,7 @@ echo "=== Виртуальное окружение ==="
 if [ ! -f "$BASE/venv/bin/activate" ]; then python3 -m venv "$BASE/venv"; fi
 "$BASE/venv/bin/pip" install --upgrade pip
 "$BASE/venv/bin/pip" install -r "$APP/requirements.txt"
-echo "=== Headless-браузер для парсера и окна входа ==="
+echo "=== Headless-браузер для демона ==="
 "$BASE/venv/bin/python" -m playwright install --with-deps chromium 2>/dev/null || "$BASE/venv/bin/python" -m playwright install chromium || echo "WARNING: chromium не установился"
 echo "=== Миграция базы (идемпотентная) ==="
 if [ -f "$APP/cctv.db" ]; then
@@ -1821,7 +1874,7 @@ User=cctv
 Group=cctv
 WorkingDirectory=/opt/cctv/app
 EnvironmentFile=/opt/cctv/.env
-ExecStart=/opt/cctv/venv/bin/gunicorn --workers 1 --threads 8 --timeout 180 --bind 127.0.0.1:8077 app:app
+ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --threads 4 --timeout 180 --bind 127.0.0.1:8077 app:app
 Restart=always
 RestartSec=3
 [Install]
@@ -1857,6 +1910,21 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNIT_BILLING_EOF
+cat > /etc/systemd/system/cctv-browserd.service <<'UNIT_BROWSERD_EOF'
+[Unit]
+Description=CCTV remote browser daemon
+After=network.target
+[Service]
+Type=simple
+User=cctv
+Group=cctv
+WorkingDirectory=/opt/cctv/worker
+ExecStart=/opt/cctv/venv/bin/python3 /opt/cctv/worker/browserd.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT_BROWSERD_EOF
 echo "=== Освобождение порта 80 (терпеливое) ==="
 wait_port_free() {
     local n=0
@@ -1931,6 +1999,7 @@ systemctl daemon-reload
 systemctl enable --now cctv-web.service
 systemctl enable --now cctv-worker.service
 systemctl enable --now cctv-billing.service
+systemctl enable --now cctv-browserd.service
 if ! systemctl restart nginx; then
     echo "WARNING: nginx restart failed, чищу зависшие процессы и стартую заново"
     systemctl kill nginx 2>/dev/null || true
@@ -1941,7 +2010,9 @@ fi
 echo "=== Самопроверка ==="
 sleep 3
 SITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$NGINX_LISTEN/login)
+DAEMON_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d '{"cmd":"status"}' http://127.0.0.1:8099/)
 echo "site login page: $SITE_CODE (ожидаем 200)"
+echo "browser daemon:  $DAEMON_CODE (ожидаем 200)"
 if [ "$SITE_CODE" != "200" ]; then
     echo "!!! сайт не отвечает, логи:"
     journalctl -u cctv-web -n 20 --no-pager || true
