@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Вход на сайт через окно браузера</h1>
+{% if active %}
+<p class="muted">Адрес: {{ burl }}. Кликай по скриншоту, вводи текст кнопкой «Ввести текст», Enter — кнопкой.</p>
+<img id="shot" src="{{ url_for('admin_browser_shot') }}?t={{ range(1000000)|random }}">
+<script>
+document.getElementById("shot").addEventListener("click", function (e) {
+  var r = this.getBoundingClientRect();
+  var x = (e.clientX - r.left) * (this.naturalWidth / r.width);
+  var y = (e.clientY - r.top) * (this.naturalHeight / r.height);
+  var f = document.getElementById("clickform");
+  f.x.value = Math.round(x); f.y.value = Math.round(y);
+  f.submit();
+});
+</script>
+<form id="clickform" method="post" action="{{ url_for('admin_browser_action') }}" style="display:none;">
+  <input type="hidden" name="act" value="click"><input type="hidden" name="x"><input type="hidden" name="y">
+</form>
+<div class="card">
+  <form method="post" action="{{ url_for('admin_browser_action') }}" class="formrow">
+    <input type="hidden" name="act" value="type">
+    <input name="text" placeholder="Текст (логин или пароль) → «Ввести текст»" style="flex:1">
+    <button class="btn" type="submit">Ввести текст</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_action') }}" class="formrow">
+    <button class="btn gray" type="submit" name="act" value="enter">Enter</button>
+    <button class="btn gray" type="submit" name="act" value="tab">Tab</button>
+    <button class="btn gray" type="submit" name="act" value="back">Назад</button>
+    <button class="btn gray" type="submit" name="act" value="scroll">Прокрутить</button>
+    <button class="btn gray" type="submit" name="act" value="wait">Ждать / обновить</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_finish') }}" style="display:inline;">
+    <button class="btn" type="submit">Готово, найти потоки</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_cancel') }}" style="display:inline;">
+    <button class="btn red" type="submit">Отменить сессию</button>
+  </form>
+</div>
+{% else %}
+<form method="post" action="{{ url_for('admin_browser_start') }}" class="formrow">
+  <input name="url" placeholder="https://сайт/страница-входа-или-камер" style="flex:1" required>
+  <button class="btn" type="submit">Открыть окно браузера</button>
+</form>
+<p class="muted">Сервер откроет настоящий браузер у себя и покажет его экран. Войди на сайт как обычно —
+сессия останется там, и система перехватит все потоки их плеера. Cookie вручную не нужны.</p>
+<p><a class="btn gray" href="{{ url_for('admin_page') }}#discover">К парсеру без входа (Cookie вручную)</a></p>
+{% endif %}
+{% endblock %}
