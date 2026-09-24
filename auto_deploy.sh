@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.7"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.8"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
@@ -238,23 +238,59 @@ def fetch_page(url, cookie):
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8", "ignore")
 
+STREAM_PAT_M3U8 = r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*'
+STREAM_PAT_RTSP = r'rtsp://[^\s"\'<>\\]+'
+STREAM_PAT_STATUS = r'https?://[^\s"\'<>\\]+/recording_status\.json[^\s"\'<>\\]*'
+
 def extract_candidates(html, base_url):
     found = []
-    pats = [
-        r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*',
-        r'rtsp://[^\s"\'<>\\]+',
-    ]
-    for p in pats:
+    for p in (STREAM_PAT_M3U8, STREAM_PAT_RTSP):
         for m in re.findall(p, html):
             u = m.replace("&amp;", "&")
             if u not in found: found.append(u)
     for m in re.findall(r'["\'](/[^\s"\'<>\\]*\.m3u8[^\s"\'<>\\]*)["\']', html):
         u = urllib.parse.urljoin(base_url, m.replace("&amp;", "&"))
         if u not in found: found.append(u)
-    for m in re.findall(r'https?://[^\s"\'<>\\]+/recording_status\.json[^\s"\'<>\\]*', html):
+    for m in re.findall(STREAM_PAT_STATUS, html):
         alt = m.replace("recording_status.json", "index.m3u8").replace("&amp;", "&")
         if alt not in found: found.append(alt)
     return found
+
+BROWSER_STATE = {"lock": False, "pw": None, "browser": None, "ctx": None, "page": None, "cands": [], "url": ""}
+SHOT_PATH = PREVIEW_DIR / "browser_shot.png"
+
+def _add_cand(u):
+    u = u.replace("&amp;", "&")
+    if u not in BROWSER_STATE["cands"]: BROWSER_STATE["cands"].append(u)
+
+def _attach_listeners(page):
+    def on_request(req):
+        u = req.url
+        if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u): _add_cand(u)
+    def on_response(resp):
+        try:
+            ct = resp.headers.get("content-type", "")
+            if ("json" in ct) or ("javascript" in ct):
+                body = resp.text()
+                for m in re.findall(STREAM_PAT_M3U8, body): _add_cand(m)
+                for m in re.findall(STREAM_PAT_RTSP, body): _add_cand(m)
+                for m in re.findall(STREAM_PAT_STATUS, body): _add_cand(m.replace("recording_status.json", "index.m3u8"))
+        except Exception:
+            pass
+    page.on("request", on_request)
+    page.on("response", on_response)
+
+def _browser_close():
+    for k in ("page", "ctx", "browser"):
+        obj = BROWSER_STATE.get(k)
+        if obj is not None:
+            try: obj.close()
+            except Exception: pass
+    pw = BROWSER_STATE.get("pw")
+    if pw is not None:
+        try: pw.stop()
+        except Exception: pass
+    BROWSER_STATE.update(lock=False, pw=None, browser=None, ctx=None, page=None, cands=[])
 
 def browser_discover(url, cookie):
     from playwright.sync_api import sync_playwright
@@ -264,10 +300,7 @@ def browser_discover(url, cookie):
         if u not in cands: cands.append(u)
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            ignore_https_errors=True,
-        )
+        ctx = browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36", ignore_https_errors=True)
         if cookie:
             dom = urllib.parse.urlparse(url).hostname or ""
             cookies = []
@@ -280,33 +313,25 @@ def browser_discover(url, cookie):
         page = ctx.new_page()
         def on_request(req):
             u = req.url
-            if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u):
-                add(u)
+            if (".m3u8" in u) or u.startswith("rtsp://") or (".mpd" in u): add(u)
         def on_response(resp):
             try:
                 ct = resp.headers.get("content-type", "")
-                if "json" in ct or "javascript" in ct:
+                if ("json" in ct) or ("javascript" in ct):
                     body = resp.text()
-                    for m in re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', body): add(m)
-                    for m in re.findall(r'https?://[^\s"\'\\]+/recording_status\.json[^\s"\'\\]*', body):
-                        add(m.replace("recording_status.json", "index.m3u8"))
-                    for m in re.findall(r'rtsp://[^\s"\'\\]+', body): add(m)
+                    for m in re.findall(STREAM_PAT_M3U8, body): add(m)
+                    for m in re.findall(STREAM_PAT_RTSP, body): add(m)
+                    for m in re.findall(STREAM_PAT_STATUS, body): add(m.replace("recording_status.json", "index.m3u8"))
             except Exception:
                 pass
         page.on("request", on_request)
         page.on("response", on_response)
-        try:
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        try:
-            page.wait_for_timeout(8000)
-        except Exception:
-            pass
+        try: page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        except Exception: pass
+        try: page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception: pass
+        try: page.wait_for_timeout(8000)
+        except Exception: pass
         browser.close()
     return cands
 
@@ -591,6 +616,99 @@ def admin_page():
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
         settings=settings, methods=PAY_METHODS)
 
+@app.route("/admin/browser")
+@admin_required
+def admin_browser_page():
+    return render_template("browser.html", active=BROWSER_STATE["lock"], burl=BROWSER_STATE["url"])
+
+@app.route("/admin/browser/start", methods=["POST"])
+@admin_required
+def admin_browser_start():
+    if BROWSER_STATE["lock"]:
+        flash("Сессия уже открыта: заверши её или отмени.")
+        return redirect(url_for("admin_browser_page"))
+    url = request.form.get("url", "").strip()
+    if not url:
+        flash("Укажи адрес сайта.")
+        return redirect(url_for("admin_browser_page"))
+    try:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--ignore-certificate-errors"])
+        ctx = browser.new_context(viewport={"width": 1280, "height": 800}, ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+        page = ctx.new_page()
+        _attach_listeners(page)
+        try: page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        except Exception: pass
+        page.wait_for_timeout(2500)
+        page.screenshot(path=str(SHOT_PATH))
+        BROWSER_STATE.update(lock=True, pw=pw, browser=browser, ctx=ctx, page=page, cands=[], url=url)
+        flash("Браузер открыт. Войди на сайт через скриншот и нажми «Готово, найти потоки».")
+    except Exception as e:
+        flash(f"Не удалось открыть браузер: {e}")
+    return redirect(url_for("admin_browser_page"))
+
+@app.route("/admin/browser/action", methods=["POST"])
+@admin_required
+def admin_browser_action():
+    if not BROWSER_STATE["lock"]:
+        flash("Нет активной сессии браузера.")
+        return redirect(url_for("admin_browser_page"))
+    page = BROWSER_STATE["page"]
+    act = request.form.get("act", "wait")
+    try:
+        if act == "click":
+            x = int(float(request.form.get("x", "0"))); y = int(float(request.form.get("y", "0")))
+            page.mouse.click(x, y)
+        elif act == "type":
+            page.keyboard.type(request.form.get("text", ""), delay=30)
+        elif act == "enter":
+            page.keyboard.press("Enter")
+        elif act == "tab":
+            page.keyboard.press("Tab")
+        elif act == "back":
+            page.go_back()
+        elif act == "scroll":
+            page.mouse.wheel(0, 400)
+        page.wait_for_timeout(1800)
+        page.screenshot(path=str(SHOT_PATH))
+    except Exception as e:
+        flash(f"Ошибка действия: {e}")
+    return redirect(url_for("admin_browser_page"))
+
+@app.route("/admin/browser/finish", methods=["POST"])
+@admin_required
+def admin_browser_finish():
+    if not BROWSER_STATE["lock"]:
+        flash("Нет активной сессии браузера.")
+        return redirect(url_for("admin_browser_page"))
+    page = BROWSER_STATE["page"]
+    base_url = BROWSER_STATE["url"]
+    try: page.wait_for_timeout(3000)
+    except Exception: pass
+    cands = list(BROWSER_STATE["cands"])[:12]
+    _browser_close()
+    items = [{"idx": i, "url": u, "ok": probe_stream(u, i)} for i, u in enumerate(cands, 1)]
+    err = "" if items else "Потоки не пойманы. Попробуй после входа нажать на их плеере play и повторить «Готово»."
+    return render_template("discover.html", items=items, error=err, base_url=base_url)
+
+@app.route("/admin/browser/cancel", methods=["POST"])
+@admin_required
+def admin_browser_cancel():
+    _browser_close()
+    flash("Сессия браузера закрыта.")
+    return redirect(url_for("admin_browser_page"))
+
+@app.route("/admin/browser/shot.png")
+@admin_required
+def admin_browser_shot():
+    if SHOT_PATH.exists():
+        resp = send_from_directory(str(PREVIEW_DIR), "browser_shot.png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    abort(404)
+
 @app.route("/admin/discover", methods=["POST"])
 @admin_required
 def admin_discover():
@@ -612,9 +730,7 @@ def admin_discover():
         except Exception as e:
             error = (error + " " if error else "") + f"Не удалось загрузить страницу: {e}"
     cands = cands[:12]
-    items = []
-    for i, u in enumerate(cands, 1):
-        items.append({"idx": i, "url": u, "ok": probe_stream(u, i)})
+    items = [{"idx": i, "url": u, "ok": probe_stream(u, i)} for i, u in enumerate(cands, 1)]
     return render_template("discover.html", items=items, error=error, base_url=base_url)
 
 @app.route("/admin/discover/preview/<path:filename>")
@@ -964,12 +1080,13 @@ video{width:100%;border-radius:10px;background:#000;}
 h1{font-size:22px;margin:0 0 16px;}
 h2{font-size:17px;margin:0 0 12px;}
 pre.log{background:#0b1229;border:1px solid #33415c;border-radius:8px;padding:8px;font-size:12px;overflow-x:auto;}
+#shot{width:100%;max-width:1000px;border:1px solid #33415c;border-radius:8px;cursor:crosshair;}
 </style>
 </head>
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.7</span>
+  <span class="badge warn">v3.8</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
@@ -1019,6 +1136,60 @@ cat > "$APP/templates/login.html" <<'LOGIN_EOF'
 </div>
 {% endblock %}
 LOGIN_EOF
+echo "=== browser.html ==="
+cat > "$APP/templates/browser.html" <<'BROWSER_EOF'
+{% extends "base.html" %}
+{% block content %}
+<h1>Вход на сайт через окно браузера</h1>
+{% if active %}
+<p class="muted">Адрес: {{ burl }}. Кликай по скриншоту как по настоящему экрану, вводи текст кнопкой «Ввести текст», Enter — кнопкой. Обновление кадра — после каждого действия или кнопкой «Ждать/обновить».</p>
+<img id="shot" src="{{ url_for('admin_browser_shot') }}?t={{ range(1000000)|random }}">
+<script>
+document.getElementById("shot").addEventListener("click", function (e) {
+  var r = this.getBoundingClientRect();
+  var x = (e.clientX - r.left) * (this.naturalWidth / r.width);
+  var y = (e.clientY - r.top) * (this.naturalHeight / r.height);
+  var f = document.getElementById("clickform");
+  f.x.value = Math.round(x); f.y.value = Math.round(y);
+  f.submit();
+});
+</script>
+<form id="clickform" method="post" action="{{ url_for('admin_browser_action') }}" style="display:none;">
+  <input type="hidden" name="act" value="click">
+  <input type="hidden" name="x">
+  <input type="hidden" name="y">
+</form>
+<div class="card">
+  <form method="post" action="{{ url_for('admin_browser_action') }}" class="formrow">
+    <input type="hidden" name="act" value="type">
+    <input name="text" placeholder="Текст (логин или пароль) → нажать «Ввести текст»" style="flex:1">
+    <button class="btn" type="submit">Ввести текст</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_action') }}" class="formrow">
+    <button class="btn gray" type="submit" name="act" value="enter">Enter</button>
+    <button class="btn gray" type="submit" name="act" value="tab">Tab</button>
+    <button class="btn gray" type="submit" name="act" value="back">Назад</button>
+    <button class="btn gray" type="submit" name="act" value="scroll">Прокрутить</button>
+    <button class="btn gray" type="submit" name="act" value="wait">Ждать / обновить</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_finish') }}" style="display:inline;">
+    <button class="btn" type="submit">Готово, найти потоки</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_browser_cancel') }}" style="display:inline;">
+    <button class="btn red" type="submit">Отменить сессию</button>
+  </form>
+</div>
+{% else %}
+<form method="post" action="{{ url_for('admin_browser_start') }}" class="formrow">
+  <input name="url" placeholder="https://сайт/страница-входа-или-камер" style="flex:1" required>
+  <button class="btn" type="submit">Открыть окно браузера</button>
+</form>
+<p class="muted">Сервер откроет настоящий браузер у себя и покажет тебе его экран. Войди на сайт как обычно —
+сессия останется в том браузере, и система перехватит все потоки, которые запросит их плеер. Cookie вручную не нужны.</p>
+<p><a class="btn gray" href="{{ url_for('admin_page') }}#discover">К парсеру без входа (Cookie вручную)</a></p>
+{% endif %}
+{% endblock %}
+BROWSER_EOF
 echo "=== dashboard.html ==="
 cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 {% extends "base.html" %}
@@ -1189,9 +1360,8 @@ cat > "$APP/templates/discover.html" <<'DISCOVER_EOF'
   {% endfor %}
 </div>
 {% else %}
-<p class="muted">Потоки не найдены. Такое бывает, если плеер стартует только по клику «play» или страница требует логин.
-Попробуй: 1) вставить Cookie из браузера; 2) открыть на их сайте конкретную камеру и взять адрес этой страницы;
-3) подключить поток вручную ниже (DevTools → Network → фильтр m3u8).</p>
+<p class="muted">Потоки не найдены. Попробуй: открыть окно браузера и войти вручную; либо вставить Cookie в парсер;
+либо подключить поток вручную ниже (DevTools → Network → m3u8).</p>
 {% endif %}
 <div class="card">
   <h2>Подключить поток вручную</h2>
@@ -1270,19 +1440,19 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.7</span></h1>
+<h1>Админка <span class="badge warn">v3.8</span></h1>
 
 <details class="card" id="discover">
 <summary>Парсер потоков с чужого сайта</summary>
-<p class="muted">Вставь адрес страницы, где крутится видео их камер. Сервер откроет её невидимым браузером,
-перехватит всё, что запрашивает их плеер (m3u8 / rtsp / mpd / ссылки из JSON API), проверит каждый поток
-и покажет превью кадра. Останется выбрать имя и нажать «Подключить». Если сайт под логином — вставь Cookie.
-Поиск занимает до ~1 минуты.</p>
+<p class="muted">Два способа: 1) «Войти через окно браузера» — сервер откроет браузер, ты сам войдёшь на сайт,
+и система перехватит потоки их плеера (рекомендуется для сайтов с логином);
+2) быстрый парсер по адресу страницы + Cookie вручную.</p>
 <form method="post" action="{{ url_for('admin_discover') }}" class="formrow">
   <input name="base_url" placeholder="https://сайт/страница-с-камерами" style="flex:1" required>
   <input name="cookie" placeholder="Cookie: name=value; … (необязательно)" style="flex:1">
-  <button class="btn" type="submit">Найти и показать потоки</button>
+  <button class="btn" type="submit">Найти потоки</button>
 </form>
+<p><a class="btn" href="{{ url_for('admin_browser_page') }}">Войти через окно браузера</a></p>
 </details>
 
 <details class="card" id="requests" {% if pending_requests %}open{% endif %}>
@@ -1589,8 +1759,8 @@ echo "=== Виртуальное окружение ==="
 if [ ! -f "$BASE/venv/bin/activate" ]; then python3 -m venv "$BASE/venv"; fi
 "$BASE/venv/bin/pip" install --upgrade pip
 "$BASE/venv/bin/pip" install -r "$APP/requirements.txt"
-echo "=== Headless-браузер для парсера (первый раз долго, ~1-2 мин) ==="
-"$BASE/venv/bin/python" -m playwright install --with-deps chromium 2>/dev/null || "$BASE/venv/bin/python" -m playwright install chromium || echo "WARNING: chromium не установился, парсер будет работать в резервном режиме (разбор HTML)"
+echo "=== Headless-браузер для парсера и окна входа ==="
+"$BASE/venv/bin/python" -m playwright install --with-deps chromium 2>/dev/null || "$BASE/venv/bin/python" -m playwright install chromium || echo "WARNING: chromium не установился"
 echo "=== Миграция базы (идемпотентная) ==="
 if [ -f "$APP/cctv.db" ]; then
     python3 - "$APP/cctv.db" <<'PYMIG'
@@ -1651,7 +1821,7 @@ User=cctv
 Group=cctv
 WorkingDirectory=/opt/cctv/app
 EnvironmentFile=/opt/cctv/.env
-ExecStart=/opt/cctv/venv/bin/gunicorn --workers 2 --timeout 180 --bind 127.0.0.1:8077 app:app
+ExecStart=/opt/cctv/venv/bin/gunicorn --workers 1 --threads 8 --timeout 180 --bind 127.0.0.1:8077 app:app
 Restart=always
 RestartSec=3
 [Install]
