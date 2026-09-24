@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:380px;margin:60px auto;">
+  <h1>Вход</h1>
+  <form method="post" action="{{ url_for('login') }}">
+    <div class="formrow"><input type="text" name="username" placeholder="Логин" required style="flex:1"></div>
+    <div class="formrow"><input type="password" name="password" placeholder="Пароль" required style="flex:1"></div>
+    <button class="btn" type="submit">Войти</button>
+  </form>
+</div>
+{% endblock %}
