@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.0"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.1"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
@@ -242,7 +242,6 @@ def dashboard():
         cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
     else:
         cameras = []
-        cam_items = [{"camera": c, "enabled": bool((user_link(current_user.id, c.id) or {}).enabled if user_link(current_user.id, c.id) else False)} for c in current_user.cameras]
         cam_items = [{"camera": c, "enabled": bool(user_link(current_user.id, c.id).enabled)} for c in current_user.cameras]
     tariff_options = [{"tariff": t, "label": interval_label(t.interval_seconds)} for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()]
     my_requests = [{"p": p, "label": method_label(p.method)} for p in PaymentRequest.query.filter_by(user_id=current_user.id).order_by(PaymentRequest.id.desc()).limit(10).all()]
@@ -698,7 +697,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.0</span>
+  <span class="badge warn">v3.1</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -800,7 +799,6 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 </div>
 {% endif %}
 <h1>Мои камеры</h1>
-{% set items = cam_items if not current_user.admin else [] %}
 {% if current_user.admin %}
   {% if cameras %}
   <div class="grid">
@@ -906,7 +904,7 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.0</span></h1>
+<h1>Админка <span class="badge warn">v3.1</span></h1>
 <div class="card">
 <h2>Настройки пополнения и обещанного платежа</h2>
 <form method="post" action="{{ url_for('admin_settings') }}">
@@ -1278,28 +1276,37 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNIT_BILLING_EOF
-echo "=== Освобождение порта 80 ==="
+echo "=== Освобождение порта 80 (умное) ==="
 NGINX_LISTEN=80
+STOPPED_CONTAINERS=""
 for i in 1 2 3; do
     if ! ss -tln | grep -q ':80 '; then break; fi
     PID=$(ss -tlnp | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1) || true
     if [ -z "$PID" ]; then break; fi
-    CG=$(cat /proc/$PID/cgroup 2>/dev/null | head -1) || true
-    if [[ "$CG" == *docker-* ]]; then
-        CID=$(echo "$CG" | grep -oP 'docker-\K[0-9a-f]{12,}' | head -1) || true
-        echo "Порт 80 держит docker-контейнер $CID — останавливаю"
+    CID=""
+    if command -v docker &>/dev/null; then
+        CID=$(docker ps -q 2>/dev/null | while read -r c; do
+                docker top "$c" 2>/dev/null | awk -v p="$PID" '$2==p{print c; exit}'
+              done | head -1) || true
+    fi
+    if [ -n "$CID" ]; then
+        echo "Порт 80 держит docker-контейнер $CID — отключаю автостарт и останавливаю"
         docker update --restart=no "$CID" 2>/dev/null || true
         docker stop "$CID" 2>/dev/null || true
+        STOPPED_CONTAINERS="$STOPPED_CONTAINERS $CID"
     else
         echo "Убиваю процесс $PID, держащий порт 80"
         kill -9 "$PID" 2>/dev/null || true
     fi
     sleep 2
 done
+if [ -n "$STOPPED_CONTAINERS" ]; then
+    echo "Остановленные контейнеры:$STOPPED_CONTAINERS (автостарт отключён, после перезагрузки не встанут)"
+fi
 if ss -tln | grep -q ':80 '; then
-    echo "WARNING: порт 80 всё ещё занят чужим процессом — переключаю сайт на 8080"
-    echo "Понадобится на роутере проброс: внешний 81 -> внутренний 8080"
-    NGINX_LISTEN=8080
+    echo "WARNING: порт 80 всё ещё занят — переключаю сайт на 8090"
+    echo "Понадобится на роутере проброс: внешний 81 -> внутренний 8090"
+    NGINX_LISTEN=8090
 fi
 echo "=== Nginx (listen $NGINX_LISTEN) ==="
 cat > /etc/nginx/sites-available/cctv <<'NGINX_EOF'
