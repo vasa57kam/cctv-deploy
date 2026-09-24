@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Найденные потоки: {{ base_url }}</h1>
+{% if error %}<p class="muted">{{ error }}</p>{% endif %}
+{% if items %}
+<div class="grid">
+  {% for it in items %}
+  <div class="cam">
+    {% if it.ok %}
+      <img src="{{ url_for('discover_preview', filename='cand_%d.jpg' % it.idx) }}" style="width:100%;border-radius:8px;">
+    {% else %}
+      <p class="muted">Превью нет: поток не открылся с сервера</p>
+    {% endif %}
+    <p class="muted" style="word-break:break-all;">{{ it.url }}</p>
+    <form method="post" action="{{ url_for('admin_discover_attach') }}" class="formrow">
+      <input type="hidden" name="url" value="{{ it.url }}">
+      <input name="name" placeholder="Название камеры" value="Источник {{ it.idx }}">
+      <label class="muted"><input type="checkbox" name="recording" value="1"> писать архив</label>
+      <button class="btn" type="submit">Подключить</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="muted">Потоки не найдены. Открой окно браузера и войди вручную, либо вставь Cookie в парсер,
+либо подключи поток вручную ниже (DevTools → Network → m3u8).</p>
+{% endif %}
+<div class="card">
+  <h2>Подключить поток вручную</h2>
+  <form method="post" action="{{ url_for('admin_discover_attach') }}" class="formrow">
+    <input name="url" placeholder="https://…/index.m3u8?token=… или rtsp://…" style="flex:1" required>
+    <input name="name" placeholder="Название камеры">
+    <label class="muted"><input type="checkbox" name="recording" value="1"> писать архив</label>
+    <button class="btn" type="submit">Подключить</button>
+  </form>
+</div>
+<p><a class="btn gray" href="{{ url_for('admin_page') }}#discover">Вернуться в админку</a></p>
+{% endblock %}
