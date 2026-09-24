@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.3"
+BASE="/opt/cctv"; APP="$BASE/app"; WORKER="$BASE/worker"; STORAGE="$BASE/storage"; BACKUP="$BASE/backup"; VERSION="3.4"
 [[ $EUID -ne 0 ]] && { echo "Запусти через sudo или от root."; exit 1; }
 echo "=== CCTV deploy v$VERSION: остановка сервисов ==="
 systemctl stop cctv-web cctv-worker cctv-billing 2>/dev/null || true
@@ -26,7 +26,7 @@ import os, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, abort, send_from_directory, flash
+from flask import Flask, render_template, request, redirect, url_for, abort, send_from_directory, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -103,6 +103,7 @@ class PaymentRequest(db.Model):
     amount = db.Column(db.Float, nullable=False); method = db.Column(db.String(20), default="other")
     comment = db.Column(db.String(255)); status = db.Column(db.String(10), default="pending")
     user_hidden = db.Column(db.Boolean, default=False)
+    admin_hidden = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow); processed_at = db.Column(db.DateTime, nullable=True)
     user = db.relationship("User", backref="payment_requests")
 
@@ -240,12 +241,27 @@ def login():
 @app.route("/logout")
 @login_required
 def logout():
+    session.pop("impersonator", None)
     logout_user(); return redirect(url_for("login"))
+
+@app.route("/stop-impersonation")
+@login_required
+def stop_impersonation():
+    imp_id = session.pop("impersonator", None)
+    if not imp_id:
+        return redirect(url_for("dashboard"))
+    admin_user = db.session.get(User, int(imp_id))
+    logout_user()
+    if admin_user: login_user(admin_user)
+    flash("Вы вернулись в админку.")
+    return redirect(url_for("admin_page"))
 
 @app.route("/")
 @login_required
 def dashboard():
-    if current_user.admin:
+    if current_user.admin and not session.get("impersonator"):
+        cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
+    elif current_user.admin:
         cameras = Camera.query.order_by(Camera.id.desc()).all(); cam_items = []
     else:
         cameras = []
@@ -456,13 +472,43 @@ def archive_download(camera_id, filename):
 @admin_required
 def admin_page():
     users = User.query.order_by(User.id.desc()).all(); cameras = Camera.query.order_by(Camera.id.desc()).all()
-    tariffs = Tariff.query.order_by(Tariff.id).all(); transactions = Transaction.query.order_by(Transaction.id.desc()).limit(50).all()
+    tariffs = Tariff.query.order_by(Tariff.id).all()
+    q = request.args.get("q", "").strip()
+    if q:
+        like = f"%{q}%"
+        transactions = db.session.execute(
+            db.select(Transaction).join(User, Transaction.user_id == User.id).where(
+                db.or_(
+                    User.username.like(like),
+                    Transaction.reason.like(like),
+                    db.cast(Transaction.amount, db.String).like(like),
+                    db.cast(Transaction.created_at, db.String).like(like),
+                )
+            ).order_by(Transaction.id.desc()).limit(300)
+        ).scalars().all()
+    else:
+        transactions = Transaction.query.order_by(Transaction.id.desc()).limit(50).all()
     pending_requests = [{"p": p, "label": method_label(p.method)} for p in PaymentRequest.query.filter_by(status="pending").order_by(PaymentRequest.id).all()]
-    processed_requests = [{"p": p, "label": method_label(p.method)} for p in PaymentRequest.query.filter(PaymentRequest.status != "pending").order_by(PaymentRequest.id.desc()).limit(20).all()]
+    processed_requests = [{"p": p, "label": method_label(p.method)} for p in
+        PaymentRequest.query.filter(PaymentRequest.status != "pending", PaymentRequest.admin_hidden == False)
+        .order_by(PaymentRequest.id.desc()).limit(50).all()]
     debts = [{"d": d, "overdue": d.due_at < datetime.utcnow()} for d in PromisedDebt.query.filter_by(status="active").order_by(PromisedDebt.due_at).all()]
     settings = {k: get_setting(k) for k in DEFAULT_SETTINGS}
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
-        pending_requests=pending_requests, processed_requests=processed_requests, debts=debts, settings=settings, methods=PAY_METHODS)
+        tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts, settings=settings, methods=PAY_METHODS)
+
+@app.route("/admin/user/<int:user_id>/impersonate", methods=["POST"])
+@admin_required
+def admin_impersonate(user_id):
+    user = get_or_404(User, user_id)
+    if not user.active:
+        flash("Пользователь заблокирован — войти под ним нельзя.")
+        return admin_redirect("#users")
+    session["impersonator"] = current_user.id
+    logout_user()
+    login_user(user)
+    flash(f"Вы вошли как {user.username}. Нажмите «Вернуться в админку» в шапке, когда закончите.")
+    return redirect(url_for("dashboard"))
 
 @app.route("/admin/settings", methods=["POST"])
 @admin_required
@@ -486,6 +532,34 @@ def admin_promised_cancel(debt_id):
     db.session.commit()
     flash(f"Обещанный платёж {debt.user.username} на {debt.repay_amount:.2f} убран администратором.")
     return admin_redirect("#settings")
+
+@app.route("/admin/payment/<int:pr_id>/approve", methods=["POST"])
+@admin_required
+def admin_payment_approve(pr_id):
+    pr = get_or_404(PaymentRequest, pr_id)
+    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
+    pr.status = "approved"; pr.processed_at = datetime.utcnow(); pr.user.balance += pr.amount
+    db.session.add(Transaction(user_id=pr.user_id, amount=pr.amount, reason=f"Пополнение ({method_label(pr.method)})" + (f": {pr.comment}" if pr.comment else "")))
+    db.session.commit(); flash(f"Пополнение {pr.amount:.2f} для {pr.user.username} подтверждено.")
+    return admin_redirect("#requests")
+
+@app.route("/admin/payment/<int:pr_id>/reject", methods=["POST"])
+@admin_required
+def admin_payment_reject(pr_id):
+    pr = get_or_404(PaymentRequest, pr_id)
+    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
+    pr.status = "rejected"; pr.processed_at = datetime.utcnow(); db.session.commit()
+    flash("Заявка отклонена.")
+    return admin_redirect("#requests")
+
+@app.route("/admin/payment/<int:pr_id>/hide", methods=["POST"])
+@admin_required
+def admin_payment_hide(pr_id):
+    pr = get_or_404(PaymentRequest, pr_id)
+    pr.admin_hidden = True
+    db.session.commit()
+    flash("Заявка скрыта из списка администратора (у пользователя она видна по-прежнему).")
+    return admin_redirect("#requests")
 
 @app.route("/admin/user/add", methods=["POST"])
 @admin_required
@@ -572,25 +646,6 @@ def admin_user_tariff(user_id):
         return admin_redirect("#cameras")
     ok, message = apply_tariff(user, tariff); flash(message)
     return admin_redirect("#users")
-
-@app.route("/admin/payment/<int:pr_id>/approve", methods=["POST"])
-@admin_required
-def admin_payment_approve(pr_id):
-    pr = get_or_404(PaymentRequest, pr_id)
-    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
-    pr.status = "approved"; pr.processed_at = datetime.utcnow(); pr.user.balance += pr.amount
-    db.session.add(Transaction(user_id=pr.user_id, amount=pr.amount, reason=f"Пополнение ({method_label(pr.method)})" + (f": {pr.comment}" if pr.comment else "")))
-    db.session.commit(); flash(f"Пополнение {pr.amount:.2f} для {pr.user.username} подтверждено.")
-    return admin_redirect("#requests")
-
-@app.route("/admin/payment/<int:pr_id>/reject", methods=["POST"])
-@admin_required
-def admin_payment_reject(pr_id):
-    pr = get_or_404(PaymentRequest, pr_id)
-    if pr.status != "pending": flash("Заявка уже обработана."); return admin_redirect("#requests")
-    pr.status = "rejected"; pr.processed_at = datetime.utcnow(); db.session.commit()
-    flash("Заявка отклонена.")
-    return admin_redirect("#requests")
 
 @app.route("/admin/transaction/<int:tx_id>/delete", methods=["POST"])
 @admin_required
@@ -743,6 +798,7 @@ header .spacer{flex:1}
 .badge.ok{background:#14342a;color:var(--ok);}
 .badge.bad{background:#3b1d1d;color:var(--bad);}
 .badge.warn{background:#3b341a;color:var(--warn);}
+.impbar{background:#7f1d1d;color:#fecaca;padding:6px 14px;border-radius:8px;font-size:13px;}
 main{padding:20px;max-width:1100px;margin:0 auto;}
 .card,details.card{background:var(--card);border:1px solid #2b3b57;border-radius:14px;padding:18px;margin-bottom:18px;}
 summary{cursor:pointer;font-size:17px;font-weight:600;}
@@ -773,10 +829,14 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v3.3</span>
+  <span class="badge warn">v3.4</span>
   {% if current_user.is_authenticated %}
-    <a href="{{ url_for('dashboard') }}">Мои камеры</a>
-    {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
+    {% if session.get("impersonator") %}
+      <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
+    {% else %}
+      <a href="{{ url_for('dashboard') }}">Мои камеры</a>
+      {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
+    {% endif %}
     <span class="spacer"></span>
     {% if not current_user.admin %}<a class="muted" href="/#topup">Баланс: {{ "%.2f"|format(current_user.balance) }} р. → пополнить</a>{% endif %}
     <a href="{{ url_for('logout') }}">Выход ({{ current_user.username }})</a>
@@ -883,7 +943,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
   </td></tr>
   {% endfor %}
 </table>
-<p class="muted">Пока заявка «на рассмотрении» — можно менять комментарий или удалить её. Обработанные записи можно скрыть из своего списка (у администратора они остаются).</p>
+<p class="muted">Пока заявка «на рассмотрении» — можно менять комментарий или удалить её. Обработанные записи можно скрыть из своего списка.</p>
 {% endif %}
 </details>
 
@@ -922,7 +982,7 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
 
 <div id="cameras">
 <h1>Мои камеры</h1>
-{% if current_user.admin %}
+{% if current_user.admin and not session.get("impersonator") %}
   {% if cameras %}
   <div class="grid">
     {% for camera in cameras %}
@@ -1028,7 +1088,7 @@ echo "=== admin.html ==="
 cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v3.3</span></h1>
+<h1>Админка <span class="badge warn">v3.4</span></h1>
 
 <details class="card" id="requests" {% if pending_requests %}open{% endif %}>
 <summary>Заявки на пополнение {% if pending_requests %}<span class="badge warn">новых: {{ pending_requests|length }}</span>{% endif %}</summary>
@@ -1040,9 +1100,10 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% else %}<p class="muted">Новых заявок нет.</p>{% endif %}
 {% if processed_requests %}
 <h2>История заявок</h2>
-<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th></tr>
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th><th></th></tr>
 {% for item in processed_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td>
-<td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td></tr>{% endfor %}</table>
+<td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_payment_hide', pr_id=item.p.id) }}" style="display:inline"><button class="btn gray mini" type="submit">Скрыть</button></form></td></tr>{% endfor %}</table>
 {% endif %}
 </details>
 
@@ -1071,7 +1132,9 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <tr><td>{{ u.id }}</td><td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td><td>{{ "%.2f"|format(u.balance) }}</td><td>{{ "%.2f"|format(u.credit_limit or 0) }}</td>
 <td>{{ u.tariff.name if u.tariff else "—" }}</td><td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
 <td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
-<td><form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Блок" if u.active else "Разблок" }}</button></form>
+<td>
+<form method="post" action="{{ url_for('admin_impersonate', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Войти в кабинет как {{ u.username }}?');"><button class="btn mini" type="submit">Войти как</button></form>
+<form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Блок" if u.active else "Разблок" }}</button></form>
 {% if not u.admin %}<form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить пользователя {{ u.username }}? Камеры останутся в пуле.');"><button class="btn red mini" type="submit">Удалить</button></form>{% endif %}</td></tr>
 <tr><td colspan="8" class="muted">
   <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;"><input name="username" value="{{ u.username }}" placeholder="Новый логин"><button class="btn gray mini" type="submit">Переименовать</button></form>
@@ -1079,6 +1142,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 </td></tr>
 {% endfor %}
 </table>
+<p class="muted">«Войти как» открывает кабинет пользователя от его имени (без пароля). Сверху появится плашка «Вернуться в админку». Пароли пользователей не отображаются никому: они хранятся необратимым хэшем.</p>
 <h2>Добавить пользователя</h2>
 <form method="post" action="{{ url_for('admin_user_add') }}" class="formrow"><input name="username" placeholder="Логин" required><input name="password" type="password" placeholder="Пароль" required><button class="btn" type="submit">Создать</button></form>
 <h2>Сменить пароль пользователю (включая себя)</h2>
@@ -1141,7 +1205,14 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 </details>
 
 <details class="card" id="transactions">
-<summary>Транзакции (последние 50)</summary>
+<summary>Транзакции {% if tx_query %}<span class="badge warn">поиск: {{ tx_query }}</span>{% else %}(последние 50){% endif %}</summary>
+<form method="get" action="{{ url_for('admin_page') }}" class="formrow"
+      onsubmit="this.action = '{{ url_for('admin_page') }}?q=' + encodeURIComponent(this.q.value) + '#transactions'; return true;">
+  <input name="q" value="{{ tx_query or '' }}" placeholder="Поиск: логин, причина, сумма, дата (по всей истории)">
+  <button class="btn gray" type="submit">Найти</button>
+  {% if tx_query %}<a class="btn gray" href="{{ url_for('admin_page') }}#transactions">Сбросить</a>{% endif %}
+</form>
+{% if tx_query %}<p class="muted">Найдено по всей истории: {{ transactions|length }}</p>{% endif %}
 <form method="post" action="{{ url_for('admin_transactions_clear') }}" style="margin-bottom:10px;" onsubmit="return confirm('Очистить ВСЮ историю транзакций? Балансы не изменятся.');">
   <button class="btn red" type="submit">Очистить всё</button>
 </form>
@@ -1331,7 +1402,7 @@ conn = sqlite3.connect(sys.argv[1]); cur = conn.cursor()
 tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 cur.execute("CREATE TABLE IF NOT EXISTS tariff (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL, price FLOAT NOT NULL, period_days INTEGER, interval_seconds INTEGER, max_cameras INTEGER, archive_days INTEGER, is_active BOOLEAN)")
 cur.execute("CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, user_id INTEGER NOT NULL, enabled BOOLEAN DEFAULT 1)")
-cur.execute("CREATE TABLE IF NOT EXISTS payment_request (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount FLOAT NOT NULL, method VARCHAR(20), comment TEXT, status VARCHAR(10) DEFAULT 'pending', user_hidden BOOLEAN DEFAULT 0, created_at TIMESTAMP, processed_at TIMESTAMP)")
+cur.execute("CREATE TABLE IF NOT EXISTS payment_request (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount FLOAT NOT NULL, method VARCHAR(20), comment TEXT, status VARCHAR(10) DEFAULT 'pending', user_hidden BOOLEAN DEFAULT 0, admin_hidden BOOLEAN DEFAULT 0, created_at TIMESTAMP, processed_at TIMESTAMP)")
 cur.execute("CREATE TABLE IF NOT EXISTS setting (key VARCHAR(80) PRIMARY KEY, value TEXT)")
 cur.execute("CREATE TABLE IF NOT EXISTS promised_debt (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, principal FLOAT NOT NULL, repay_amount FLOAT NOT NULL, created_at TIMESTAMP, due_at TIMESTAMP, status VARCHAR(10) DEFAULT 'active', repaid_at TIMESTAMP)")
 def cols(t): return {r[1] for r in cur.execute(f"PRAGMA table_info({t})").fetchall()}
@@ -1361,6 +1432,9 @@ if "payment_request" in tables:
     if "user_hidden" not in pr:
         cur.execute("ALTER TABLE payment_request ADD COLUMN user_hidden BOOLEAN DEFAULT 0")
         print("migration: payment_request += user_hidden")
+    if "admin_hidden" not in pr:
+        cur.execute("ALTER TABLE payment_request ADD COLUMN admin_hidden BOOLEAN DEFAULT 0")
+        print("migration: payment_request += admin_hidden")
 cur.execute("PRAGMA journal_mode=WAL").fetchall()
 conn.commit(); conn.close(); print("migration ok")
 PYMIG
