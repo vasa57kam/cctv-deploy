@@ -1,0 +1,13 @@
+[Unit]
+Description=CCTV remote browser daemon
+After=network.target
+[Service]
+Type=simple
+User=cctv
+Group=cctv
+WorkingDirectory=/opt/cctv/worker
+ExecStart=/opt/cctv/venv/bin/python3 /opt/cctv/worker/browserd.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
