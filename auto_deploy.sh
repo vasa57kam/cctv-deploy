@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.7"
+VERSION="2.8"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -397,8 +397,10 @@ def apply_tariff(user, tariff):
             f"на балансе {user.balance:.2f}"
         )
 
+    same_tariff = user.tariff_id == tariff.id
+
     base = now
-    if user.subscription_ends_at and user.subscription_ends_at > now:
+    if same_tariff and user.subscription_ends_at and user.subscription_ends_at > now:
         base = user.subscription_ends_at
 
     user.balance -= tariff.price
@@ -824,6 +826,11 @@ def admin_user_credit(user_id):
 @admin_required
 def admin_user_toggle(user_id):
     user = get_or_404(User, user_id)
+
+    if user.id == current_user.id and user.active:
+        flash("Нельзя заблокировать самого себя.")
+        return redirect(url_for("admin_page"))
+
     user.active = not user.active
     db.session.commit()
 
@@ -1258,7 +1265,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.7</span>
+  <span class="badge warn">v2.8</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -1499,7 +1506,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.7</span></h1>
+<h1>Админка <span class="badge warn">v2.8</span></h1>
 
 <div class="card">
 <h2>Настройки пополнения и обещанного платежа</h2>
@@ -1821,7 +1828,7 @@ document.getElementById("pass-form").addEventListener("submit", function () {
 {% endblock %}
 ADMIN_EOF
 
-echo "=== worker.py ==="
+echo "=== worker.py (v2.8: ротация логов + автоудаление архива) ==="
 cat > "$WORKER/worker.py" <<'WORKER_EOF'
 import sqlite3
 import subprocess
@@ -1840,6 +1847,7 @@ procs = {}
 configs = {}
 log_files = {}
 running = True
+loops = 0
 
 
 def handle_signal(signum, frame):
@@ -1869,6 +1877,35 @@ def get_cameras():
 
 def camera_config(cam):
     return (cam["rtsp_url"], bool(cam["recording_enabled"]))
+
+
+def cleanup_archives():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cameras = conn.execute("SELECT id FROM camera").fetchall()
+        for row in cameras:
+            cid = row["id"]
+            days = conn.execute(
+                """
+                SELECT MAX(t.archive_days) AS d
+                FROM camera_access ca
+                JOIN user u ON u.id = ca.user_id
+                JOIN tariff t ON t.id = u.tariff_id
+                WHERE ca.camera_id = ?
+                """,
+                (cid,),
+            ).fetchone()["d"]
+            days = days or 7
+            cutoff = time.time() - days * 86400
+            d = ARCHIVE_DIR / f"camera_{cid}"
+            if d.exists():
+                for f in d.glob("*.mp4"):
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+        conn.close()
+    except Exception:
+        pass
 
 
 def stop_camera(camera_id):
@@ -1902,7 +1939,11 @@ def start_camera(cam):
     archive_dir.mkdir(parents=True, exist_ok=True)
     live_dir.mkdir(parents=True, exist_ok=True)
 
-    lf = open(LOG_DIR / f"camera_{camera_id}.log", "ab", buffering=0)
+    log_path = LOG_DIR / f"camera_{camera_id}.log"
+    if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+        log_path.unlink()
+
+    lf = open(log_path, "ab", buffering=0)
     log_files[camera_id] = lf
 
     cmd = [
@@ -1973,6 +2014,10 @@ while running:
             stop_camera(cid)
             configs.pop(cid, None)
 
+    loops += 1
+    if loops % 300 == 0:
+        cleanup_archives()
+
     time.sleep(5)
 
 
@@ -1980,7 +2025,7 @@ for cid in list(procs.keys()):
     stop_camera(cid)
 WORKER_EOF
 
-echo "=== billing.py (тик 1 сек: интервалы, кредит, обещанный) ==="
+echo "=== billing.py (v2.8: +прунинг транзакций) ==="
 cat > "$WORKER/billing.py" <<'BILLING_EOF'
 import sqlite3
 import time
@@ -1989,6 +2034,19 @@ from pathlib import Path
 
 
 DB_PATH = Path("/opt/cctv/app/cctv.db")
+
+ticks = 0
+
+
+def prune_old_transactions():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat(sep=" ")
+        conn.execute('DELETE FROM "transaction" WHERE created_at < ?', (cutoff,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def tick():
@@ -2082,6 +2140,10 @@ while True:
         tick()
     except Exception as e:
         print("[billing] error:", e, flush=True)
+
+    ticks += 1
+    if ticks % 3600 == 0:
+        prune_old_transactions()
 
     time.sleep(1)
 BILLING_EOF
