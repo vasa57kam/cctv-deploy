@@ -7,7 +7,7 @@ APP="$BASE/app"
 WORKER="$BASE/worker"
 STORAGE="$BASE/storage"
 BACKUP="$BASE/backup"
-VERSION="2.5"
+VERSION="2.6"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Запусти через sudo или от root."
@@ -106,6 +106,19 @@ login_manager.login_view = "login"
 login_manager.login_message = "Для доступа к этой странице нужно войти."
 
 
+PAY_METHODS = [
+    ("cash", "Наличные"),
+    ("transfer", "Перевод по номеру"),
+    ("card", "Карта онлайн"),
+    ("promised", "Обещанный платёж"),
+    ("other", "Другое"),
+]
+
+
+def method_label(code):
+    return dict(PAY_METHODS).get(code, code)
+
+
 camera_access = db.Table(
     "camera_access",
     db.Column("id", db.Integer, primary_key=True),
@@ -134,6 +147,7 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     balance = db.Column(db.Float, default=0.0)
+    credit_limit = db.Column(db.Float, default=0.0)
     admin = db.Column(db.Boolean, default=False)
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -171,6 +185,21 @@ class Transaction(db.Model):
     amount = db.Column(db.Float, nullable=False)
     reason = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PaymentRequest(db.Model):
+    __tablename__ = "payment_request"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    method = db.Column(db.String(20), default="other")
+    comment = db.Column(db.String(255))
+    status = db.Column(db.String(10), default="pending")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    processed_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship("User", backref="payment_requests")
 
 
 @login_manager.user_loader
@@ -369,12 +398,57 @@ def dashboard():
         for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()
     ]
 
+    my_requests = [
+        {"p": p, "label": method_label(p.method)}
+        for p in PaymentRequest.query
+        .filter_by(user_id=current_user.id)
+        .order_by(PaymentRequest.id.desc())
+        .limit(10).all()
+    ]
+
     return render_template(
         "dashboard.html",
         cameras=cameras,
         sub_active=subscription_active(current_user),
         tariff_options=tariff_options,
+        my_requests=my_requests,
+        methods=PAY_METHODS,
     )
+
+
+@app.route("/payment/request", methods=["POST"])
+@login_required
+def payment_request():
+    try:
+        amount = float(request.form.get("amount", "0"))
+    except ValueError:
+        flash("Некорректная сумма.")
+        return redirect(url_for("dashboard"))
+
+    if amount <= 0:
+        flash("Сумма должна быть больше нуля.")
+        return redirect(url_for("dashboard"))
+
+    method = request.form.get("method", "other")
+    if method not in dict(PAY_METHODS):
+        method = "other"
+
+    comment = request.form.get("comment", "").strip()
+
+    pr = PaymentRequest(
+        user_id=current_user.id,
+        amount=amount,
+        method=method,
+        comment=comment,
+        status="pending",
+        created_at=datetime.utcnow(),
+    )
+
+    db.session.add(pr)
+    db.session.commit()
+
+    flash("Заявка создана. Администратор подтвердит пополнение.")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/tariff/choose", methods=["POST"])
@@ -473,12 +547,30 @@ def admin_page():
     tariffs = Tariff.query.order_by(Tariff.id).all()
     transactions = Transaction.query.order_by(Transaction.id.desc()).limit(50).all()
 
+    pending_requests = [
+        {"p": p, "label": method_label(p.method)}
+        for p in PaymentRequest.query
+        .filter_by(status="pending")
+        .order_by(PaymentRequest.id).all()
+    ]
+
+    processed_requests = [
+        {"p": p, "label": method_label(p.method)}
+        for p in PaymentRequest.query
+        .filter(PaymentRequest.status != "pending")
+        .order_by(PaymentRequest.id.desc())
+        .limit(20).all()
+    ]
+
     return render_template(
         "admin.html",
         users=users,
         cameras=cameras,
         tariffs=tariffs,
         transactions=transactions,
+        pending_requests=pending_requests,
+        processed_requests=processed_requests,
+        methods=PAY_METHODS,
     )
 
 
@@ -533,6 +625,24 @@ def admin_user_edit(user_id):
     return redirect(url_for("admin_page"))
 
 
+@app.route("/admin/user/<int:user_id>/credit", methods=["POST"])
+@admin_required
+def admin_user_credit(user_id):
+    user = get_or_404(User, user_id)
+
+    try:
+        limit = float(request.form.get("credit_limit", "0"))
+    except ValueError:
+        flash("Некорректный лимит.")
+        return redirect(url_for("admin_page"))
+
+    user.credit_limit = max(0.0, limit)
+    db.session.commit()
+
+    flash(f"Доверительный лимит {user.username}: {user.credit_limit:.2f}.")
+    return redirect(url_for("admin_page"))
+
+
 @app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
 @admin_required
 def admin_user_toggle(user_id):
@@ -559,6 +669,9 @@ def admin_user_delete(user_id):
 
     for transaction in list(user.transactions):
         db.session.delete(transaction)
+
+    for pr in list(user.payment_requests):
+        db.session.delete(pr)
 
     db.session.execute(
         camera_access.delete().where(camera_access.c.user_id == user.id)
@@ -594,6 +707,7 @@ def admin_topup():
     user_id = request.form.get("user_id", "")
     amount_raw = request.form.get("amount", "")
     reason = request.form.get("reason", "").strip()
+    method = request.form.get("method", "other")
 
     try:
         user_id = int(user_id)
@@ -606,10 +720,12 @@ def admin_topup():
 
     user.balance += amount
 
+    reason_text = reason or method_label(method)
+
     transaction = Transaction(
         user_id=user.id,
         amount=amount,
-        reason=reason or "Ручная корректировка",
+        reason=f"Пополнение ({reason_text})",
     )
 
     db.session.add(transaction)
@@ -636,6 +752,47 @@ def admin_user_tariff(user_id):
     ok, message = apply_tariff(user, tariff)
     flash(message)
 
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/payment/<int:pr_id>/approve", methods=["POST"])
+@admin_required
+def admin_payment_approve(pr_id):
+    pr = get_or_404(PaymentRequest, pr_id)
+
+    if pr.status != "pending":
+        flash("Заявка уже обработана.")
+        return redirect(url_for("admin_page"))
+
+    pr.status = "approved"
+    pr.processed_at = datetime.utcnow()
+    pr.user.balance += pr.amount
+
+    db.session.add(Transaction(
+        user_id=pr.user_id,
+        amount=pr.amount,
+        reason=f"Пополнение ({method_label(pr.method)})" + (f": {pr.comment}" if pr.comment else ""),
+    ))
+    db.session.commit()
+
+    flash(f"Пополнение {pr.amount:.2f} для {pr.user.username} подтверждено.")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/payment/<int:pr_id>/reject", methods=["POST"])
+@admin_required
+def admin_payment_reject(pr_id):
+    pr = get_or_404(PaymentRequest, pr_id)
+
+    if pr.status != "pending":
+        flash("Заявка уже обработана.")
+        return redirect(url_for("admin_page"))
+
+    pr.status = "rejected"
+    pr.processed_at = datetime.utcnow()
+    db.session.commit()
+
+    flash("Заявка отклонена.")
     return redirect(url_for("admin_page"))
 
 
@@ -712,6 +869,23 @@ def admin_tariff_toggle(tariff_id):
     tariff.is_active = not tariff.is_active
     db.session.commit()
     flash(f"Тариф {tariff.name}: {'включён' if tariff.is_active else 'выключен'}.")
+    return redirect(url_for("admin_page"))
+
+
+@app.route("/admin/tariff/<int:tariff_id>/delete", methods=["POST"])
+@admin_required
+def admin_tariff_delete(tariff_id):
+    tariff = get_or_404(Tariff, tariff_id)
+
+    if tariff.users:
+        flash(f"Тариф {tariff.name} нельзя удалить: на нём есть пользователи.")
+        return redirect(url_for("admin_page"))
+
+    name = tariff.name
+    db.session.delete(tariff)
+    db.session.commit()
+
+    flash(f"Тариф {name} удалён.")
     return redirect(url_for("admin_page"))
 
 
@@ -904,7 +1078,7 @@ h2{font-size:17px;margin:0 0 12px;}
 <body>
 <header>
   <span class="logo">CCTV Cloud</span>
-  <span class="badge warn">v2.5</span>
+  <span class="badge warn">v2.6</span>
   {% if current_user.is_authenticated %}
     <a href="{{ url_for('dashboard') }}">Мои камеры</a>
     {% if current_user.admin %}<a href="{{ url_for('admin_page') }}">Админка</a>{% endif %}
@@ -972,7 +1146,40 @@ cat > "$APP/templates/dashboard.html" <<'DASH_EOF'
        выберите тариф в списке ниже</p>
   {% endif %}
   <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.
-     Списания идут автоматически с интервалом тарифа.</p>
+     {% if current_user.credit_limit %}
+       Доверительный лимит: {{ "%.2f"|format(current_user.credit_limit) }} р.
+     {% endif %}</p>
+</div>
+
+<div class="card">
+  <h2>Пополнить баланс</h2>
+  <form method="post" action="{{ url_for('payment_request') }}" class="formrow">
+    <input name="amount" placeholder="Сумма" required>
+    <select name="method">
+      {% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+    </select>
+    <input name="comment" placeholder="Комментарий / номер перевода" style="flex:1">
+    <button class="btn" type="submit">Создать заявку</button>
+  </form>
+  <p class="muted">Заявка уходит администратору. После подтверждения сумма упадёт на баланс.</p>
+  {% if my_requests %}
+  <table>
+    <tr><th>ID</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Статус</th></tr>
+    {% for item in my_requests %}
+    <tr>
+      <td>{{ item.p.id }}</td>
+      <td>{{ "%.2f"|format(item.p.amount) }}</td>
+      <td>{{ item.label }}</td>
+      <td>{{ item.p.comment or "" }}</td>
+      <td>
+        {% if item.p.status == "pending" %}<span class="badge warn">на рассмотрении</span>
+        {% elif item.p.status == "approved" %}<span class="badge ok">подтверждено</span>
+        {% else %}<span class="badge bad">отклонено</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -1086,17 +1293,65 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Админка <span class="badge warn">v2.5</span></h1>
+<h1>Админка <span class="badge warn">v2.6</span></h1>
+
+<div class="card">
+<h2>Заявки на пополнение</h2>
+{% if pending_requests %}
+<table>
+<tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Действия</th></tr>
+{% for item in pending_requests %}
+<tr>
+<td>{{ item.p.id }}</td>
+<td>{{ item.p.user.username }}</td>
+<td>{{ "%.2f"|format(item.p.amount) }}</td>
+<td>{{ item.label }}</td>
+<td>{{ item.p.comment or "" }}</td>
+<td>
+  <form method="post" action="{{ url_for('admin_payment_approve', pr_id=item.p.id) }}" style="display:inline">
+    <button class="btn" type="submit">Подтвердить</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_payment_reject', pr_id=item.p.id) }}" style="display:inline">
+    <button class="btn red" type="submit">Отклонить</button>
+  </form>
+</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p class="muted">Новых заявок нет.</p>
+{% endif %}
+
+{% if processed_requests %}
+<h2>История заявок</h2>
+<table>
+<tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th></tr>
+{% for item in processed_requests %}
+<tr>
+<td>{{ item.p.id }}</td>
+<td>{{ item.p.user.username }}</td>
+<td>{{ "%.2f"|format(item.p.amount) }}</td>
+<td>{{ item.label }}</td>
+<td>
+  {% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>
+  {% else %}<span class="badge bad">отклонено</span>{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+</div>
 
 <div class="card">
 <h2>Пользователи</h2>
 <table>
-<tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
+<tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Лимит</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
 {% for u in users %}
 <tr>
 <td>{{ u.id }}</td>
 <td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}</td>
 <td>{{ "%.2f"|format(u.balance) }}</td>
+<td>{{ "%.2f"|format(u.credit_limit or 0) }}</td>
 <td>{{ u.tariff.name if u.tariff else "—" }}</td>
 <td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
 <td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %}</td>
@@ -1112,10 +1367,14 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 </td>
 </tr>
 <tr>
-<td colspan="7" class="muted">
+<td colspan="8" class="muted">
   <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;">
     <input name="username" value="{{ u.username }}" placeholder="Новый логин">
     <button class="btn gray" type="submit">Переименовать</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_user_credit', user_id=u.id) }}" class="formrow" style="margin:4px 0 0 0;">
+    <input name="credit_limit" value="{{ u.credit_limit or 0 }}" placeholder="Доверительный лимит">
+    <button class="btn gray" type="submit">Задать лимит</button>
   </form>
 </td>
 </tr>
@@ -1136,11 +1395,14 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <button class="btn" type="submit">Сменить пароль</button>
 </form>
 
-<h2>Баланс</h2>
+<h2>Пополнить баланс вручную</h2>
 <form method="post" action="{{ url_for('admin_topup') }}" class="formrow">
 <select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
 <input name="amount" placeholder="100 или -100" required>
-<input name="reason" placeholder="Причина">
+<select name="method">
+  {% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+</select>
+<input name="reason" placeholder="Причина (необязательно)">
 <button class="btn" type="submit">Применить</button>
 </form>
 
@@ -1228,6 +1490,7 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
 <td>
 <form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_tariff_delete', tariff_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить тариф {{ t.name }}?');"><button class="btn red" type="submit">Удалить</button></form>
 </td>
 </tr>
 <tr>
@@ -1269,7 +1532,6 @@ cat > "$APP/templates/admin.html" <<'ADMIN_EOF'
 <input name="archive_days" placeholder="Архив дней" value="7">
 <button class="btn" type="submit">Добавить</button>
 </form>
-<p class="muted">Цена списывается сразу при подключении и далее каждый интервал, пока хватает баланса. Кончился баланс — доступ гаснет сам.</p>
 </div>
 
 <div class="card">
@@ -1460,7 +1722,7 @@ for cid in list(procs.keys()):
     stop_camera(cid)
 WORKER_EOF
 
-echo "=== billing.py (тик раз в секунду) ==="
+echo "=== billing.py (тик 1 сек, учёт доверительного лимита) ==="
 cat > "$WORKER/billing.py" <<'BILLING_EOF'
 import sqlite3
 import time
@@ -1485,6 +1747,7 @@ def tick():
         SELECT u.id AS user_id,
                u.username,
                u.balance,
+               u.credit_limit,
                u.subscription_ends_at,
                t.id AS tariff_id,
                t.name AS tariff_name,
@@ -1508,8 +1771,9 @@ def tick():
             continue
 
         interval = int(r["interval_seconds"] or 2592000)
+        credit = float(r["credit_limit"] or 0)
 
-        if r["balance"] < r["price"]:
+        if (r["balance"] - r["price"]) < -credit:
             continue
 
         base = ends if ends > now else now
@@ -1602,6 +1866,21 @@ cur.execute(
     """
 )
 
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS payment_request (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        amount FLOAT NOT NULL,
+        method VARCHAR(20),
+        comment TEXT,
+        status VARCHAR(10) DEFAULT 'pending',
+        created_at TIMESTAMP,
+        processed_at TIMESTAMP
+    )
+    """
+)
+
 def cols(table):
     return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -1620,6 +1899,9 @@ if "user" in tables:
     if "subscription_ends_at" not in u:
         cur.execute("ALTER TABLE user ADD COLUMN subscription_ends_at TIMESTAMP")
         print("migration: user += subscription_ends_at")
+    if "credit_limit" not in u:
+        cur.execute("ALTER TABLE user ADD COLUMN credit_limit FLOAT DEFAULT 0")
+        print("migration: user += credit_limit")
 
 if "camera" in tables:
     c = cols("camera")
@@ -1777,8 +2059,8 @@ if [ -f "$APP/cctv.db" ]; then
     echo "Пользователей: $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM user;')"
     echo "Камер:         $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera;')"
     echo "Доступов:      $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM camera_access;')"
+    echo "Заявок:        $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM payment_request;')"
     echo "Транзакций:    $(sqlite3 "$APP/cctv.db" 'SELECT COUNT(*) FROM "transaction";')"
 fi
 echo "Архив на диске: $(du -sh "$STORAGE/archive" 2>/dev/null | cut -f1)"
-echo "Логи камер:     ls $STORAGE/logs"
 echo "Пароль админа:  sudo cat /opt/cctv/admin_password.txt"
