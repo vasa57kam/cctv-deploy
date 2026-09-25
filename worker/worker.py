@@ -3,6 +3,7 @@ from pathlib import Path
 
 BASE_DIR = Path("/opt/cctv"); DB_PATH = BASE_DIR / "app" / "cctv.db"
 ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"; LOG_DIR = BASE_DIR / "storage" / "logs"
+MOTION_THRESHOLD = "0.06"
 procs = {}; configs = {}; log_files = {}; running = True; loops = 0
 
 def handle_signal(signum, frame):
@@ -15,12 +16,14 @@ def get_cameras():
     if not DB_PATH.exists(): return []
     try:
         conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-        rows = [dict(r) for r in conn.execute("SELECT id, rtsp_url, recording_enabled FROM camera WHERE active=1")]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, rtsp_url, recording_enabled, recording_mode FROM camera WHERE active=1")]
         conn.close(); return rows
     except sqlite3.Error:
         return []
 
-def camera_config(cam): return (cam["rtsp_url"], bool(cam["recording_enabled"]))
+def camera_config(cam):
+    return (cam["rtsp_url"], bool(cam["recording_enabled"]), cam.get("recording_mode") or "continuous")
 
 def cleanup_archives():
     try:
@@ -38,45 +41,6 @@ def cleanup_archives():
     except Exception:
         pass
 
-def glue_archives():
-    try:
-        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-        cams = conn.execute("SELECT id FROM camera").fetchall()
-        conn.close()
-        today = time.strftime("%Y-%m-%d")
-        for row in cams:
-            d = ARCHIVE_DIR / f"camera_{row['id']}"
-            if not d.exists(): continue
-            by_day = {}
-            for f in d.glob("*_*.mp4"):
-                by_day.setdefault(f.name[:10], []).append(f)
-            for day, files in by_day.items():
-                if day == today or len(files) < 2: continue
-                out = d / f"{day}.mp4"
-                if out.exists():
-                    for f in files:
-                        try: f.unlink()
-                        except Exception: pass
-                    continue
-                lst = d / f".concat_{day}.txt"
-                with open(lst, "w") as fh:
-                    for f in sorted(files):
-                        fh.write(f"file '{f}'\n")
-                cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                       "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out)]
-                try:
-                    r = subprocess.run(cmd, capture_output=True, timeout=1800)
-                    if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
-                        for f in files:
-                            try: f.unlink()
-                            except Exception: pass
-                except Exception:
-                    pass
-                try: lst.unlink()
-                except Exception: pass
-    except Exception:
-        pass
-
 def stop_camera(camera_id):
     proc = procs.pop(camera_id, None)
     if proc is not None:
@@ -91,7 +55,9 @@ def stop_camera(camera_id):
         except Exception: pass
 
 def start_camera(cam):
-    camera_id = cam["id"]; recording_enabled = bool(cam["recording_enabled"])
+    camera_id = cam["id"]
+    recording_enabled = bool(cam["recording_enabled"])
+    mode = cam.get("recording_mode") or "continuous"
     archive_dir = ARCHIVE_DIR / f"camera_{camera_id}"; live_dir = LIVE_DIR / f"camera_{camera_id}"
     LOG_DIR.mkdir(parents=True, exist_ok=True); archive_dir.mkdir(parents=True, exist_ok=True); live_dir.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"camera_{camera_id}.log"
@@ -99,8 +65,21 @@ def start_camera(cam):
     lf = open(log_path, "ab", buffering=0); log_files[camera_id] = lf
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]]
     if recording_enabled:
-        cmd += ["-map", "0:v", "-c:v", "copy", "-an", "-f", "segment", "-segment_time", "300", "-reset_timestamps", "1", "-strftime", "1", str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4")]
-    cmd += ["-map", "0:v", "-c:v", "copy", "-an", "-f", "hls", "-hls_time", "6", "-hls_list_size", "6", "-hls_flags", "delete_segments", str(live_dir / "index.m3u8")]
+        if mode == "motion":
+            cmd += ["-map", "0:v",
+                    "-vf", f"select='gt(scene,{MOTION_THRESHOLD})'",
+                    "-vsync", "0",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                    "-an",
+                    "-f", "segment", "-segment_time", "300", "-reset_timestamps", "1", "-strftime", "1",
+                    str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4")]
+        else:
+            cmd += ["-map", "0:v", "-c:v", "copy", "-an",
+                    "-f", "segment", "-segment_time", "300", "-reset_timestamps", "1", "-strftime", "1",
+                    str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4")]
+    cmd += ["-map", "0:v", "-c:v", "copy", "-an", "-f", "hls",
+            "-hls_time", "6", "-hls_list_size", "6", "-hls_flags", "delete_segments",
+            str(live_dir / "index.m3u8")]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
 while running:
@@ -122,9 +101,7 @@ while running:
         if cid not in active_ids:
             stop_camera(cid); configs.pop(cid, None)
     loops += 1
-    if loops % 300 == 0:
-        cleanup_archives()
-        glue_archives()
+    if loops % 300 == 0: cleanup_archives()
     time.sleep(5)
 
 for cid in list(procs.keys()): stop_camera(cid)
