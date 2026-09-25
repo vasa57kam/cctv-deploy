@@ -1,8 +1,9 @@
-import os, re, time, json, base64
+import os, re, time, json, base64, socket, threading
 import urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from flask import Flask, render_template, request, redirect, url_for, abort, send_from_directory, send_file, flash, session, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
@@ -15,6 +16,7 @@ LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
 PREVIEW_DIR = STORAGE_DIR / "previews"; EXPORT_DIR = STORAGE_DIR / "exports"
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 DAEMON_URL = "http://127.0.0.1:8099/"
+SCAN_STATE_PATH = STORAGE_DIR / "scan_state.json"
 for d in (DB_PATH.parent, LIVE_DIR, ARCHIVE_DIR, PREVIEW_DIR, EXPORT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +39,17 @@ DEFAULT_SETTINGS = {
     "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
+
+SCAN_PORTS = [554, 80, 8080, 8000, 8899, 37777, 5000, 8443, 5540, 8554, 81, 88]
+RTSP_PATTERNS = [
+    "/Streaming/Channels/101", "/Streaming/Channels/102", "/h264/ch1/main/av_stream",
+    "/cam/realmonitor?channel=1&subtype=0", "/cam/realmonitor?channel=1&subtype=1",
+    "/axis-media/media.amp", "/media/video1", "/ch01.264", "/ch01_264",
+    "/11", "/12", "/1", "/stream1", "/live/ch00_0", "/h264_stream", "/video1",
+    "/user=admin&password=&channel=1&stream=0.sdp",
+]
+DEFAULT_CREDS = [("admin", "admin"), ("admin", "12345"), ("admin", "123456"),
+                 ("admin", "password"), ("root", "root"), ("admin", "888888")]
 
 def method_label(code): return dict(PAY_METHODS).get(code, code)
 def role_label(code): return dict(ROLES).get(code, code)
@@ -102,6 +115,18 @@ class Camera(db.Model):
     group_name = db.Column(db.String(60), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
+
+class CameraRequest(db.Model):
+    __tablename__ = "camera_request"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    ip = db.Column(db.String(64), nullable=False)
+    login = db.Column(db.String(64), nullable=True)
+    password = db.Column(db.String(64), nullable=True)
+    comment = db.Column(db.String(255))
+    status = db.Column(db.String(10), default="pending")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship("User", backref="camera_requests")
 
 class Transaction(db.Model):
     __tablename__ = "transaction"
@@ -433,6 +458,65 @@ def build_archive_days(camera):
         result.append(d)
     return result
 
+def _port_open(ip, port, timeout=0.6):
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout); s.close(); return True
+    except Exception:
+        return False
+
+def _write_scan_state(state):
+    tmp = SCAN_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False))
+    os.replace(tmp, SCAN_STATE_PATH)
+
+def scan_state():
+    if SCAN_STATE_PATH.exists():
+        try: return json.loads(SCAN_STATE_PATH.read_text())
+        except Exception: pass
+    return {"running": False, "ip": "", "open_ports": [], "results": [], "checked": 0, "total": 0}
+
+def run_scan(ip, login, password, try_defaults):
+    state = {"running": True, "ip": ip, "open_ports": [], "results": [], "checked": 0, "total": 0,
+             "started": datetime.utcnow().isoformat()}
+    _write_scan_state(state)
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        opens = list(ex.map(lambda p: (p, _port_open(ip, p)), SCAN_PORTS))
+    state["open_ports"] = [p for p, ok in sorted(opens) if ok]
+    _write_scan_state(state)
+    creds = []
+    if login:
+        creds.append((login, password or ""))
+    else:
+        creds.append(None)
+    if try_defaults:
+        creds.extend(DEFAULT_CREDS)
+    rtsp_port = next((p for p in (554, 8554, 5540) if p in state["open_ports"]), None)
+    candidates = []
+    if rtsp_port:
+        for c in creds:
+            auth = ""
+            if c:
+                auth = f"{urllib.parse.quote(c[0], safe='')}:{urllib.parse.quote(c[1], safe='')}@"
+            for pat in RTSP_PATTERNS:
+                candidates.append(f"rtsp://{auth}{ip}:{rtsp_port}{pat}")
+    for hp in (80, 8080, 8000):
+        if hp in state["open_ports"]:
+            candidates += [f"http://{ip}:{hp}/video.m3u8", f"http://{ip}:{hp}/stream.m3u8",
+                           f"http://{ip}:{hp}/hls/live.m3u8", f"http://{ip}:{hp}/live/1.m3u8"]
+    state["total"] = len(candidates)
+    _write_scan_state(state)
+    idx = 100
+    for url in candidates:
+        if len(state["results"]) >= 8: break
+        idx += 1
+        ok = probe_stream(url, idx)
+        state["checked"] += 1
+        if ok:
+            state["results"].append({"idx": idx, "url": url})
+        _write_scan_state(state)
+    state["running"] = False
+    _write_scan_state(state)
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user.is_authenticated: return redirect(url_for("dashboard"))
@@ -498,6 +582,7 @@ def dashboard():
     my_requests = [{"p": p, "label": method_label(p.method)} for p in
         PaymentRequest.query.filter_by(user_id=current_user.id).order_by(PaymentRequest.id.desc()).limit(30).all()
         if not p.user_hidden][:10]
+    my_cam_requests = CameraRequest.query.filter_by(user_id=current_user.id).order_by(CameraRequest.id.desc()).limit(10).all()
     methods = available_methods()
     transfer_instruction = get_setting("transfer_instruction", "") or ""
     promised_enabled = get_setting("method_promised", "0") == "1"
@@ -515,11 +600,64 @@ def dashboard():
     team_members = TeamMember.query.filter_by(owner_id=current_user.id).all() if (current_user.tariff and current_user.tariff.is_b2b) else []
     return render_template("dashboard.html", cameras=cameras, cam_items=cam_items, role=role, owner=owner, thumbs=thumbs,
         user_enabled_count=enabled_count(owner), sub_active=subscription_active(owner), freeze_now=active_freeze(owner),
-        tariff_options=tariff_options, my_requests=my_requests, methods=methods, transfer_instruction=transfer_instruction,
+        tariff_options=tariff_options, my_requests=my_requests, my_cam_requests=my_cam_requests,
+        methods=methods, transfer_instruction=transfer_instruction,
         promised_enabled=promised_enabled, promised_amount=promised_amount, promised_fee=promised_fee,
         promised_repay_seconds=promised_repay_seconds, promised_repay_label=interval_label(promised_repay_seconds),
         active_debt=active_debt, my_freezes=my_freezes, archive_orders=archive_orders,
         archive_price=archive_price, freeze_price=freeze_price, team_members=team_members)
+
+@app.route("/camera/request", methods=["POST"])
+@login_required
+def camera_request():
+    ip = request.form.get("ip", "").strip()
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip) and not re.match(r"^[a-zA-Z0-9.-]+$", ip):
+        flash("Некорректный IP или имя хоста."); return user_redirect("#camera-request")
+    db.session.add(CameraRequest(user_id=current_user.id, ip=ip,
+        login=request.form.get("login", "").strip() or None,
+        password=request.form.get("password", "").strip() or None,
+        comment=request.form.get("comment", "").strip()))
+    db.session.commit()
+    flash("Заявка на добавление камеры отправлена администратору.")
+    return user_redirect("#camera-request")
+
+@app.route("/admin/camera-request/<int:rid>/close", methods=["POST"])
+@admin_required
+def camera_request_close(rid):
+    r = get_or_404(CameraRequest, rid)
+    r.status = "closed"; db.session.commit()
+    return admin_redirect("#camera-requests")
+
+@app.route("/admin/scan")
+@admin_required
+def admin_scan_page():
+    st = scan_state()
+    pre_ip = request.args.get("ip", "")
+    pre_login = request.args.get("login", "")
+    pre_pass = request.args.get("pass", "")
+    return render_template("scan.html", state=st, pre_ip=pre_ip, pre_login=pre_login, pre_pass=pre_pass)
+
+@app.route("/admin/scan/start", methods=["POST"])
+@admin_required
+def admin_scan_start():
+    ip = request.form.get("ip", "").strip()
+    if not ip:
+        flash("Укажите IP или имя хоста."); return redirect(url_for("admin_scan_page"))
+    st = scan_state()
+    if st.get("running"):
+        flash("Сканирование уже идёт — дождитесь окончания."); return redirect(url_for("admin_scan_page"))
+    login = request.form.get("login", "").strip()
+    password = request.form.get("password", "").strip()
+    try_defaults = request.form.get("try_defaults") == "1"
+    threading.Thread(target=run_scan, args=(ip, login, password, try_defaults), daemon=True).start()
+    audit(current_user, "scan_start", ip)
+    flash(f"Сканирование {ip} запущено в фоне. Страница обновится сама.")
+    return redirect(url_for("admin_scan_page"))
+
+@app.route("/admin/scan/status")
+@admin_required
+def admin_scan_status():
+    return jsonify(scan_state())
 
 @app.route("/payment/request", methods=["POST"])
 @login_required
@@ -783,6 +921,7 @@ def admin_page():
     cameras = Camera.query.order_by(Camera.id.desc()).all()
     tariffs = Tariff.query.order_by(Tariff.id).all()
     thumbs = {c.id: thumb_state(c) for c in cameras}
+    cam_requests = CameraRequest.query.order_by(CameraRequest.id.desc()).limit(30).all()
     q = request.args.get("q", "").strip()
     if q:
         like = f"%{q}%"
@@ -823,7 +962,7 @@ def admin_page():
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
         freezes=freezes, archive_orders=archive_orders, partners=partners, teams=teams, thumbs=thumbs,
-        recent_audit=recent_audit, settings=settings, methods=PAY_METHODS, roles=ROLES,
+        cam_requests=cam_requests, recent_audit=recent_audit, settings=settings, methods=PAY_METHODS, roles=ROLES,
         browser_active=browser_active, stats=stats)
 
 @app.route("/admin/browser")
@@ -1166,6 +1305,7 @@ def admin_user_delete(user_id):
     for d in list(user.promised_debts): db.session.delete(d)
     for m in list(user.team_membership): db.session.delete(m)
     for m in list(user.team_members_owned): db.session.delete(m)
+    for cr in list(user.camera_requests): db.session.delete(cr)
     db.session.execute(camera_access.delete().where(camera_access.c.user_id == user.id))
     db.session.delete(user); db.session.commit()
     return admin_redirect("#users")
