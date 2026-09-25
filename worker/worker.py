@@ -1,8 +1,9 @@
-import sqlite3, subprocess, time, signal
+import os, sqlite3, subprocess, time, signal
 from pathlib import Path
 
 BASE_DIR = Path("/opt/cctv"); DB_PATH = BASE_DIR / "app" / "cctv.db"
-ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"; LOG_DIR = BASE_DIR / "storage" / "logs"
+ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"
+LOG_DIR = BASE_DIR / "storage" / "logs"; PREVIEW_DIR = BASE_DIR / "storage" / "previews"
 MOTION_THRESHOLD = "0.06"
 procs = {}; configs = {}; log_files = {}; running = True; loops = 0
 
@@ -24,6 +25,24 @@ def get_cameras():
 
 def camera_config(cam):
     return (cam["rtsp_url"], bool(cam["recording_enabled"]), cam.get("recording_mode") or "continuous")
+
+def snap_thumbs(cams):
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    for cam in cams:
+        out = PREVIEW_DIR / f"thumb_{cam['id']}.jpg"
+        tmp = PREVIEW_DIR / f".thumb_{cam['id']}.tmp.jpg"
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+               "-i", cam["rtsp_url"], "-frames:v", "1", "-y", str(tmp)]
+        try:
+            r = subprocess.run(cmd, timeout=10, capture_output=True)
+            if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                os.replace(tmp, out)
+            elif tmp.exists():
+                tmp.unlink()
+        except Exception:
+            if tmp.exists():
+                try: tmp.unlink()
+                except Exception: pass
 
 def cleanup_archives():
     try:
@@ -82,8 +101,9 @@ def start_camera(cam):
             str(live_dir / "index.m3u8")]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
+cams_now = []
 while running:
-    cameras = get_cameras(); active_ids = set()
+    cameras = get_cameras(); cams_now = cameras; active_ids = set()
     for cam in cameras:
         cid = cam["id"]; active_ids.add(cid); cfg = camera_config(cam)
         proc = procs.get(cid)
@@ -101,6 +121,7 @@ while running:
         if cid not in active_ids:
             stop_camera(cid); configs.pop(cid, None)
     loops += 1
+    if loops % 12 == 1: snap_thumbs(cameras)
     if loops % 300 == 0: cleanup_archives()
     time.sleep(5)
 
