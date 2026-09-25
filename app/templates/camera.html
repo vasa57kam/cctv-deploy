@@ -2,20 +2,29 @@
 {% block content %}
 <h1>{{ camera.name }} {% if camera.group_name %}<span class="badge warn">{{ camera.group_name }}</span>{% endif %}</h1>
 <div class="card">
-  <h2>Онлайн</h2>
+  <h2>Плеер</h2>
+  <div class="formrow">
+    <button class="btn" id="btn-live" type="button">Лайв</button>
+    <span class="muted" id="now-playing">режим: лайв</span>
+  </div>
   <video id="video" controls autoplay muted></video>
   <p class="muted" id="player-status"></p>
 </div>
 <div class="card">
   <h2>Архив</h2>
+  <p class="muted">Прошедшие дни сервер склеивает в один файл (смотреть с перемоткой).
+     Куски текущего дня пишутся по 5 минут. «Смотреть» — в плеере выше, «Скачать» — файлом.
+     Точный фрагмент за период можно заказать нарезкой в кабинете (платно).</p>
   {% if records %}
   <table>
     <tr><th>Файл</th><th>Размер</th><th>Статус</th><th></th></tr>
     {% for rec in records %}
     <tr><td>{{ rec.name }}</td><td>{{ rec.size_mb }} МБ</td>
-    <td>{% if rec.ready %}<span class="badge ok">готов</span>{% else %}<span class="badge warn">идёт запись…</span>{% endif %}</td>
-    <td><a class="btn gray" href="{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}" target="_blank">Смотреть</a>
-    {% if rec.ready %}<a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}</td></tr>
+    <td>{% if rec.ready %}<span class="badge ok">{{ rec.kind_label }}</span>{% else %}<span class="badge warn">идёт запись…</span>{% endif %}</td>
+    <td>
+      <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}')">Смотреть</button>
+      {% if rec.ready %}<a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
+    </td></tr>
     {% endfor %}
   </table>
   {% else %}<p class="muted">Архив пуст: запись ещё не началась или выключена.</p>{% endif %}
@@ -24,11 +33,30 @@
 <script>
 const video = document.getElementById("video");
 const statusEl = document.getElementById("player-status");
-const src = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
-if (window.Hls && Hls.isSupported()) {
-  const hls = new Hls();
-  hls.loadSource(src); hls.attachMedia(video);
-  hls.on(Hls.Events.ERROR, function(e, data) { if (data.fatal) statusEl.textContent = "Нет сигнала: камера офлайн или поток недоступен"; });
-} else { video.src = src; }
+const nowEl = document.getElementById("now-playing");
+const liveSrc = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
+let hls = null;
+function playLive(){
+  if (hls) { hls.destroy(); hls = null; }
+  video.removeAttribute("src");
+  statusEl.textContent = "";
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls();
+    hls.loadSource(liveSrc); hls.attachMedia(video);
+    hls.on(Hls.Events.ERROR, function(e, d){ if (d.fatal) statusEl.textContent = "Нет сигнала: камера офлайн или поток недоступен"; });
+  } else { video.src = liveSrc; }
+  nowEl.textContent = "режим: лайв";
+  video.play();
+}
+function playArchive(url){
+  if (hls) { hls.destroy(); hls = null; }
+  statusEl.textContent = "";
+  video.src = url;
+  nowEl.textContent = "режим: архив (перемотка доступна)";
+  video.play();
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+document.getElementById("btn-live").addEventListener("click", playLive);
+playLive();
 </script>
 {% endblock %}
