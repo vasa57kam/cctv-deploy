@@ -1,3 +1,4 @@
+
 import sqlite3, os
 
 DB = "/opt/cctv/app/cctv.db"
@@ -43,7 +44,7 @@ CREATE TABLE IF NOT EXISTS promised_debt (id INTEGER PRIMARY KEY, user_id INTEGE
   status VARCHAR(10) DEFAULT 'active', repaid_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS subscription_freeze (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
   freeze_from TIMESTAMP NOT NULL, freeze_to TIMESTAMP NOT NULL, original_ends_at TIMESTAMP,
-  status VARCHAR(10) DEFAULT 'pending', created_at TIMESTAMP);
+  status VARCHAR(10) DEFAULT 'pending', price FLOAT DEFAULT 0, created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS referral (id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL,
   referee_id INTEGER NOT NULL, bonus_amount FLOAT DEFAULT 0, status VARCHAR(10) DEFAULT 'pending',
   created_at TIMESTAMP, credited_at TIMESTAMP);
@@ -62,10 +63,8 @@ CREATE TABLE IF NOT EXISTS whitelabel (id INTEGER PRIMARY KEY, partner_id INTEGE
 
 if has("tariff"):
     c = cols("tariff")
-    if "is_b2b" not in c:
-        cur.execute("ALTER TABLE tariff ADD COLUMN is_b2b BOOLEAN DEFAULT 0")
-    if "max_users" not in c:
-        cur.execute("ALTER TABLE tariff ADD COLUMN max_users INTEGER DEFAULT 1")
+    if "is_b2b" not in c: cur.execute("ALTER TABLE tariff ADD COLUMN is_b2b BOOLEAN DEFAULT 0")
+    if "max_users" not in c: cur.execute("ALTER TABLE tariff ADD COLUMN max_users INTEGER DEFAULT 1")
     if "interval_seconds" not in c:
         cur.execute("ALTER TABLE tariff ADD COLUMN interval_seconds INTEGER")
         cur.execute("UPDATE tariff SET interval_seconds = COALESCE(period_days,30)*86400 WHERE interval_seconds IS NULL")
@@ -108,6 +107,12 @@ if has("payment_request"):
     if "admin_hidden" not in c:
         cur.execute("ALTER TABLE payment_request ADD COLUMN admin_hidden BOOLEAN DEFAULT 0")
         print("migration: payment_request += admin_hidden")
+
+if has("subscription_freeze"):
+    c = cols("subscription_freeze")
+    if "price" not in c:
+        cur.execute("ALTER TABLE subscription_freeze ADD COLUMN price FLOAT DEFAULT 0")
+        print("migration: subscription_freeze += price")
 
 n = cur.execute("SELECT COUNT(*) FROM tariff").fetchone()[0]
 if n == 0:
