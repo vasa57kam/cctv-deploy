@@ -1,0 +1,269 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Админка <span class="badge warn">v4.0</span></h1>
+
+<details class="card" id="analytics" open>
+<summary>Аналитика</summary>
+<p>
+<span class="stat"><b>{{ "%.0f"|format(stats.mrr) }} р.</b>MRR (мес. выручка)</span>
+<span class="stat"><b>{{ "%.0f"|format(stats.revenue30) }} р.</b>списания за 30 дн.</span>
+<span class="stat"><b>{{ stats.paying }} / {{ stats.total }}</b>платящих / всего</span>
+<span class="stat"><b>{{ stats.churn }}%</b>отток</span>
+<span class="stat"><b>{{ "%.0f"|format(stats.arpu) }} р.</b>ARPU</span>
+</p>
+<h2>Просмотры камер за 14 дней</h2>
+{% if stats.views %}
+<table><tr><th>День</th><th>Просмотров</th></tr>
+{% for day, cnt in stats.views %}<tr><td>{{ day }}</td><td>{{ cnt }}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="muted">Пока нет данных.</p>{% endif %}
+</details>
+
+<details class="card" id="discover">
+<summary>Парсер потоков с чужого сайта {% if browser_active %}<span class="badge warn">сессия браузера открыта</span>{% endif %}</summary>
+<form method="post" action="{{ url_for('admin_discover') }}" class="formrow">
+  <input name="base_url" placeholder="https://сайт/страница-с-камерами" style="flex:1" required>
+  <input name="cookie" placeholder="Cookie: name=value; … (необязательно)" style="flex:1">
+  <button class="btn" type="submit">Найти потоки</button>
+</form>
+<p><a class="btn" href="{{ url_for('admin_browser_page') }}">Войти через окно браузера</a></p>
+</details>
+
+<details class="card" id="requests" {% if pending_requests %}open{% endif %}>
+<summary>Заявки на пополнение {% if pending_requests %}<span class="badge warn">новых: {{ pending_requests|length }}</span>{% endif %}</summary>
+{% if pending_requests %}
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Действия</th></tr>
+{% for item in pending_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td><td>{{ item.p.comment or "" }}</td>
+<td><form method="post" action="{{ url_for('admin_payment_approve', pr_id=item.p.id) }}" style="display:inline"><button class="btn" type="submit">Подтвердить</button></form>
+<form method="post" action="{{ url_for('admin_payment_reject', pr_id=item.p.id) }}" style="display:inline"><button class="btn red" type="submit">Отклонить</button></form></td></tr>{% endfor %}</table>
+<p class="muted">При подтверждении платежа партнёру-рефереру автоматически начисляется его комиссия.</p>
+{% else %}<p class="muted">Новых заявок нет.</p>{% endif %}
+{% if processed_requests %}
+<h2>История заявок</h2>
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Способ</th><th>Статус</th><th></th></tr>
+{% for item in processed_requests %}<tr><td>{{ item.p.id }}</td><td>{{ item.p.user.username }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td>
+<td>{% if item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_payment_hide', pr_id=item.p.id) }}" style="display:inline"><button class="btn gray mini" type="submit">Скрыть</button></form></td></tr>{% endfor %}</table>
+{% endif %}
+</details>
+
+<details class="card" id="freezes" {% if freezes %}open{% endif %}>
+<summary>Заморозки подписок {% if freezes %}<span class="badge warn">{{ freezes|length }}</span>{% endif %}</summary>
+{% if freezes %}
+<table><tr><th>Пользователь</th><th>Период</th><th>Статус</th><th>Действия</th></tr>
+{% for f in freezes %}<tr><td>{{ f.user.username }}</td><td>{{ f.freeze_from.strftime("%d.%m.%Y") }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
+<td>{% if f.status == "active" %}<span class="badge ok">действует</span>{% else %}<span class="badge warn">заявка</span>{% endif %}</td>
+<td>{% if f.status == "pending" %}
+<form method="post" action="{{ url_for('admin_freeze_action', freeze_id=f.id, action='approve') }}" style="display:inline"><button class="btn mini" type="submit">Одобрить</button></form>
+<form method="post" action="{{ url_for('admin_freeze_action', freeze_id=f.id, action='reject') }}" style="display:inline"><button class="btn red mini" type="submit">Отклонить</button></form>
+{% else %}—{% endif %}</td></tr>{% endfor %}</table>
+{% else %}<p class="muted">Заморозок нет.</p>{% endif %}
+</details>
+
+<details class="card" id="archive-orders" {% if archive_orders %}open{% endif %}>
+<summary>Заказы выгрузки архива</summary>
+{% if archive_orders %}
+<table><tr><th>ID</th><th>Клиент</th><th>Камера</th><th>Период</th><th>Цена</th><th>Статус</th><th>Действия</th></tr>
+{% for o in archive_orders %}<tr><td>{{ o.id }}</td><td>{{ o.user.username }}</td><td>{{ o.camera.name }}</td>
+<td>{{ o.from_dt.strftime("%d.%m %H:%M") }} — {{ o.to_dt.strftime("%d.%m %H:%M") }}</td><td>{{ "%.0f"|format(o.price) }}</td>
+<td>{% if o.status == "approved" %}<span class="badge ok">готово</span>{% elif o.status == "pending" %}<span class="badge warn">в работе</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
+<td>{% if o.status == "pending" %}
+<form method="post" action="{{ url_for('admin_archive_order', order_id=o.id, action='approve') }}" style="display:inline"><button class="btn mini" type="submit">Оплатить и отдать</button></form>
+<form method="post" action="{{ url_for('admin_archive_order', order_id=o.id, action='reject') }}" style="display:inline"><button class="btn red mini" type="submit">Отклонить</button></form>
+{% else %}<span class="muted">файл: exports/order_{{ o.id }}.mp4</span>{% endif %}</td></tr>{% endfor %}</table>
+<p class="muted">После «Оплатить и отдать» спишется цена, а клиент сможет скачать файл, когда ты положишь его в /opt/cctv/storage/exports/order_N.mp4.</p>
+{% else %}<p class="muted">Заказов нет.</p>{% endif %}
+</details>
+
+<details class="card" id="cameras" open>
+<summary>Камеры (общий пул) — {{ cameras|length }}</summary>
+<table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
+{% for cam in cameras %}
+<tr><td>{{ cam.id }}</td><td>{{ cam.name }}{% if cam.group_name %} <span class="badge warn">{{ cam.group_name }}</span>{% endif %}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
+<td>{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %} {% if cam.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</td>
+<td>{% for u in cam.users %}<span class="badge ok">{{ u.username }}</span> <form method="post" action="{{ url_for('admin_camera_revoke', camera_id=cam.id) }}" style="display:inline"><input type="hidden" name="user_id" value="{{ u.id }}"><button class="btn gray mini" type="submit">отозвать</button></form><br>{% else %}<span class="muted">никому</span>{% endfor %}</td>
+<td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn gray" type="submit">Выдать</button></form></td>
+<td><form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red mini" type="submit">Удалить</button></form></td></tr>
+<tr><td colspan="6" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="group" value="{{ cam.group_name or '' }}" placeholder="Группа"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://… или m3u8" style="flex:1"><button class="btn gray" type="submit">Сохранить</button></form></td></tr>
+{% endfor %}
+</table>
+<h2>Добавить камеру в пул</h2>
+<form method="post" action="{{ url_for('admin_camera_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="group" placeholder="Группа (вход/двор/парковка)"><input name="rtsp_url" placeholder="rtsp://… или HLS m3u8" required style="flex:1"><button class="btn" type="submit">Добавить</button></form>
+</details>
+
+<details class="card" id="users">
+<summary>Пользователи — {{ users|length }}</summary>
+<table><tr><th>ID</th><th>Логин</th><th>Баланс</th><th>Лимит</th><th>Тариф</th><th>Оплачено до</th><th>Статус</th><th>Действия</th></tr>
+{% for u in users %}
+<tr><td>{{ u.id }}</td><td>{{ u.username }}{% if u.admin %} <span class="badge warn">админ</span>{% endif %}{% if u.team_membership %} <span class="badge warn">сотрудник</span>{% endif %}</td><td>{{ "%.2f"|format(u.balance) }}</td><td>{{ "%.2f"|format(u.credit_limit or 0) }}</td>
+<td>{{ u.tariff.name if u.tariff else "—" }}</td><td>{{ u.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") if u.subscription_ends_at else "—" }}</td>
+<td>{% if u.active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">заблокирован</span>{% endif %} {% if u.auto_renew %}<span class="badge ok">авто</span>{% endif %}</td>
+<td>
+<form method="post" action="{{ url_for('admin_impersonate', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Войти в кабинет как {{ u.username }}?');"><button class="btn mini" type="submit">Войти как</button></form>
+<form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Блок" if u.active else "Разблок" }}</button></form>
+{% if not u.admin %}<form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить {{ u.username }}?');"><button class="btn red mini" type="submit">Удалить</button></form>{% endif %}</td></tr>
+<tr><td colspan="8" class="muted">
+  <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;"><input name="username" value="{{ u.username }}" placeholder="Логин"><button class="btn gray mini" type="submit">Переименовать</button></form>
+  <form method="post" action="{{ url_for('admin_user_credit', user_id=u.id) }}" class="formrow" style="margin:4px 0 0 0;"><input name="credit_limit" value="{{ u.credit_limit or 0 }}" placeholder="Доверит. лимит"><button class="btn gray mini" type="submit">Лимит</button></form>
+</td></tr>
+{% endfor %}
+</table>
+<h2>Добавить пользователя</h2>
+<form method="post" action="{{ url_for('admin_user_add') }}" class="formrow"><input name="username" placeholder="Логин" required><input name="password" type="password" placeholder="Пароль" required><input name="refcode" placeholder="Реф. код (если есть)"><button class="btn" type="submit">Создать</button></form>
+<h2>Сменить пароль</h2>
+<form method="post" id="pass-form" class="formrow"><select name="user_id" id="pass-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input type="password" name="password" placeholder="Новый пароль" required><button class="btn" type="submit">Сменить</button></form>
+<h2>Пополнить баланс вручную</h2>
+<form method="post" action="{{ url_for('admin_topup') }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><input name="amount" placeholder="100 или -100" required><select name="method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select><input name="reason" placeholder="Причина"><button class="btn" type="submit">Применить</button></form>
+<h2>Подключить тариф</h2>
+<form method="post" id="tariff-form" class="formrow"><select name="user_id" id="tariff-user">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select><button class="btn" type="submit">Подключить</button></form>
+</details>
+
+<details class="card" id="team">
+<summary>B2B-команды (сотрудники организаций)</summary>
+{% if teams %}
+<table><tr><th>Организация</th><th>Сотрудник</th><th>Роль</th><th></th></tr>
+{% for m in teams %}<tr><td>{{ m.owner.username }}</td><td>{{ m.user.username }}</td><td>{{ m.role }}</td>
+<td><form method="post" action="{{ url_for('admin_team_remove', mid=m.id) }}" style="display:inline" onsubmit="return confirm('Убрать сотрудника?');"><button class="btn red mini" type="submit">Убрать</button></form></td></tr>{% endfor %}
+</table>
+{% else %}<p class="muted">Команд пока нет.</p>{% endif %}
+<h2>Добавить сотрудника</h2>
+<form method="post" action="{{ url_for('admin_team_invite') }}" class="formrow">
+<select name="owner_id">{% for u in users %}{% if u.tariff and u.tariff.is_b2b %}<option value="{{ u.id }}">{{ u.username }}</option>{% endif %}{% endfor %}</select>
+<input name="username" placeholder="Логин сотрудника" required>
+<input name="password" type="password" placeholder="Пароль" required>
+<select name="role">{% for code, label in roles %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select>
+<button class="btn" type="submit">Добавить</button></form>
+</details>
+
+<details class="card" id="tariffs">
+<summary>Тарифы — {{ tariffs|length }}</summary>
+<table><tr><th>Название</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Сотр.</th><th>Архив</th><th>Статус</th><th></th></tr>
+{% for t in tariffs %}
+<tr><td>{{ t.name }}{% if t.is_b2b %} <span class="badge warn">B2B</span>{% endif %}</td><td>{{ t.price }}</td>
+<td>{% if t.interval_seconds % 2592000 == 0 %}{{ t.interval_seconds // 2592000 }} мес{% elif t.interval_seconds % 86400 == 0 %}{{ t.interval_seconds // 86400 }} дн{% elif t.interval_seconds % 3600 == 0 %}{{ t.interval_seconds // 3600 }} ч{% elif t.interval_seconds % 60 == 0 %}{{ t.interval_seconds // 60 }} мин{% else %}{{ t.interval_seconds }} сек{% endif %}</td>
+<td>{{ t.max_cameras }}</td><td>{{ t.max_users }}</td><td>{{ t.archive_days }} дн.</td>
+<td>{% if t.is_active %}<span class="badge ok">активен</span>{% else %}<span class="badge bad">скрыт</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_tariff_toggle', tariff_id=t.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if t.is_active else "Вкл" }}</button></form>
+<form method="post" action="{{ url_for('admin_tariff_delete', tariff_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить тариф {{ t.name }}?');"><button class="btn red mini" type="submit">Удалить</button></form></td></tr>
+<tr><td colspan="8" class="muted"><form method="post" action="{{ url_for('admin_tariff_edit', tariff_id=t.id) }}" class="formrow" style="margin:0;">
+<input name="name" value="{{ t.name }}"><input name="price" value="{{ t.price }}" style="width:90px">
+<select name="interval_seconds">{% if t.interval_seconds not in [1,60,3600,86400,2592000] %}<option value="{{ t.interval_seconds }}" selected>{{ t.interval_seconds }} с</option>{% endif %}<option value="1" {% if t.interval_seconds == 1 %}selected{% endif %}>сек</option><option value="60" {% if t.interval_seconds == 60 %}selected{% endif %}>мин</option><option value="3600" {% if t.interval_seconds == 3600 %}selected{% endif %}>час</option><option value="86400" {% if t.interval_seconds == 86400 %}selected{% endif %}>день</option><option value="2592000" {% if t.interval_seconds == 2592000 %}selected{% endif %}>месяц</option></select>
+<input name="max_cameras" value="{{ t.max_cameras }}" style="width:70px"><input name="max_users" value="{{ t.max_users }}" style="width:70px"><input name="archive_days" value="{{ t.archive_days }}" style="width:70px">
+<label class="muted"><input type="checkbox" name="is_b2b" value="1" {% if t.is_b2b %}checked{% endif %}> B2B</label>
+<button class="btn gray" type="submit">Сохранить</button></form>
+<span class="muted">пакеты: 3 мес −5%, 6 мес −10%, 12 мес −15% (создаются автоматически)</span></td></tr>
+{% endfor %}
+</table>
+<h2>Добавить тариф</h2>
+<form method="post" action="{{ url_for('admin_tariff_add') }}" class="formrow"><input name="name" placeholder="Название" required><input name="price" placeholder="Цена" required>
+<select name="interval_seconds"><option value="1">сек</option><option value="60">мин</option><option value="3600">час</option><option value="86400">день</option><option value="2592000" selected>месяц</option></select>
+<input name="max_cameras" placeholder="Камер" value="1"><input name="max_users" placeholder="Сотрудников" value="1"><input name="archive_days" placeholder="Архив дн." value="7">
+<label class="muted"><input type="checkbox" name="is_b2b" value="1"> B2B</label>
+<button class="btn" type="submit">Добавить</button></form>
+</details>
+
+<details class="card" id="partners">
+<summary>Партнёры и white-label — {{ partners|length }}</summary>
+{% if partners %}
+{% for p in partners %}
+{% set wl = p.whitelabel[0] if p.whitelabel else none %}
+<h2>{{ p.user.username }} — комиссия {{ p.commission_percent }}%</h2>
+<p class="muted">Приведено клиентов: {{ p.total_referrals }} · Заработано: {{ "%.2f"|format(p.total_earned) }} р.</p>
+<form method="post" action="{{ url_for('admin_partner_edit', pid=p.id) }}" class="formrow">
+<input name="commission_percent" value="{{ p.commission_percent }}" style="width:110px" placeholder="Комиссия %">
+<button class="btn gray" type="submit">Изменить комиссию</button></form>
+<form method="post" action="{{ url_for('admin_whitelabel_save', pid=p.id) }}" class="formrow">
+<input name="brand_name" value="{{ wl.brand_name if wl else 'CCTV' }}" placeholder="Бренд">
+<input name="domain" value="{{ wl.domain or '' }}" placeholder="домен партнёра">
+<input name="logo_url" value="{{ wl.logo_url or '' }}" placeholder="URL логотипа" style="flex:1">
+<input name="primary_color" value="{{ wl.primary_color if wl else '#38bdf8' }}" style="width:110px">
+<button class="btn gray" type="submit">Сохранить white-label</button></form>
+{% endfor %}
+{% else %}<p class="muted">Партнёров пока нет.</p>{% endif %}
+<h2>Сделать партнёром</h2>
+<form method="post" action="{{ url_for('admin_partner_create') }}" class="formrow">
+<select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select>
+<button class="btn" type="submit">Назначить партнёром</button></form>
+</details>
+
+<details class="card" id="referrals">
+<summary>Рефералы</summary>
+{% if referrals %}
+<table><tr><th>Кто привёл</th><th>Новый клиент</th><th>Статус</th><th></th></tr>
+{% for r in referrals %}<tr><td>{{ r.referrer.username }}</td><td>{{ r.referee.username }}</td>
+<td>{% if r.status == "credited" %}<span class="badge ok">бонус {{ "%.0f"|format(r.bonus_amount) }} р.</span>{% else %}<span class="badge warn">ждёт первого платежа</span>{% endif %}</td>
+<td>{% if r.status == "pending" %}<form method="post" action="{{ url_for('admin_referral_credit', ref_id=r.id) }}" style="display:inline"><button class="btn mini" type="submit">Начислить бонус</button></form>{% endif %}</td></tr>{% endfor %}
+</table>
+{% else %}<p class="muted">Рефералов пока нет.</p>{% endif %}
+</details>
+
+<details class="card" id="settings">
+<summary>Настройки: способы оплаты, комиссии, обещанный, white-label</summary>
+<form method="post" action="{{ url_for('admin_settings') }}">
+  <p>{% for code, label in methods %}<label style="margin-right:16px;"><input type="checkbox" name="method_{{ code }}" value="1" {% if settings['method_' + code] == '1' %}checked{% endif %}> {{ label }}</label>{% endfor %}</p>
+  <p class="muted">Инструкция для «Перевод по номеру»:</p>
+  <textarea name="transfer_instruction" rows="3" style="width:100%;">{{ settings['transfer_instruction'] }}</textarea>
+  <div class="formrow" style="margin-top:10px;">
+    <input name="promised_amount" value="{{ settings['promised_amount'] }}" placeholder="Сумма обещанного" style="width:130px">
+    <select name="promised_repay_seconds">
+      {% if settings['promised_repay_seconds'] not in ['3600','86400','259200','604800','1209600'] %}<option value="{{ settings['promised_repay_seconds'] }}" selected>{{ settings['promised_repay_seconds'] }} с</option>{% endif %}
+      <option value="3600" {% if settings['promised_repay_seconds'] == '3600' %}selected{% endif %}>1 час</option>
+      <option value="86400" {% if settings['promised_repay_seconds'] == '86400' %}selected{% endif %}>1 день</option>
+      <option value="259200" {% if settings['promised_repay_seconds'] == '259200' %}selected{% endif %}>3 дня</option>
+      <option value="604800" {% if settings['promised_repay_seconds'] == '604800' %}selected{% endif %}>7 дней</option>
+      <option value="1209600" {% if settings['promised_repay_seconds'] == '1209600' %}selected{% endif %}>14 дней</option>
+    </select>
+    <label class="muted">Комиссия обещанного %: <input name="promised_fee_percent" value="{{ settings['promised_fee_percent'] }}" style="width:80px"></label>
+  </div>
+  <div class="formrow">
+    <label class="muted">Реф. бонус, р: <input name="referral_bonus" value="{{ settings['referral_bonus'] }}" style="width:90px"></label>
+    <label class="muted">Комиссия партнёра по умолч., %: <input name="partner_commission" value="{{ settings['partner_commission'] }}" style="width:90px"></label>
+    <label class="muted">Цена выгрузки архива, р: <input name="archive_order_price" value="{{ settings['archive_order_price'] }}" style="width:90px"></label>
+  </div>
+  <div class="formrow">
+    <input name="whitelabel_name" value="{{ settings['whitelabel_name'] }}" placeholder="Название бренда">
+    <input name="whitelabel_primary" value="{{ settings['whitelabel_primary'] }}" placeholder="#цвет" style="width:110px">
+    <input name="whitelabel_logo" value="{{ settings['whitelabel_logo'] }}" placeholder="URL логотипа" style="flex:1">
+  </div>
+  <button class="btn" type="submit">Сохранить</button>
+</form>
+<h2>Активные обещанные платежи</h2>
+{% if debts %}
+<table><tr><th>Пользователь</th><th>Взял</th><th>К возврату</th><th>До</th><th>Статус</th><th></th></tr>
+{% for item in debts %}<tr><td>{{ item.d.user.username }}</td><td>{{ "%.2f"|format(item.d.principal) }}</td><td>{{ "%.2f"|format(item.d.repay_amount) }}</td><td>{{ item.d.due_at.strftime("%d.%m.%Y %H:%M") }}</td>
+<td>{% if item.overdue %}<span class="badge bad">просрочен</span>{% else %}<span class="badge warn">активен</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('admin_promised_cancel', debt_id=item.d.id) }}" style="display:inline" onsubmit="return confirm('Списать долг?');"><button class="btn red mini" type="submit">Убрать</button></form></td></tr>{% endfor %}</table>
+{% else %}<p class="muted">Активных обещанных платежей нет.</p>{% endif %}
+</details>
+
+<details class="card" id="audit">
+<summary>Журнал событий (последние 60)</summary>
+<form method="post" action="{{ url_for('admin_audit_clear') }}" style="margin-bottom:10px;" onsubmit="return confirm('Очистить журнал?');"><button class="btn red" type="submit">Очистить журнал</button></form>
+<table><tr><th>Время</th><th>Пользователь</th><th>Действие</th><th>Объект</th><th>IP</th></tr>
+{% for a in recent_audit %}<tr><td>{{ a.created_at.strftime("%d.%m %H:%M:%S") }}</td><td>{{ a.user.username if a.user else "—" }}</td><td>{{ a.action }}</td><td class="muted">{{ a.target or "" }}</td><td class="muted">{{ a.ip or "" }}</td></tr>{% endfor %}
+</table>
+</details>
+
+<details class="card" id="transactions">
+<summary>Транзакции {% if tx_query %}<span class="badge warn">поиск: {{ tx_query }}</span>{% else %}(последние 50){% endif %}</summary>
+<form method="get" action="{{ url_for('admin_page') }}" class="formrow"
+      onsubmit="this.action = '{{ url_for('admin_page') }}?q=' + encodeURIComponent(this.q.value) + '#transactions'; return true;">
+  <input name="q" value="{{ tx_query or '' }}" placeholder="Поиск: логин, причина, сумма, дата">
+  <button class="btn gray" type="submit">Найти</button>
+  {% if tx_query %}<a class="btn gray" href="{{ url_for('admin_page') }}#transactions">Сбросить</a>{% endif %}
+</form>
+{% if tx_query %}<p class="muted">Найдено: {{ transactions|length }}</p>{% endif %}
+<form method="post" action="{{ url_for('admin_transactions_clear') }}" style="margin-bottom:10px;" onsubmit="return confirm('Очистить ВСЮ историю транзакций? Балансы не изменятся.');"><button class="btn red" type="submit">Очистить всё</button></form>
+<table><tr><th>ID</th><th>Пользователь</th><th>Сумма</th><th>Причина</th><th>Дата</th><th></th></tr>
+{% for t in transactions %}<tr><td>{{ t.id }}</td><td>{{ t.user.username if t.user else "—" }}</td><td>{{ "%.2f"|format(t.amount) }}</td><td>{{ t.reason }}</td><td>{{ t.created_at.strftime("%d.%m.%Y %H:%M:%S") if t.created_at else "" }}</td>
+<td><form method="post" action="{{ url_for('admin_transaction_delete', tx_id=t.id) }}" style="display:inline" onsubmit="return confirm('Удалить транзакцию #{{ t.id }}?');"><button class="btn red mini" type="submit">✕</button></form></td></tr>{% endfor %}
+</table>
+</details>
+
+<script>
+document.getElementById("tariff-form").addEventListener("submit", function () { this.action = "/admin/user/" + document.getElementById("tariff-user").value + "/tariff"; });
+document.getElementById("pass-form").addEventListener("submit", function () { this.action = "/admin/user/" + document.getElementById("pass-user").value + "/password"; });
+</script>
+{% endblock %}
