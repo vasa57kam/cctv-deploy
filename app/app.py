@@ -34,7 +34,7 @@ DEFAULT_SETTINGS = {
     "method_cash": "1", "method_transfer": "1", "method_card": "0", "method_promised": "1", "method_other": "0",
     "transfer_instruction": "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). В комментарии укажите дату и последние 4 цифры.",
     "promised_amount": "300", "promised_repay_seconds": "604800", "promised_fee_percent": "10",
-    "referral_bonus": "100", "partner_commission": "30", "archive_order_price": "100",
+    "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
 
@@ -130,7 +130,7 @@ class SubscriptionFreeze(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     freeze_from = db.Column(db.DateTime, nullable=False); freeze_to = db.Column(db.DateTime, nullable=False)
-    status = db.Column(db.String(10), default="pending")
+    status = db.Column(db.String(10), default="pending"); price = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     user = db.relationship("User", backref="freezes")
 
@@ -267,8 +267,16 @@ def team_role(user):
     m = team_member_of(user)
     return m.role if m else None
 
+def active_freeze(user):
+    if user is None: return None
+    now = datetime.utcnow()
+    return SubscriptionFreeze.query.filter_by(user_id=user.id, status="active").filter(
+        SubscriptionFreeze.freeze_from <= now, SubscriptionFreeze.freeze_to >= now).first()
+
 def subscription_active(user):
-    return user is not None and user.subscription_ends_at is not None and user.subscription_ends_at > datetime.utcnow()
+    if user is None or user.subscription_ends_at is None: return False
+    if active_freeze(user): return False
+    return user.subscription_ends_at > datetime.utcnow()
 
 def user_link(user_id, camera_id):
     return db.session.execute(camera_access.select().where(
@@ -310,8 +318,6 @@ def can_add_camera_to_user(user):
 def camera_archive_days(camera):
     vals = [u.tariff.archive_days for u in camera.users if u.tariff is not None and u.tariff.archive_days]
     return max(vals) if vals else 7
-
-def ref_code(user): return base64.urlsafe_b64encode(str(user.id).encode()).decode().rstrip("=")
 
 def apply_tariff(user, tariff, months=1, discount=0.0):
     now = datetime.utcnow()
@@ -393,17 +399,6 @@ def stop_impersonation():
     flash("Вы вернулись в админку.")
     return redirect(url_for("admin_page"))
 
-@app.route("/referral/use/<code>")
-def referral_use(code):
-    try:
-        pad = (4 - len(code) % 4) % 4
-        rid = int(base64.urlsafe_b64decode(code + "=" * pad).decode())
-    except Exception:
-        flash("Неверная реферальная ссылка."); return redirect(url_for("login"))
-    session["pending_referrer"] = rid
-    flash("Реферальный код принят: назовите его администратору при создании вашего аккаунта.")
-    return redirect(url_for("login"))
-
 @app.route("/")
 @login_required
 def dashboard():
@@ -432,20 +427,20 @@ def dashboard():
         promised_fee = float(get_setting("promised_fee_percent", "0") or 0)
         promised_repay_seconds = int(get_setting("promised_repay_seconds", "604800") or 0)
         archive_price = float(get_setting("archive_order_price", "100") or 0)
+        freeze_price = float(get_setting("freeze_price_per_day", "50") or 0)
     except ValueError:
-        promised_amount, promised_fee, promised_repay_seconds, archive_price = 300.0, 0.0, 604800, 100.0
+        promised_amount, promised_fee, promised_repay_seconds, archive_price, freeze_price = 300.0, 0.0, 604800, 100.0, 50.0
     active_debt = PromisedDebt.query.filter_by(user_id=current_user.id, status="active").first()
-    my_referrals = Referral.query.filter_by(referrer_id=current_user.id).order_by(Referral.id.desc()).all()
     my_freezes = SubscriptionFreeze.query.filter_by(user_id=current_user.id).order_by(SubscriptionFreeze.id.desc()).limit(5).all()
     archive_orders = ArchiveOrder.query.filter_by(user_id=current_user.id).order_by(ArchiveOrder.id.desc()).limit(10).all()
     team_members = TeamMember.query.filter_by(owner_id=current_user.id).all() if (current_user.tariff and current_user.tariff.is_b2b) else []
     return render_template("dashboard.html", cameras=cameras, cam_items=cam_items, role=role, owner=owner,
-        user_enabled_count=enabled_count(owner), sub_active=subscription_active(owner),
+        user_enabled_count=enabled_count(owner), sub_active=subscription_active(owner), freeze_now=active_freeze(owner),
         tariff_options=tariff_options, my_requests=my_requests, methods=methods, transfer_instruction=transfer_instruction,
         promised_enabled=promised_enabled, promised_amount=promised_amount, promised_fee=promised_fee,
         promised_repay_seconds=promised_repay_seconds, promised_repay_label=interval_label(promised_repay_seconds),
-        active_debt=active_debt, my_referrals=my_referrals, referral_code=ref_code(current_user),
-        my_freezes=my_freezes, archive_orders=archive_orders, archive_price=archive_price, team_members=team_members)
+        active_debt=active_debt, my_freezes=my_freezes, archive_orders=archive_orders,
+        archive_price=archive_price, freeze_price=freeze_price, team_members=team_members)
 
 @app.route("/payment/request", methods=["POST"])
 @login_required
@@ -534,7 +529,8 @@ def freeze_request():
     now = datetime.utcnow()
     db.session.add(SubscriptionFreeze(user_id=current_user.id, freeze_from=now, freeze_to=now + timedelta(days=days), status="pending"))
     db.session.commit()
-    flash(f"Заявка на заморозку {days} дн. отправлена.")
+    price = days * float(get_setting("freeze_price_per_day", "50") or 0)
+    flash(f"Заявка на заморозку {days} дн. отправлена. Стоимость при подтверждении: {price:.0f} ₽.")
     return user_redirect("#freeze")
 
 @app.route("/archive/order", methods=["POST"])
@@ -552,7 +548,7 @@ def archive_order():
     price = float(get_setting("archive_order_price", "100") or 0)
     db.session.add(ArchiveOrder(user_id=current_user.id, camera_id=camera.id, from_dt=from_dt, to_dt=to_dt, price=price, status="pending"))
     db.session.commit()
-    flash(f"Заявка на выгрузку создана. Стоимость {price:.0f} ₽ спишется после подтверждения админом.")
+    flash(f"Заявка на нарезку фрагмента создана. Стоимость {price:.0f} ₽ спишется после подтверждения.")
     return user_redirect("#archive-request")
 
 @app.route("/archive-order/<int:oid>/download")
@@ -644,8 +640,12 @@ def camera_page(camera_id):
         files = sorted(camera_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         for p in files[:100]:
             st = p.stat()
-            if st.st_mtime < cutoff: break
-            records.append({"name": p.name, "ready": (now_ts - st.st_mtime) > 60, "size_mb": round(st.st_size / 1048576, 1)})
+            if st.st_mtime < cutoff: continue
+            is_day = bool(re.match(r"^\d{4}-\d{2}-\d{2}\.mp4$", p.name))
+            records.append({"name": p.name, "ready": (now_ts - st.st_mtime) > 60,
+                "size_mb": round(st.st_size / 1048576, 1),
+                "kind_label": "день, склеено" if is_day else "кусок 5 мин"})
+        records = records[:50]
     return render_template("camera.html", camera=camera, records=records)
 
 @app.route("/live/<int:camera_id>/<path:filename>")
@@ -692,8 +692,7 @@ def admin_page():
     debts = [{"d": d, "overdue": d.due_at < datetime.utcnow()} for d in PromisedDebt.query.filter_by(status="active").all()]
     freezes = SubscriptionFreeze.query.filter(SubscriptionFreeze.status.in_(["pending", "active"])).order_by(SubscriptionFreeze.id.desc()).all()
     archive_orders = ArchiveOrder.query.order_by(ArchiveOrder.id.desc()).limit(30).all()
-    partners = Partner.query.all()
-    referrals = Referral.query.order_by(Referral.id.desc()).limit(30).all()
+    partners = [{"p": p, "clients": User.query.filter_by(partner_of=p.id).count()} for p in Partner.query.all()]
     teams = TeamMember.query.order_by(TeamMember.id.desc()).all()
     recent_audit = AuditLog.query.order_by(AuditLog.id.desc()).limit(60).all()
     settings = {k: get_setting(k) for k in DEFAULT_SETTINGS}
@@ -715,7 +714,7 @@ def admin_page():
              "paying": len(paying), "total": len(users), "views": [(str(d), c) for d, c in views]}
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
-        freezes=freezes, archive_orders=archive_orders, partners=partners, referrals=referrals, teams=teams,
+        freezes=freezes, archive_orders=archive_orders, partners=partners, teams=teams,
         recent_audit=recent_audit, settings=settings, methods=PAY_METHODS, roles=ROLES,
         browser_active=browser_active, stats=stats)
 
@@ -823,7 +822,7 @@ def admin_impersonate(user_id):
 def admin_settings():
     for code, _ in PAY_METHODS: set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
     for k in ("transfer_instruction", "promised_amount", "promised_repay_seconds", "promised_fee_percent",
-              "referral_bonus", "partner_commission", "archive_order_price",
+              "partner_commission", "archive_order_price", "freeze_price_per_day",
               "whitelabel_name", "whitelabel_primary", "whitelabel_logo"):
         set_setting(k, request.form.get(k, ""))
     db.session.commit()
@@ -836,13 +835,21 @@ def admin_freeze_action(freeze_id, action):
     fr = get_or_404(SubscriptionFreeze, freeze_id)
     if fr.status != "pending": return admin_redirect("#freezes")
     if action == "approve":
+        days = max(1, (fr.freeze_to - fr.freeze_from).days or 1)
+        price = round(days * float(get_setting("freeze_price_per_day", "50") or 0), 2)
+        if fr.user.balance < price:
+            flash(f"У {fr.user.username} не хватает баланса на заморозку ({price:.0f} ₽). Заявка не одобрена.")
+            return admin_redirect("#freezes")
+        fr.user.balance -= price
+        db.session.add(Transaction(user_id=fr.user.id, amount=-price, reason=f"Платная заморозка подписки на {days} дн."))
+        fr.price = price
         fr.status = "active"
         if fr.user.subscription_ends_at:
             fr.user.subscription_ends_at = fr.user.subscription_ends_at + (fr.freeze_to - fr.freeze_from)
-        flash(f"Заморозка {fr.user.username} одобрена, срок сдвинут.")
+        db.session.commit()
+        flash(f"Заморозка {fr.user.username} одобрена: списано {price:.0f} ₽, срок сдвинут, доступ закрыт на период заморозки (запись идёт).")
     else:
-        fr.status = "rejected"; flash("Заморозка отклонена.")
-    db.session.commit()
+        fr.status = "rejected"; db.session.commit(); flash("Заморозка отклонена.")
     return admin_redirect("#freezes")
 
 @app.route("/admin/archive/<int:order_id>/<action>", methods=["POST"])
@@ -858,24 +865,11 @@ def admin_archive_order(order_id, action):
         flash(f"У {o.user.username} не хватает баланса ({o.price:.0f} ₽).")
         return admin_redirect("#archive-orders")
     o.user.balance -= o.price
-    db.session.add(Transaction(user_id=o.user.id, amount=-o.price, reason=f"Выгрузка архива #{o.id} ({o.camera.name})"))
+    db.session.add(Transaction(user_id=o.user.id, amount=-o.price, reason=f"Нарезка фрагмента архива #{o.id} ({o.camera.name})"))
     o.status = "approved"; o.processed_at = datetime.utcnow()
     db.session.commit()
-    flash(f"Оплачено. Положи файл в /opt/cctv/storage/exports/order_{o.id}.mp4 — клиент сможет скачать.")
+    flash(f"Оплачено. Нарежи файл и положи в /opt/cctv/storage/exports/order_{o.id}.mp4 — клиент сможет скачать.")
     return admin_redirect("#archive-orders")
-
-@app.route("/admin/referral/<int:ref_id>/credit", methods=["POST"])
-@admin_required
-def admin_referral_credit(ref_id):
-    r = get_or_404(Referral, ref_id)
-    if r.status == "credited": return admin_redirect("#referrals")
-    bonus = float(get_setting("referral_bonus", "100") or 0)
-    r.referrer.balance += bonus
-    db.session.add(Transaction(user_id=r.referrer.id, amount=bonus, reason=f"Реферальный бонус за {r.referee.username}"))
-    r.status = "credited"; r.bonus_amount = bonus; r.credited_at = datetime.utcnow()
-    db.session.commit()
-    flash(f"Бонус {bonus:.0f} ₽ начислен {r.referrer.username}.")
-    return admin_redirect("#referrals")
 
 @app.route("/admin/partner/create", methods=["POST"])
 @admin_required
@@ -899,6 +893,32 @@ def admin_partner_edit(pid):
     except ValueError: pass
     db.session.commit()
     flash(f"Комиссия партнёра {p.user.username}: {p.commission_percent}%.")
+    return admin_redirect("#partners")
+
+@app.route("/admin/partner/<int:pid>/attach", methods=["POST"])
+@admin_required
+def admin_partner_attach(pid):
+    p = get_or_404(Partner, pid)
+    try: user_id = int(request.form.get("user_id", ""))
+    except ValueError: return admin_redirect("#partners")
+    user = get_or_404(User, user_id)
+    user.partner_of = p.id
+    p.total_referrals = (p.total_referrals or 0) + 1
+    db.session.commit()
+    flash(f"Клиент {user.username} прикреплён к партнёру {p.user.username}.")
+    return admin_redirect("#partners")
+
+@app.route("/admin/partner/<int:pid>/detach", methods=["POST"])
+@admin_required
+def admin_partner_detach(pid):
+    p = get_or_404(Partner, pid)
+    try: user_id = int(request.form.get("user_id", ""))
+    except ValueError: return admin_redirect("#partners")
+    user = get_or_404(User, user_id)
+    if user.partner_of == p.id:
+        user.partner_of = None
+        p.total_referrals = max(0, (p.total_referrals or 0) - 1)
+        db.session.commit()
     return admin_redirect("#partners")
 
 @app.route("/admin/partner/<int:pid>/whitelabel", methods=["POST"])
@@ -965,17 +985,16 @@ def admin_payment_approve(pr_id):
     db.session.add(Transaction(user_id=pr.user_id, amount=pr.amount,
         reason=f"Пополнение ({method_label(pr.method)})" + (f": {pr.comment}" if pr.comment else "")))
     db.session.commit()
-    if pr.user.referred_by:
-        referrer = db.session.get(User, pr.user.referred_by)
-        partner = Partner.query.filter_by(user_id=pr.user.referred_by).first() if referrer else None
+    if pr.user.partner_of:
+        partner = Partner.query.filter_by(user_id=pr.user.partner_of).first()
         if partner:
             commission = round(pr.amount * partner.commission_percent / 100.0, 2)
-            referrer.balance += commission
-            db.session.add(Transaction(user_id=referrer.id, amount=commission,
+            partner.user.balance += commission
+            db.session.add(Transaction(user_id=partner.user_id, amount=commission,
                 reason=f"Партнёрская комиссия {partner.commission_percent:.0f}% с платежа {pr.user.username}"))
             partner.total_earned = (partner.total_earned or 0) + commission
             db.session.commit()
-            flash(f"Партнёру {referrer.username} начислена комиссия {commission:.2f} ₽.")
+            flash(f"Партнёру {partner.user.username} начислена комиссия {commission:.2f} ₽.")
     return admin_redirect("#requests")
 
 @app.route("/admin/payment/<int:pr_id>/reject", methods=["POST"])
@@ -998,19 +1017,8 @@ def admin_user_add():
     username = request.form.get("username", "").strip(); password = request.form.get("password", "").strip()
     if not username or not password or User.query.filter_by(username=username).first():
         return admin_redirect("#users")
-    referred_by = None
-    code = request.form.get("refcode", "").strip()
-    if code:
-        try:
-            pad = (4 - len(code) % 4) % 4
-            referred_by = int(base64.urlsafe_b64decode(code + "=" * pad).decode())
-            if not db.session.get(User, referred_by): referred_by = None
-        except Exception: referred_by = None
-    u = User(username=username, password_hash=generate_password_hash(password), active=True, admin=False, balance=0.0, referred_by=referred_by)
+    u = User(username=username, password_hash=generate_password_hash(password), active=True, admin=False, balance=0.0)
     db.session.add(u); db.session.commit()
-    if referred_by:
-        db.session.add(Referral(referrer_id=referred_by, referee_id=u.id, status="pending"))
-        db.session.commit()
     return admin_redirect("#users")
 
 @app.route("/admin/user/<int:user_id>/edit", methods=["POST"])
