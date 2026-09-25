@@ -1,4 +1,3 @@
-
 import sqlite3, os
 
 DB = "/opt/cctv/app/cctv.db"
@@ -31,7 +30,7 @@ CREATE TABLE IF NOT EXISTS team_member (id INTEGER PRIMARY KEY, owner_id INTEGER
   user_id INTEGER NOT NULL UNIQUE, role VARCHAR(20) DEFAULT 'viewer', created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL, rtsp_url TEXT NOT NULL,
   user_id INTEGER, active BOOLEAN DEFAULT 1, recording_enabled BOOLEAN DEFAULT 0,
-  group_name VARCHAR(60), created_at TIMESTAMP);
+  recording_mode VARCHAR(12) DEFAULT 'continuous', group_name VARCHAR(60), created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL, enabled BOOLEAN DEFAULT 1);
 CREATE TABLE IF NOT EXISTS "transaction" (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
@@ -84,6 +83,9 @@ if has("camera"):
     if "recording_enabled" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 0")
         print("migration: camera += recording_enabled")
+    if "recording_mode" not in c:
+        cur.execute("ALTER TABLE camera ADD COLUMN recording_mode VARCHAR(12) DEFAULT 'continuous'")
+        print("migration: camera += recording_mode")
     if "group_name" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN group_name VARCHAR(60)")
         print("migration: camera += group_name")
