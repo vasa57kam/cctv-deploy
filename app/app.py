@@ -216,6 +216,16 @@ def init_db():
 
 with app.app_context(): init_db()
 
+@app.template_filter("rudate")
+def rudate(dt):
+    if not dt: return ""
+    now = datetime.utcnow()
+    t = f"{dt.hour:02d}:{dt.minute:02d}"
+    if dt.date() == now.date(): return f"сегодня, {t}"
+    if dt.date() == (now - timedelta(days=1)).date(): return f"вчера, {t}"
+    months = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    return f"{dt.day} {months[dt.month - 1]}, {t}"
+
 @app.context_processor
 def inject_brand():
     brand = {"name": get_setting("whitelabel_name", "CCTV Cloud"),
@@ -320,6 +330,12 @@ def camera_archive_days(camera):
     vals = [u.tariff.archive_days for u in camera.users if u.tariff is not None and u.tariff.archive_days]
     return max(vals) if vals else 7
 
+def thumb_state(camera):
+    p = PREVIEW_DIR / f"thumb_{camera.id}.jpg"
+    if not p.exists() or p.stat().st_size == 0:
+        return {"url": None, "online": False}
+    return {"url": f"/thumb/{camera.id}", "online": (time.time() - p.stat().st_mtime) < 120}
+
 def apply_tariff(user, tariff, months=1, discount=0.0):
     now = datetime.utcnow()
     total = round(tariff.price * months * (1 - discount / 100.0), 2)
@@ -388,16 +404,18 @@ def build_archive_days(camera):
             d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
             d["glued"] = {"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
                           "ready": (now_ts - st.st_mtime) > 30,
-                          "time_start": "00:00:00", "time_end": "23:59:59", "kind": "день, склеено"}
+                          "time_start": "00:00:00", "time_end": "23:59:59", "kind": "день, склеено", "s": 0}
         elif m_chunk:
             day = m_chunk.group(1)
             d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
             h, mi, s = m_chunk.group(2), m_chunk.group(3), m_chunk.group(4)
+            s_sec = int(h) * 3600 + int(mi) * 60 + int(s)
+            e_sec = min(86400, s_sec + 300)
             start = f"{h}:{mi}:{s}"
             end = (datetime.strptime(f"{day} {h}:{mi}:{s}", "%Y-%m-%d %H:%M:%S") + timedelta(minutes=5)).strftime("%H:%M:%S")
             d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
                 "ready": (now_ts - st.st_mtime) > 60,
-                "time_start": start, "time_end": end, "kind": "кусок 5 мин"})
+                "time_start": start, "time_end": end, "kind": "кусок 5 мин", "s": s_sec, "e": e_sec})
     result = []
     for day in sorted(days.keys(), reverse=True):
         d = days[day]
@@ -405,9 +423,11 @@ def build_archive_days(camera):
         if d["glued"]:
             d["ranges"] = "00:00–23:59 (весь день одним файлом)"
             d["total_mb"] = d["glued"]["size_mb"]
+            d["segments"] = [{"s": 0, "e": 86400, "file": d["glued"]["name"], "glued": True}]
         else:
             d["ranges"] = ", ".join(f"{c['time_start'][:5]}–{c['time_end'][:5]}" for c in d["chunks"]) or "нет данных"
             d["total_mb"] = round(sum(c["size_mb"] for c in d["chunks"]), 1)
+            d["segments"] = [{"s": c["s"], "e": c["e"], "file": c["name"], "glued": False} for c in d["chunks"]]
         d["can_glue"] = (day < today) and (d["glued"] is None) and len(d["chunks"]) >= 1
         d["chunks"].sort(key=lambda x: x["name"], reverse=True)
         result.append(d)
@@ -444,6 +464,16 @@ def stop_impersonation():
     flash("Вы вернулись в админку.")
     return redirect(url_for("admin_page"))
 
+@app.route("/thumb/<int:camera_id>")
+@login_required
+def camera_thumb(camera_id):
+    camera = get_camera_or_403(camera_id)
+    p = PREVIEW_DIR / f"thumb_{camera.id}.jpg"
+    if not p.exists(): abort(404)
+    resp = send_file(p, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 @app.route("/")
 @login_required
 def dashboard():
@@ -458,6 +488,10 @@ def dashboard():
         cam_items = [{"camera": c, "enabled": True} for c in owner.cameras if user_link(owner.id, c.id) and user_link(owner.id, c.id).enabled]
     else:
         cam_items = [{"camera": c, "enabled": bool(user_link(current_user.id, c.id).enabled)} for c in current_user.cameras]
+    thumbs = {}
+    allcams = cameras or [it["camera"] for it in cam_items]
+    for c in allcams:
+        thumbs[c.id] = thumb_state(c)
     tariff_options = [{"tariff": t, "label": interval_label(t.interval_seconds),
                        "bundles": [b for b in t.bundles if b.is_active]}
                       for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()]
@@ -479,7 +513,7 @@ def dashboard():
     my_freezes = SubscriptionFreeze.query.filter_by(user_id=current_user.id).order_by(SubscriptionFreeze.id.desc()).limit(5).all()
     archive_orders = ArchiveOrder.query.filter_by(user_id=current_user.id).order_by(ArchiveOrder.id.desc()).limit(10).all()
     team_members = TeamMember.query.filter_by(owner_id=current_user.id).all() if (current_user.tariff and current_user.tariff.is_b2b) else []
-    return render_template("dashboard.html", cameras=cameras, cam_items=cam_items, role=role, owner=owner,
+    return render_template("dashboard.html", cameras=cameras, cam_items=cam_items, role=role, owner=owner, thumbs=thumbs,
         user_enabled_count=enabled_count(owner), sub_active=subscription_active(owner), freeze_now=active_freeze(owner),
         tariff_options=tariff_options, my_requests=my_requests, methods=methods, transfer_instruction=transfer_instruction,
         promised_enabled=promised_enabled, promised_amount=promised_amount, promised_fee=promised_fee,
@@ -679,8 +713,9 @@ def camera_page(camera_id):
     camera = get_camera_or_403(camera_id)
     audit(current_user, "camera_view", camera.name)
     days = build_archive_days(camera)
-    return render_template("camera.html", camera=camera, days=days,
-        is_admin=current_user.admin, team_role=team_role(current_user))
+    days_json = json.dumps([{"day": d["day"], "segments": d["segments"]} for d in days])
+    return render_template("camera.html", camera=camera, days=days, days_json=days_json,
+        thumb=thumb_state(camera), is_admin=current_user.admin, team_role=team_role(current_user))
 
 @app.route("/admin/camera/<int:camera_id>/motion", methods=["POST"])
 @admin_required
@@ -747,6 +782,7 @@ def admin_page():
     users = User.query.order_by(User.id.desc()).all()
     cameras = Camera.query.order_by(Camera.id.desc()).all()
     tariffs = Tariff.query.order_by(Tariff.id).all()
+    thumbs = {c.id: thumb_state(c) for c in cameras}
     q = request.args.get("q", "").strip()
     if q:
         like = f"%{q}%"
@@ -786,7 +822,7 @@ def admin_page():
              "paying": len(paying), "total": len(users), "views": [(str(d), c) for d, c in views]}
     return render_template("admin.html", users=users, cameras=cameras, tariffs=tariffs, transactions=transactions,
         tx_query=q, pending_requests=pending_requests, processed_requests=processed_requests, debts=debts,
-        freezes=freezes, archive_orders=archive_orders, partners=partners, teams=teams,
+        freezes=freezes, archive_orders=archive_orders, partners=partners, teams=teams, thumbs=thumbs,
         recent_audit=recent_audit, settings=settings, methods=PAY_METHODS, roles=ROLES,
         browser_active=browser_active, stats=stats)
 
