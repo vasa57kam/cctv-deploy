@@ -41,7 +41,10 @@
 {% else %}
 <div class="card" id="subscribe">
   <h2>Подписка</h2>
-  {% if current_user.tariff %}
+  {% if freeze_now %}
+    <p><span class="badge warn">заморожена</span> до {{ freeze_now.freeze_to.strftime("%d.%m.%Y %H:%M") }}.
+       Доступ к камерам закрыт, запись архива продолжается.</p>
+  {% elif current_user.tariff %}
     <p>Тариф: <b>{{ current_user.tariff.name }}</b> (камер: {{ current_user.tariff.max_cameras }}, архив: {{ current_user.tariff.archive_days }} дн.)
        {% if sub_active %}<span class="badge ok">активна</span> до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") }}
        {% else %}<span class="badge bad">истекла</span>{% endif %}</p>
@@ -143,48 +146,38 @@
   </form></td></tr>
   {% endfor %}
 </table>
-<p class="muted">Пакет = предоплата за несколько месяцев со скидкой. Если на новом тарифе меньше камер, чем подключено, система попросит выбрать активные.</p>
+<p class="muted">Пакет = предоплата за несколько месяцев со скидкой. Если на новом тарифе меньше камер, система попросит выбрать активные.</p>
 </details>
 
 <details class="card" id="freeze">
-<summary>Заморозка подписки (отпуск / ремонт)</summary>
+<summary>Заморозка подписки (платная)</summary>
 <form method="post" action="{{ url_for('freeze_request') }}" class="formrow">
   <input name="days" value="7" placeholder="Дней (1–30)" style="width:150px">
   <button class="btn" type="submit">Запросить заморозку</button>
 </form>
-<p class="muted">Заморозку подтверждает администратор; срок подписки сдвигается на длительность заморозки. Во время заморозки списания не идут.</p>
+<p class="muted">Заморозка платная: {{ "%.0f"|format(freeze_price) }} ₽/день (списывается при подтверждении админом).
+   На время заморозки доступ к камерам закрывается и интервальные списания стоят на паузе,
+   НО запись архива продолжается — именно за хранение и взимается плата. Срок подписки сдвигается на длительность заморозки.</p>
 {% if my_freezes %}
-<table><tr><th>Период</th><th>Статус</th></tr>
+<table><tr><th>Период</th><th>Цена</th><th>Статус</th></tr>
 {% for f in my_freezes %}
 <tr><td>{{ f.freeze_from.strftime("%d.%m.%Y") }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
+<td>{{ "%.0f"|format(f.price or 0) }} р.</td>
 <td>{% if f.status == "active" %}<span class="badge ok">действует</span>{% elif f.status == "pending" %}<span class="badge warn">на рассмотрении</span>{% else %}<span class="badge bad">отклонена</span>{% endif %}</td></tr>
 {% endfor %}</table>
 {% endif %}
 </details>
 
-<details class="card" id="referral">
-<summary>Приведи друга — получи бонус</summary>
-<p>Ваш код: <b>{{ referral_code }}</b></p>
-<p class="muted" style="word-break:break-all;">Ссылка: {{ url_for('referral_use', code=referral_code, _external=True) }}</p>
-<p class="muted">Друг передаёт код администратору при подключении. После его первого платежа администратор начислит бонус вам на баланс.</p>
-{% if my_referrals %}
-<table><tr><th>Друг</th><th>Статус</th></tr>
-{% for r in my_referrals %}
-<tr><td>{{ r.referee.username }}</td>
-<td>{% if r.status == "credited" %}<span class="badge ok">бонус начислен</span>{% else %}<span class="badge warn">ожидает первого платежа</span>{% endif %}</td></tr>
-{% endfor %}</table>
-{% endif %}
-</details>
-
 <details class="card" id="archive-request">
-<summary>Заказать выгрузку архива за период</summary>
+<summary>Заказать нарезку фрагмента архива (платно)</summary>
 <form method="post" action="{{ url_for('archive_order') }}" class="formrow">
   <select name="camera_id">{% for item in cam_items %}<option value="{{ item.camera.id }}">{{ item.camera.name }}</option>{% endfor %}</select>
   <input type="datetime-local" name="from_dt" required>
   <input type="datetime-local" name="to_dt" required>
   <button class="btn" type="submit">Заказать ({{ "%.0f"|format(archive_price) }} р.)</button>
 </form>
-<p class="muted">До 3 суток за заявку. После подтверждения администратором сумма спишется, файл появится в списке для скачивания.</p>
+<p class="muted">До 3 суток за заявку. Смотреть архив целиком можно бесплатно в плеере на странице камеры;
+   нарезка точного фрагмента файлом — платная услуга администратора.</p>
 {% if archive_orders %}
 <table><tr><th>ID</th><th>Камера</th><th>Период</th><th>Цена</th><th>Статус</th><th></th></tr>
 {% for o in archive_orders %}
