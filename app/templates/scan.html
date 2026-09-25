@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Поиск камер по IP</h1>
+<div class="card">
+  <p class="muted">Сканер проверит типовые порты (554 RTSP, 80/8080/8000 web, 37777 Dahua, 8899, 8554…),
+     затем переберёт типовые RTSP-адреса вендоров (Hikvision, Dahua, Axis, Uniview и др.) и HTTP-HLS.
+     Каждый живой поток получит превью-кадр. Работает в фоне — можно уйти со страницы и вернуться.</p>
+  <form method="post" action="{{ url_for('admin_scan_start') }}" class="formrow">
+    <input name="ip" value="{{ pre_ip }}" placeholder="IP или имя хоста камеры" required style="flex:1">
+    <input name="login" value="{{ pre_login }}" placeholder="Логин (если известен)">
+    <input name="password" value="{{ pre_pass }}" placeholder="Пароль (если известен)" type="password">
+    <label class="muted"><input type="checkbox" name="try_defaults" value="1"> пробовать стандартные пароли</label>
+    <button class="btn" type="submit">Начать сканирование</button>
+  </form>
+  <p class="muted">Без логина сканер пробует анонимный доступ. Галка «стандартные пароли» добавляет
+     популярные пары вида admin/admin — используй только на своих сетях.</p>
+</div>
+
+<div class="card">
+  <h2>Статус</h2>
+  <p id="st-running" class="muted" style="display:none;">Сканирование идёт… <span id="prog"></span></p>
+  <p id="st-done" class="muted">Открытые порты: <span id="ports">—</span></p>
+</div>
+
+<div class="card">
+  <h2>Найденные потоки</h2>
+  <div class="grid" id="results"></div>
+</div>
+
+<p><a class="btn gray" href="{{ url_for('admin_page') }}#discover">Вернуться в админку</a></p>
+
+<script>
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function render(st){
+  document.getElementById("st-running").style.display = st.running ? "" : "none";
+  document.getElementById("prog").textContent = st.running ? ("проверено " + (st.checked||0) + " из " + (st.total||0)) : "";
+  document.getElementById("ports").innerHTML = (st.open_ports && st.open_ports.length)
+    ? st.open_ports.map(function(p){return '<span class="badge ok">'+p+'</span>';}).join(" ")
+    : '<span class="muted">—</span>';
+  var grid = document.getElementById("results");
+  var res = st.results || [];
+  grid.innerHTML = res.map(function(r){
+    return '<div class="cam">'
+      + '<img src="/admin/discover/preview/cand_' + r.idx + '.jpg" style="width:100%;border-radius:8px;">'
+      + '<p class="muted" style="word-break:break-all;">' + esc(r.url) + '</p>'
+      + '<form method="post" action="/admin/discover/attach" class="formrow">'
+      + '<input type="hidden" name="url" value="' + esc(r.url) + '">'
+      + '<input name="name" placeholder="Название" value="Камера ' + esc(st.ip || '') + '">'
+      + '<label class="muted"><input type="checkbox" name="recording" value="1"> запись</label>'
+      + '<button class="btn" type="submit">Подключить</button></form></div>';
+  }).join("");
+  if (!st.running && !res.length && (st.total || 0) > 0) {
+    grid.innerHTML = '<p class="muted">Потоки не найдены. Укажи логин/пароль камеры или проверь, '
+      + 'что на камере включён RTSP/ONVIF и она доступна с сервера по сети.</p>';
+  }
+}
+function poll(){ fetch('/admin/scan/status').then(function(r){return r.json();}).then(render).catch(function(){}); }
+poll(); setInterval(poll, 3000);
+</script>
+{% endblock %}
