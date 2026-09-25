@@ -1,6 +1,21 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ camera.name }} {% if camera.group_name %}<span class="badge warn">{{ camera.group_name }}</span>{% endif %}</h1>
+
+{% if is_admin %}
+<div class="card">
+  <h2>Управление камерой (только админ)</h2>
+  <form method="post" action="{{ url_for('admin_camera_recording', camera_id=camera.id) }}" style="display:inline">
+    <button class="btn" type="submit">{{ "Выключить запись" if camera.recording_enabled else "Включить запись" }}</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" style="display:inline">
+    <button class="btn gray" type="submit">Режим записи: {{ "ПО ДВИЖЕНИЮ" if camera.recording_mode == "motion" else "НЕПРЕРЫВНАЯ" }} → переключить</button>
+  </form>
+  <p class="muted">Запись по движению пишет в архив только кадры с изменениями сцены: тишина и статика место не занимают.
+     Лайв-поток всегда полный. Воркер переключает режим за ~5 секунд. Абоненты запись не включают и не выключают.</p>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>Плеер</h2>
   <div class="formrow">
@@ -10,25 +25,57 @@
   <video id="video" controls autoplay muted></video>
   <p class="muted" id="player-status"></p>
 </div>
+
 <div class="card">
-  <h2>Архив</h2>
-  <p class="muted">Прошедшие дни сервер склеивает в один файл (смотреть с перемоткой).
-     Куски текущего дня пишутся по 5 минут. «Смотреть» — в плеере выше, «Скачать» — файлом.
-     Точный фрагмент за период можно заказать нарезкой в кабинете (платно).</p>
-  {% if records %}
-  <table>
-    <tr><th>Файл</th><th>Размер</th><th>Статус</th><th></th></tr>
-    {% for rec in records %}
-    <tr><td>{{ rec.name }}</td><td>{{ rec.size_mb }} МБ</td>
-    <td>{% if rec.ready %}<span class="badge ok">{{ rec.kind_label }}</span>{% else %}<span class="badge warn">идёт запись…</span>{% endif %}</td>
-    <td>
-      <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}')">Смотреть</button>
-      {% if rec.ready %}<a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
-    </td></tr>
+  <h2>Архив по дням</h2>
+  <p class="muted">Дни и интервалы времени, за которые есть запись, подсвечены. «Смотреть» открывает фрагмент
+     в плеере выше с перемоткой, «Скачать» отдаёт файлом. Точный кусок за период абонент может заказать
+     платной нарезкой в кабинете.</p>
+  {% if days %}
+    {% for d in days %}
+    <details class="card" {% if loop.first %}open{% endif %} style="background:#16233c;">
+      <summary>
+        <span class="badge ok">{{ d.day }}</span>
+        запись: {{ d.ranges }} · {{ "%.1f"|format(d.total_mb) }} МБ
+        {% if d.glued %}<span class="badge ok">склеено</span>{% endif %}
+      </summary>
+      {% if is_admin and d.can_glue %}
+      <form method="post" action="{{ url_for('admin_camera_glue', camera_id=camera.id, day=d.day) }}" style="margin:8px 0;">
+        <button class="btn gray" type="submit" onclick="return confirm('Склеить день {{ d.day }} в один файл? Куски удалятся после успеха.');">Склеить день в один файл</button>
+      </form>
+      {% endif %}
+      <table>
+        <tr><th>Время</th><th>Файл</th><th>Размер</th><th>Тип</th><th></th></tr>
+        {% if d.glued %}
+        <tr>
+          <td>{{ d.glued.time_start[:5] }}–{{ d.glued.time_end[:5] }}</td>
+          <td>{{ d.glued.name }}</td><td>{{ d.glued.size_mb }} МБ</td>
+          <td><span class="badge ok">{{ d.glued.kind }}</span></td>
+          <td>
+            <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=d.glued.name) }}')">Смотреть</button>
+            <a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=d.glued.name) }}">Скачать</a>
+          </td>
+        </tr>
+        {% endif %}
+        {% for rec in d.chunks %}
+        <tr>
+          <td>{{ rec.time_start[:5] }}–{{ rec.time_end[:5] }}</td>
+          <td>{{ rec.name }}</td><td>{{ rec.size_mb }} МБ</td>
+          <td>{% if rec.ready %}<span class="badge warn">{{ rec.kind }}</span>{% else %}<span class="badge warn">идёт запись…</span>{% endif %}</td>
+          <td>
+            <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}')">Смотреть</button>
+            {% if rec.ready %}<a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </details>
     {% endfor %}
-  </table>
-  {% else %}<p class="muted">Архив пуст: запись ещё не началась или выключена.</p>{% endif %}
+  {% else %}
+  <p class="muted">Архив пуст: запись ещё не началась или выключена администратором.</p>
+  {% endif %}
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const video = document.getElementById("video");
