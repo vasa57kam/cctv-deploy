@@ -38,6 +38,45 @@ def cleanup_archives():
     except Exception:
         pass
 
+def glue_archives():
+    try:
+        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+        cams = conn.execute("SELECT id FROM camera").fetchall()
+        conn.close()
+        today = time.strftime("%Y-%m-%d")
+        for row in cams:
+            d = ARCHIVE_DIR / f"camera_{row['id']}"
+            if not d.exists(): continue
+            by_day = {}
+            for f in d.glob("*_*.mp4"):
+                by_day.setdefault(f.name[:10], []).append(f)
+            for day, files in by_day.items():
+                if day == today or len(files) < 2: continue
+                out = d / f"{day}.mp4"
+                if out.exists():
+                    for f in files:
+                        try: f.unlink()
+                        except Exception: pass
+                    continue
+                lst = d / f".concat_{day}.txt"
+                with open(lst, "w") as fh:
+                    for f in sorted(files):
+                        fh.write(f"file '{f}'\n")
+                cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                       "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out)]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=1800)
+                    if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                        for f in files:
+                            try: f.unlink()
+                            except Exception: pass
+                except Exception:
+                    pass
+                try: lst.unlink()
+                except Exception: pass
+    except Exception:
+        pass
+
 def stop_camera(camera_id):
     proc = procs.pop(camera_id, None)
     if proc is not None:
@@ -83,7 +122,9 @@ while running:
         if cid not in active_ids:
             stop_camera(cid); configs.pop(cid, None)
     loops += 1
-    if loops % 300 == 0: cleanup_archives()
+    if loops % 300 == 0:
+        cleanup_archives()
+        glue_archives()
     time.sleep(5)
 
 for cid in list(procs.keys()): stop_camera(cid)
