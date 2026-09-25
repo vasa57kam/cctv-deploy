@@ -5,7 +5,8 @@ from pathlib import Path
 from functools import wraps
 import subprocess
 from flask import Flask, render_template, request, redirect, url_for, abort, send_from_directory, send_file, flash, session, jsonify, g
-from flask_sqlalchemy import SQLAlchemy, func
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 
