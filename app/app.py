@@ -98,6 +98,7 @@ class Camera(db.Model):
     id = db.Column(db.Integer, primary_key=True); name = db.Column(db.String(120), nullable=False)
     rtsp_url = db.Column(db.Text, nullable=False); user_id = db.Column(db.Integer, nullable=True)
     active = db.Column(db.Boolean, default=True); recording_enabled = db.Column(db.Boolean, default=False)
+    recording_mode = db.Column(db.String(12), default="continuous")
     group_name = db.Column(db.String(60), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
@@ -368,6 +369,50 @@ def probe_stream(url, idx):
     except subprocess.TimeoutExpired: return False
     return out.exists() and out.stat().st_size > 0
 
+CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$")
+DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.mp4$")
+
+def build_archive_days(camera):
+    camera_dir = ARCHIVE_DIR / f"camera_{camera.id}"
+    if not camera_dir.exists(): return []
+    cutoff = time.time() - camera_archive_days(camera) * 86400
+    now_ts = time.time()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    days = {}
+    for p in camera_dir.glob("*.mp4"):
+        st = p.stat()
+        if st.st_mtime < cutoff: continue
+        m_day = DAY_RE.match(p.name); m_chunk = CHUNK_RE.match(p.name)
+        if m_day:
+            day = m_day.group(1)
+            d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
+            d["glued"] = {"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
+                          "ready": (now_ts - st.st_mtime) > 30,
+                          "time_start": "00:00:00", "time_end": "23:59:59", "kind": "день, склеено"}
+        elif m_chunk:
+            day = m_chunk.group(1)
+            d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
+            h, mi, s = m_chunk.group(2), m_chunk.group(3), m_chunk.group(4)
+            start = f"{h}:{mi}:{s}"
+            end = (datetime.strptime(f"{day} {h}:{mi}:{s}", "%Y-%m-%d %H:%M:%S") + timedelta(minutes=5)).strftime("%H:%M:%S")
+            d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
+                "ready": (now_ts - st.st_mtime) > 60,
+                "time_start": start, "time_end": end, "kind": "кусок 5 мин"})
+    result = []
+    for day in sorted(days.keys(), reverse=True):
+        d = days[day]
+        d["chunks"].sort(key=lambda x: x["name"])
+        if d["glued"]:
+            d["ranges"] = "00:00–23:59 (весь день одним файлом)"
+            d["total_mb"] = d["glued"]["size_mb"]
+        else:
+            d["ranges"] = ", ".join(f"{c['time_start'][:5]}–{c['time_end'][:5]}" for c in d["chunks"]) or "нет данных"
+            d["total_mb"] = round(sum(c["size_mb"] for c in d["chunks"]), 1)
+        d["can_glue"] = (day < today) and (d["glued"] is None) and len(d["chunks"]) >= 1
+        d["chunks"].sort(key=lambda x: x["name"], reverse=True)
+        result.append(d)
+    return result
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user.is_authenticated: return redirect(url_for("dashboard"))
@@ -633,20 +678,47 @@ def camera_set_enabled(camera_id):
 def camera_page(camera_id):
     camera = get_camera_or_403(camera_id)
     audit(current_user, "camera_view", camera.name)
-    records = []
-    camera_dir = ARCHIVE_DIR / f"camera_{camera.id}"
-    if camera_dir.exists():
-        cutoff = time.time() - camera_archive_days(camera) * 86400; now_ts = time.time()
-        files = sorted(camera_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for p in files[:100]:
-            st = p.stat()
-            if st.st_mtime < cutoff: continue
-            is_day = bool(re.match(r"^\d{4}-\d{2}-\d{2}\.mp4$", p.name))
-            records.append({"name": p.name, "ready": (now_ts - st.st_mtime) > 60,
-                "size_mb": round(st.st_size / 1048576, 1),
-                "kind_label": "день, склеено" if is_day else "кусок 5 мин"})
-        records = records[:50]
-    return render_template("camera.html", camera=camera, records=records)
+    days = build_archive_days(camera)
+    return render_template("camera.html", camera=camera, days=days,
+        is_admin=current_user.admin, team_role=team_role(current_user))
+
+@app.route("/admin/camera/<int:camera_id>/motion", methods=["POST"])
+@admin_required
+def admin_camera_motion(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    camera.recording_mode = "motion" if (camera.recording_mode or "continuous") != "motion" else "continuous"
+    db.session.commit()
+    mode_ru = "по движению" if camera.recording_mode == "motion" else "непрерывная"
+    audit(current_user, "recording_mode", f"{camera.name}={mode_ru}")
+    flash(f"Камера {camera.name}: режим записи — {mode_ru}. Воркер переключится за ~5 секунд.")
+    return redirect(url_for("camera_page", camera_id=camera.id))
+
+@app.route("/admin/camera/<int:camera_id>/glue/<day>", methods=["POST"])
+@admin_required
+def admin_camera_glue(camera_id, day):
+    camera = get_or_404(Camera, camera_id)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        flash("Неверный день."); return redirect(url_for("camera_page", camera_id=camera.id))
+    if day >= datetime.utcnow().strftime("%Y-%m-%d"):
+        flash("Текущий день склеивать рано: запись ещё идёт."); return redirect(url_for("camera_page", camera_id=camera.id))
+    d = ARCHIVE_DIR / f"camera_{camera.id}"
+    chunks = sorted([p for p in d.glob(f"{day}_*.mp4")]) if d.exists() else []
+    if not chunks:
+        flash("За этот день кусков нет."); return redirect(url_for("camera_page", camera_id=camera.id))
+    out = d / f"{day}.mp4"
+    if out.exists():
+        flash("День уже склеен."); return redirect(url_for("camera_page", camera_id=camera.id))
+    lst = d / f".concat_{day}.txt"
+    with open(lst, "w") as fh:
+        for f in chunks:
+            fh.write(f"file '{f}'\n")
+    rm_list = " ".join(f"'{f}'" for f in chunks)
+    cmd = (f"ffmpeg -nostdin -loglevel error -f concat -safe 0 -i '{lst}' -c copy "
+           f"-movflags +faststart '{out}' && rm -f {rm_list} '{lst}' || rm -f '{lst}'")
+    subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    audit(current_user, "glue_day", f"{camera.name} {day}")
+    flash(f"Склейка дня {day} запущена в фоне: получится один файл с перемоткой; куски удалятся после успеха.")
+    return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/live/<int:camera_id>/<path:filename>")
 @login_required
@@ -847,7 +919,7 @@ def admin_freeze_action(freeze_id, action):
         if fr.user.subscription_ends_at:
             fr.user.subscription_ends_at = fr.user.subscription_ends_at + (fr.freeze_to - fr.freeze_from)
         db.session.commit()
-        flash(f"Заморозка {fr.user.username} одобрена: списано {price:.0f} ₽, срок сдвинут, доступ закрыт на период заморозки (запись идёт).")
+        flash(f"Заморозка одобрена: списано {price:.0f} ₽, доступ закрыт на период, запись идёт.")
     else:
         fr.status = "rejected"; db.session.commit(); flash("Заморозка отклонена.")
     return admin_redirect("#freezes")
@@ -868,7 +940,7 @@ def admin_archive_order(order_id, action):
     db.session.add(Transaction(user_id=o.user.id, amount=-o.price, reason=f"Нарезка фрагмента архива #{o.id} ({o.camera.name})"))
     o.status = "approved"; o.processed_at = datetime.utcnow()
     db.session.commit()
-    flash(f"Оплачено. Нарежи файл и положи в /opt/cctv/storage/exports/order_{o.id}.mp4 — клиент сможет скачать.")
+    flash(f"Оплачено. Положи файл в /opt/cctv/storage/exports/order_{o.id}.mp4 — клиент сможет скачать.")
     return admin_redirect("#archive-orders")
 
 @app.route("/admin/partner/create", methods=["POST"])
@@ -1215,6 +1287,7 @@ def admin_camera_toggle(camera_id):
 @admin_required
 def admin_camera_recording(camera_id):
     camera = get_or_404(Camera, camera_id); camera.recording_enabled = not camera.recording_enabled; db.session.commit()
+    audit(current_user, "recording_toggle", f"{camera.name}={camera.recording_enabled}")
     return admin_redirect("#cameras")
 
 @app.route("/admin/camera/<int:camera_id>/delete", methods=["POST"])
@@ -1239,18 +1312,13 @@ def api_cameras():
     owner = effective_owner(current_user)
     cams = Camera.query.all() if current_user.admin else owner.cameras
     return jsonify([{"id": c.id, "name": c.name, "group": c.group_name, "active": c.active,
-        "recording": c.recording_enabled} for c in cams])
+        "recording": c.recording_enabled, "mode": c.recording_mode} for c in cams])
 
 @app.route("/api/cameras/<int:cid>/records")
 @login_required
 def api_records(cid):
     camera = get_camera_or_403(cid)
-    d = ARCHIVE_DIR / f"camera_{camera.id}"
-    recs = []
-    if d.exists():
-        for p in sorted(d.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)[:100]:
-            recs.append({"name": p.name, "size_mb": round(p.stat().st_size / 1048576, 1), "mtime": int(p.stat().st_mtime)})
-    return jsonify(recs)
+    return jsonify(build_archive_days(camera))
 
 @app.route("/static/<path:filename>")
 def static_files(filename):
