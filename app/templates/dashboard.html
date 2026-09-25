@@ -6,15 +6,29 @@
 <div class="grid">
   {% for camera in cameras %}
   <div class="cam">
+    {% set th = thumbs.get(camera.id) %}
+    {% if th and th.url %}
+    <div class="thumbwrap" style="margin:-12px -12px 10px;">
+      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
+      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
+    </div>
+    {% endif %}
     <h3>{{ camera.name }}</h3>
-    <p>{% if camera.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %}
-       {% if camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}
-       {% if camera.group_name %}<span class="badge warn">{{ camera.group_name }}</span>{% endif %}</p>
+    <p class="muted" style="margin:0 0 8px;">
+      <span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}
+      {% if camera.recording_enabled %}· <span class="badge ok">запись</span>{% else %}· <span class="badge warn">без записи</span>{% endif %}
+      {% if camera.group_name %}· {{ camera.group_name }}{% endif %}
+    </p>
     <a class="btn" href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
   </div>
   {% endfor %}
 </div>
-{% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+{% else %}
+<div class="card empty">
+  <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>
+  <p>Камер пока нет. Добавьте первую в админке или найдите потоки парсером.</p>
+</div>
+{% endif %}
 
 {% elif role %}
 <div class="card" id="subscribe">
@@ -29,21 +43,29 @@
 <div class="grid">
   {% for item in cam_items %}
   <div class="cam">
+    {% set th = thumbs.get(item.camera.id) %}
+    {% if th and th.url %}
+    <div class="thumbwrap" style="margin:-12px -12px 10px;">
+      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
+      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
+    </div>
+    {% endif %}
     <h3>{{ item.camera.name }}</h3>
-    <p>{% if item.camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</p>
+    <p class="muted" style="margin:0 0 8px;"><span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}</p>
     <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
   </div>
   {% endfor %}
 </div>
-{% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+{% else %}
+<div class="card empty"><p>Камер пока нет.</p></div>
+{% endif %}
 </div>
 
 {% else %}
 <div class="card" id="subscribe">
   <h2>Подписка</h2>
   {% if freeze_now %}
-    <p><span class="badge warn">заморожена</span> до {{ freeze_now.freeze_to.strftime("%d.%m.%Y %H:%M") }}.
-       Доступ к камерам закрыт, запись архива продолжается.</p>
+    <p><span class="badge warn">заморожена</span> до {{ freeze_now.freeze_to|rudate }}. Доступ к камерам закрыт, запись архива продолжается.</p>
   {% elif current_user.tariff %}
     <p>Тариф: <b>{{ current_user.tariff.name }}</b> (камер: {{ current_user.tariff.max_cameras }}, архив: {{ current_user.tariff.archive_days }} дн.)
        {% if sub_active %}<span class="badge ok">активна</span> до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") }}
@@ -51,7 +73,7 @@
     <form method="post" action="{{ url_for('auto_renew_toggle') }}" style="display:inline">
       <button class="btn gray" type="submit">{{ "Выключить автопродление" if current_user.auto_renew else "Включить автопродление" }}</button>
     </form>
-    {% if current_user.auto_renew %}<span class="badge ok">автопродление включено</span>{% endif %}
+    {% if current_user.auto_renew %}<span class="badge ok">автопродление</span>{% endif %}
   {% else %}<p><span class="badge warn">тариф не подключён</span> выберите тариф в блоке «Тарифы» ниже</p>{% endif %}
   <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.{% if current_user.credit_limit %} Доверительный лимит: {{ "%.2f"|format(current_user.credit_limit) }} р.{% endif %} Активных камер: {{ user_enabled_count }}.</p>
 </div>
@@ -81,7 +103,7 @@
 </script>
 {% else %}<p class="muted">Способы пополнения отключены администратором.</p>{% endif %}
 {% if my_requests %}
-<table>
+<div class="tablewrap"><table>
   <tr><th>ID</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Статус</th><th></th></tr>
   {% for item in my_requests %}
   <tr><td>{{ item.p.id }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td><td>{{ item.p.comment or "" }}</td>
@@ -102,7 +124,7 @@
     {% endif %}
   </td></tr>
   {% endfor %}
-</table>
+</table></div>
 {% endif %}
 </details>
 
@@ -110,7 +132,7 @@
 <details class="card" id="promised" {% if active_debt %}open{% endif %}>
 <summary>Обещанный платёж</summary>
 {% if active_debt %}
-  <p><span class="badge warn">долг</span> К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р. до {{ active_debt.due_at.strftime("%d.%m.%Y %H:%M") }}. Списывается автоматически.</p>
+  <p><span class="badge warn">долг</span> К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р. до {{ active_debt.due_at|rudate }}. Списывается автоматически.</p>
   <form method="post" action="{{ url_for('promised_repay') }}" class="formrow" onsubmit="return confirm('Вернуть долг досрочно?');">
     <button class="btn gray" type="submit">Вернуть досрочно {{ "%.2f"|format(active_debt.repay_amount) }} р.</button>
   </form>
@@ -125,7 +147,7 @@
 
 <details class="card" id="tariffs">
 <summary>Тарифы: подключить / продлить (пакеты со скидкой)</summary>
-<table>
+<div class="tablewrap"><table>
   <tr><th>Тариф</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th>Пакет и оплата</th></tr>
   {% for opt in tariff_options %}
   <tr><td>{{ opt.tariff.name }}{% if current_user.tariff_id == opt.tariff.id %} <span class="badge ok">текущий</span>{% endif %}
@@ -145,7 +167,7 @@
     <button class="btn" type="submit">{{ "Продлить" if current_user.tariff_id == opt.tariff.id else "Подключить" }}</button>
   </form></td></tr>
   {% endfor %}
-</table>
+</table></div>
 <p class="muted">Пакет = предоплата за несколько месяцев со скидкой. Если на новом тарифе меньше камер, система попросит выбрать активные.</p>
 </details>
 
@@ -156,15 +178,15 @@
   <button class="btn" type="submit">Запросить заморозку</button>
 </form>
 <p class="muted">Заморозка платная: {{ "%.0f"|format(freeze_price) }} ₽/день (списывается при подтверждении админом).
-   На время заморозки доступ к камерам закрывается и интервальные списания стоят на паузе,
-   НО запись архива продолжается — именно за хранение и взимается плата. Срок подписки сдвигается на длительность заморозки.</p>
+   На время заморозки доступ закрыт и интервальные списания стоят на паузе, НО запись архива продолжается —
+   именно за хранение взимается плата. Срок подписки сдвигается на длительность заморозки.</p>
 {% if my_freezes %}
-<table><tr><th>Период</th><th>Цена</th><th>Статус</th></tr>
+<div class="tablewrap"><table><tr><th>Период</th><th>Цена</th><th>Статус</th></tr>
 {% for f in my_freezes %}
-<tr><td>{{ f.freeze_from.strftime("%d.%m.%Y") }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
+<tr><td>{{ f.freeze_from|rudate }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
 <td>{{ "%.0f"|format(f.price or 0) }} р.</td>
 <td>{% if f.status == "active" %}<span class="badge ok">действует</span>{% elif f.status == "pending" %}<span class="badge warn">на рассмотрении</span>{% else %}<span class="badge bad">отклонена</span>{% endif %}</td></tr>
-{% endfor %}</table>
+{% endfor %}</table></div>
 {% endif %}
 </details>
 
@@ -179,14 +201,14 @@
 <p class="muted">До 3 суток за заявку. Смотреть архив целиком можно бесплатно в плеере на странице камеры;
    нарезка точного фрагмента файлом — платная услуга администратора.</p>
 {% if archive_orders %}
-<table><tr><th>ID</th><th>Камера</th><th>Период</th><th>Цена</th><th>Статус</th><th></th></tr>
+<div class="tablewrap"><table><tr><th>ID</th><th>Камера</th><th>Период</th><th>Цена</th><th>Статус</th><th></th></tr>
 {% for o in archive_orders %}
 <tr><td>{{ o.id }}</td><td>{{ o.camera.name }}</td>
-<td>{{ o.from_dt.strftime("%d.%m %H:%M") }} — {{ o.to_dt.strftime("%d.%m %H:%M") }}</td>
+<td>{{ o.from_dt|rudate }} — {{ o.to_dt.strftime("%d.%m %H:%M") }}</td>
 <td>{{ "%.0f"|format(o.price) }} р.</td>
 <td>{% if o.status == "approved" %}<span class="badge ok">готово</span>{% elif o.status == "pending" %}<span class="badge warn">в работе</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
 <td>{% if o.status == "approved" %}<a class="btn mini" href="{{ url_for('archive_order_download', oid=o.id) }}">Скачать</a>{% endif %}</td></tr>
-{% endfor %}</table>
+{% endfor %}</table></div>
 {% endif %}
 </details>
 
@@ -194,10 +216,10 @@
 <details class="card" id="team">
 <summary>Сотрудники организации</summary>
 {% if team_members %}
-<table><tr><th>Логин</th><th>Роль</th></tr>
+<div class="tablewrap"><table><tr><th>Логин</th><th>Роль</th></tr>
 {% for m in team_members %}
 <tr><td>{{ m.user.username }}</td><td>{{ {"viewer": "Охранник", "manager": "Менеджер", "accountant": "Бухгалтер", "admin": "Админ организации"}.get(m.role, m.role) }}</td></tr>
-{% endfor %}</table>
+{% endfor %}</table></div>
 {% else %}<p class="muted">Сотрудников пока нет. Их добавляет администратор по вашей просьбе.</p>{% endif %}
 </details>
 {% endif %}
@@ -208,9 +230,19 @@
 <div class="grid">
   {% for item in cam_items %}
   <div class="cam">
+    {% set th = thumbs.get(item.camera.id) %}
+    {% if th and th.url %}
+    <div class="thumbwrap" style="margin:-12px -12px 10px;">
+      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
+      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
+    </div>
+    {% endif %}
     <h3>{{ item.camera.name }}</h3>
-    <p>{% if item.enabled %}<span class="badge ok">работает</span>{% else %}<span class="badge bad">недоступна по тарифу</span>{% endif %}
-       {% if item.camera.recording_enabled %}<span class="badge ok">запись</span>{% else %}<span class="badge warn">без записи</span>{% endif %}</p>
+    <p class="muted" style="margin:0 0 8px;">
+      <span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}
+      {% if item.enabled %}· <span class="badge ok">работает</span>{% else %}· <span class="badge bad">недоступна по тарифу</span>{% endif %}
+      {% if item.camera.recording_enabled %}· <span class="badge ok">запись</span>{% endif %}
+    </p>
     {% if item.enabled %}
       <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
       <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline">
@@ -226,7 +258,12 @@
   </div>
   {% endfor %}
 </div>
-{% else %}<div class="card"><p class="muted">Камер пока нет.</p></div>{% endif %}
+{% else %}
+<div class="card empty">
+  <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>
+  <p>Камер пока нет. Попросите администратора выдать доступ.</p>
+</div>
+{% endif %}
 </div>
 {% endif %}
 {% endblock %}
