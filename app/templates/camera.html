@@ -1,6 +1,22 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>{{ camera.name }} {% if camera.group_name %}<span class="badge warn">{{ camera.group_name }}</span>{% endif %}</h1>
+<div class="card" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+  {% if thumb and thumb.url %}
+  <div class="thumbwrap" style="width:190px;flex:0 0 190px;">
+    <img src="{{ thumb.url }}?t={{ range(100000)|random }}" alt="превью">
+    <span class="playbadge"><svg width="34" height="34" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
+  </div>
+  {% endif %}
+  <div style="flex:1;min-width:220px;">
+    <h1 style="margin:0 0 6px;">{{ camera.name }}</h1>
+    <p class="muted" style="margin:0;">
+      <span class="dot {{ 'on' if thumb and thumb.online else 'off' }}"></span>{{ "онлайн" if thumb and thumb.online else "офлайн или нет превью" }}
+      {% if camera.group_name %} · группа «{{ camera.group_name }}»{% endif %}
+      {% if camera.recording_enabled %} · <span class="badge ok">запись: {{ "по движению" if camera.recording_mode == "motion" else "непрерывная" }}</span>
+      {% else %} · <span class="badge warn">запись выключена</span>{% endif %}
+    </p>
+  </div>
+</div>
 
 {% if is_admin %}
 <div class="card">
@@ -9,10 +25,9 @@
     <button class="btn" type="submit">{{ "Выключить запись" if camera.recording_enabled else "Включить запись" }}</button>
   </form>
   <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" style="display:inline">
-    <button class="btn gray" type="submit">Режим записи: {{ "ПО ДВИЖЕНИЮ" if camera.recording_mode == "motion" else "НЕПРЕРЫВНАЯ" }} → переключить</button>
+    <button class="btn gray" type="submit">Режим: {{ "ПО ДВИЖЕНИЮ" if camera.recording_mode == "motion" else "НЕПРЕРЫВНАЯ" }} → переключить</button>
   </form>
-  <p class="muted">Запись по движению пишет в архив только кадры с изменениями сцены: тишина и статика место не занимают.
-     Лайв-поток всегда полный. Воркер переключает режим за ~5 секунд. Абоненты запись не включают и не выключают.</p>
+  <p class="muted" style="margin-top:8px;">Запись по движению экономит место: статика не пишется. Лайв всегда полный. Абоненты записью не управляют.</p>
 </div>
 {% endif %}
 
@@ -27,13 +42,29 @@
 </div>
 
 <div class="card">
+  <h2>Шкала записи</h2>
+  {% if days %}
+  <div class="formrow">
+    <select id="day-sel" style="min-width:160px;">{% for d in days %}<option value="{{ d.day }}">{{ d.day }}</option>{% endfor %}</select>
+    <span class="muted">зелёное — есть запись; клик по зоне = просмотр с этого момента</span>
+  </div>
+  <div class="tl" id="tl"></div>
+  <div class="tl-hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
+  {% else %}
+  <div class="empty">
+    <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+    <p>Записей пока нет: запись выключена или ещё не началась.</p>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Архив по дням</h2>
-  <p class="muted">Дни и интервалы времени, за которые есть запись, подсвечены. «Смотреть» открывает фрагмент
-     в плеере выше с перемоткой, «Скачать» отдаёт файлом. Точный кусок за период абонент может заказать
-     платной нарезкой в кабинете.</p>
+  <p class="muted">«Смотреть» открывает фрагмент в плеере с перемоткой, «Скачать» отдаёт файлом.
+     Точный кусок за период — платная нарезка в кабинете.</p>
   {% if days %}
     {% for d in days %}
-    <details class="card" {% if loop.first %}open{% endif %} style="background:#16233c;">
+    <details class="card" {% if loop.first %}open{% endif %} style="background:var(--card2);box-shadow:none;">
       <summary>
         <span class="badge ok">{{ d.day }}</span>
         запись: {{ d.ranges }} · {{ "%.1f"|format(d.total_mb) }} МБ
@@ -44,7 +75,7 @@
         <button class="btn gray" type="submit" onclick="return confirm('Склеить день {{ d.day }} в один файл? Куски удалятся после успеха.');">Склеить день в один файл</button>
       </form>
       {% endif %}
-      <table>
+      <div class="tablewrap"><table>
         <tr><th>Время</th><th>Файл</th><th>Размер</th><th>Тип</th><th></th></tr>
         {% if d.glued %}
         <tr>
@@ -52,7 +83,7 @@
           <td>{{ d.glued.name }}</td><td>{{ d.glued.size_mb }} МБ</td>
           <td><span class="badge ok">{{ d.glued.kind }}</span></td>
           <td>
-            <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=d.glued.name) }}')">Смотреть</button>
+            <button class="btn gray" type="button" onclick="playArchive(ARCH_BASE + '{{ d.glued.name }}', 0)">Смотреть</button>
             <a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=d.glued.name) }}">Скачать</a>
           </td>
         </tr>
@@ -63,26 +94,27 @@
           <td>{{ rec.name }}</td><td>{{ rec.size_mb }} МБ</td>
           <td>{% if rec.ready %}<span class="badge warn">{{ rec.kind }}</span>{% else %}<span class="badge warn">идёт запись…</span>{% endif %}</td>
           <td>
-            <button class="btn gray" type="button" onclick="playArchive('{{ url_for('archive_file', camera_id=camera.id, filename=rec.name) }}')">Смотреть</button>
+            <button class="btn gray" type="button" onclick="playArchive(ARCH_BASE + '{{ rec.name }}', 0)">Смотреть</button>
             {% if rec.ready %}<a class="btn" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
           </td>
         </tr>
         {% endfor %}
-      </table>
+      </table></div>
     </details>
     {% endfor %}
-  {% else %}
-  <p class="muted">Архив пуст: запись ещё не началась или выключена администратором.</p>
   {% endif %}
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
+const ARCH_BASE = "{{ url_for('archive_file', camera_id=camera.id, filename='') }}";
+const DAYS = {{ days_json | safe }};
 const video = document.getElementById("video");
 const statusEl = document.getElementById("player-status");
 const nowEl = document.getElementById("now-playing");
 const liveSrc = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
-let hls = null;
+let hls = null, pendingSeek = 0;
+function fmt(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");}
 function playLive(){
   if (hls) { hls.destroy(); hls = null; }
   video.removeAttribute("src");
@@ -95,13 +127,54 @@ function playLive(){
   nowEl.textContent = "режим: лайв";
   video.play();
 }
-function playArchive(url){
+function playArchive(url, seek){
   if (hls) { hls.destroy(); hls = null; }
+  pendingSeek = seek || 0;
   statusEl.textContent = "";
   video.src = url;
-  nowEl.textContent = "режим: архив (перемотка доступна)";
-  video.play();
+  video.addEventListener("loadedmetadata", function onm(){
+    video.removeEventListener("loadedmetadata", onm);
+    if (pendingSeek) video.currentTime = pendingSeek;
+    video.play();
+  });
+  nowEl.textContent = "режим: архив" + (pendingSeek ? " с " + fmt(pendingSeek) : "");
   window.scrollTo({top: 0, behavior: "smooth"});
+}
+const tl = document.getElementById("tl");
+const sel = document.getElementById("day-sel");
+function renderTL(){
+  if (!tl) return;
+  tl.innerHTML = "";
+  const d = DAYS.find(x => x.day === sel.value);
+  if (!d) return;
+  d.segments.forEach(s => {
+    const el = document.createElement("div");
+    el.className = "seg";
+    el.style.left = (s.s / 86400 * 100) + "%";
+    el.style.width = Math.max(0.35, (s.e - s.s) / 86400 * 100) + "%";
+    el.title = fmt(s.s) + "–" + fmt(s.e);
+    tl.appendChild(el);
+  });
+  if (sel.value === new Date().toISOString().slice(0, 10)) {
+    const n = new Date();
+    const sec = n.getUTCHours() * 3600 + n.getUTCMinutes() * 60 + n.getUTCSeconds();
+    const m = document.createElement("div");
+    m.className = "now"; m.style.left = (sec / 86400 * 100) + "%";
+    tl.appendChild(m);
+  }
+}
+if (tl && sel) {
+  sel.addEventListener("change", renderTL);
+  tl.addEventListener("click", function (e) {
+    const r = tl.getBoundingClientRect();
+    const T = Math.round((e.clientX - r.left) / r.width * 86400);
+    const d = DAYS.find(x => x.day === sel.value);
+    if (!d) return;
+    const sg = d.segments.find(x => T >= x.s && T < x.e);
+    if (!sg) { statusEl.textContent = "На этот момент записи нет (" + fmt(T) + ")."; return; }
+    playArchive(ARCH_BASE + sg.file, sg.glued ? T : T - sg.s);
+  });
+  renderTL();
 }
 document.getElementById("btn-live").addEventListener("click", playLive);
 playLive();
