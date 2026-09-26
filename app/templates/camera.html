@@ -14,6 +14,7 @@
       {% if camera.group_name %} · группа «{{ camera.group_name }}»{% endif %}
       {% if camera.recording_enabled %} · <span class="badge ok">запись: {{ "по движению" if camera.recording_mode == "motion" else "непрерывная" }}</span>
       {% else %} · <span class="badge warn">запись выключена</span>{% endif %}
+      {% if camera.motion_zone %} · <span class="badge warn">зона задана</span>{% endif %}
     </p>
   </div>
 </div>
@@ -27,7 +28,68 @@
   <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" style="display:inline">
     <button class="btn gray" type="submit">Режим: {{ "ПО ДВИЖЕНИЮ" if camera.recording_mode == "motion" else "НЕПРЕРЫВНАЯ" }} → переключить</button>
   </form>
-  <p class="muted" style="margin-top:8px;">Запись по движению экономит место: статика не пишется. Лайв всегда полный. Абоненты записью не управляют.</p>
+  <p class="muted">По движению = событийная запись: пишется только пока в зоне есть движение и +10 сек после.
+     Непрерывная = куски по 5 минут всегда. Лайв не зависит от режима.</p>
+</div>
+
+<div class="card">
+  <h2>Зона детекции движения</h2>
+  <p class="muted">Нарисуй рамку мышью по кадру ниже — движение будет искаться только внутри неё
+     (деревья, дорога и прочие помехи вне рамки не触发 запись). Рамка сохраняется в долях кадра,
+     поэтому не сбивается при смене разрешения. Без рамки детектор смотрит весь кадр.</p>
+  <div id="zonebox" style="position:relative;max-width:760px;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:crosshair;background:#000;">
+    <img id="zoneimg" src="{% if thumb and thumb.url %}{{ thumb.url }}?t={{ range(100000)|random }}{% else %}{% endif %}" style="width:100%;display:block;" alt="кадр">
+    <div id="zoneRect" style="position:absolute;border:2px solid var(--warn);background:rgba(251,191,36,.18);display:none;pointer-events:none;"></div>
+  </div>
+  <form method="post" action="{{ url_for('admin_camera_zone', camera_id=camera.id) }}" class="formrow" style="margin-top:10px;">
+    <input type="hidden" name="x1" id="zx1" value="0">
+    <input type="hidden" name="y1" id="zy1" value="0">
+    <input type="hidden" name="x2" id="zx2" value="1">
+    <input type="hidden" name="y2" id="zy2" value="1">
+    <button class="btn" type="submit">Сохранить зону</button>
+    <button class="btn red" type="submit" name="clear" value="1" onclick="return confirm('Сбросить зону на весь кадр?');">Сбросить (весь кадр)</button>
+    <span class="muted" id="zoneinfo">{% if zone %}текущая зона: {{ zone }}{% else %}зона не задана — детекция по всему кадру{% endif %}</span>
+  </form>
+  <script>
+  (function () {
+    var box = document.getElementById("zonebox");
+    var rect = document.getElementById("zoneRect");
+    var img = document.getElementById("zoneimg");
+    if (!box || !img) return;
+    var drawing = false, sx = 0, sy = 0;
+    var cur = {% if zone %}{{ zone | tojson }}{% else %}null{% endif %};
+    function show(z) {
+      if (!z) { rect.style.display = "none"; return; }
+      var p = z.split(",").map(parseFloat);
+      rect.style.display = "block";
+      rect.style.left = (p[0] * 100) + "%";
+      rect.style.top = (p[1] * 100) + "%";
+      rect.style.width = ((p[2] - p[0]) * 100) + "%";
+      rect.style.height = ((p[3] - p[1]) * 100) + "%";
+    }
+    show(cur);
+    function rel(e) {
+      var r = box.getBoundingClientRect();
+      return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+    }
+    box.addEventListener("mousedown", function (e) {
+      drawing = true;
+      var p = rel(e); sx = p[0]; sy = p[1];
+    });
+    box.addEventListener("mousemove", function (e) {
+      if (!drawing) return;
+      var p = rel(e);
+      var x1 = Math.min(sx, p[0]), x2 = Math.max(sx, p[0]);
+      var y1 = Math.min(sy, p[1]), y2 = Math.max(sy, p[1]);
+      show(x1 + "," + y1 + "," + x2 + "," + y2);
+      document.getElementById("zx1").value = x1.toFixed(4);
+      document.getElementById("zy1").value = y1.toFixed(4);
+      document.getElementById("zx2").value = x2.toFixed(4);
+      document.getElementById("zy2").value = y2.toFixed(4);
+    });
+    window.addEventListener("mouseup", function () { drawing = false; });
+  })();
+  </script>
 </div>
 {% endif %}
 
@@ -61,6 +123,7 @@
 <div class="card">
   <h2>Архив по дням</h2>
   <p class="muted">«Смотреть» открывает фрагмент в плеере с перемоткой, «Скачать» отдаёт файлом.
+     События движения приходят отдельными файлами с точным временем начала.
      Точный кусок за период — платная нарезка в кабинете.</p>
   {% if days %}
     {% for d in days %}
