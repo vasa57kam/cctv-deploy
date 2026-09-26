@@ -29,16 +29,20 @@
     <button class="btn gray" type="submit">Режим: {{ "ПО ДВИЖЕНИЮ" if camera.recording_mode == "motion" else "НЕПРЕРЫВНАЯ" }} → переключить</button>
   </form>
   <p class="muted">По движению = событийная запись: пишется только пока в зоне есть движение и +10 сек после.
-     Непрерывная = куски по 5 минут всегда. Лайв не зависит от режима.</p>
+     Непрерывная = куски по 5 минут всегда. Лайв от режима не зависит.</p>
 </div>
 
 <div class="card">
   <h2>Зона детекции движения</h2>
   <p class="muted">Нарисуй рамку мышью по кадру ниже — движение будет искаться только внутри неё
-     (деревья, дорога и прочие помехи вне рамки не触发 запись). Рамка сохраняется в долях кадра,
+     (деревья, дорога и прочие помехи вне рамки не будут гнать запись). Рамка хранится в долях кадра,
      поэтому не сбивается при смене разрешения. Без рамки детектор смотрит весь кадр.</p>
   <div id="zonebox" style="position:relative;max-width:760px;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:crosshair;background:#000;">
-    <img id="zoneimg" src="{% if thumb and thumb.url %}{{ thumb.url }}?t={{ range(100000)|random }}{% else %}{% endif %}" style="width:100%;display:block;" alt="кадр">
+    {% if thumb and thumb.url %}
+    <img id="zoneimg" src="{{ thumb.url }}?t={{ range(100000)|random }}" style="width:100%;display:block;" alt="кадр">
+    {% else %}
+    <p class="muted" style="padding:20px;">Превью пока нет — зону можно задать числами ниже или после появления кадра.</p>
+    {% endif %}
     <div id="zoneRect" style="position:absolute;border:2px solid var(--warn);background:rgba(251,191,36,.18);display:none;pointer-events:none;"></div>
   </div>
   <form method="post" action="{{ url_for('admin_camera_zone', camera_id=camera.id) }}" class="formrow" style="margin-top:10px;">
@@ -54,8 +58,7 @@
   (function () {
     var box = document.getElementById("zonebox");
     var rect = document.getElementById("zoneRect");
-    var img = document.getElementById("zoneimg");
-    if (!box || !img) return;
+    if (!box) return;
     var drawing = false, sx = 0, sy = 0;
     var cur = {% if zone %}{{ zone | tojson }}{% else %}null{% endif %};
     function show(z) {
