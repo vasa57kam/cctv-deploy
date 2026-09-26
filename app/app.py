@@ -37,6 +37,7 @@ DEFAULT_SETTINGS = {
     "transfer_instruction": "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). В комментарии укажите дату и последние 4 цифры.",
     "promised_amount": "300", "promised_repay_seconds": "604800", "promised_fee_percent": "10",
     "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
+    "motion_threshold": "0.06",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
 
@@ -112,6 +113,7 @@ class Camera(db.Model):
     rtsp_url = db.Column(db.Text, nullable=False); user_id = db.Column(db.Integer, nullable=True)
     active = db.Column(db.Boolean, default=True); recording_enabled = db.Column(db.Boolean, default=False)
     recording_mode = db.Column(db.String(12), default="continuous")
+    motion_zone = db.Column(db.String(60), nullable=True)
     group_name = db.Column(db.String(60), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
@@ -441,6 +443,18 @@ def build_archive_days(camera):
             d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
                 "ready": (now_ts - st.st_mtime) > 60,
                 "time_start": start, "time_end": end, "kind": "кусок 5 мин", "s": s_sec, "e": e_sec})
+        else:
+            day = p.name[:10]
+            d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
+            hm = re.match(r"^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", p.name)
+            s_sec = 0
+            if hm:
+                s_sec = int(hm.group(1)) * 3600 + int(hm.group(2)) * 60 + int(hm.group(3))
+            d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
+                "ready": (now_ts - st.st_mtime) > 60,
+                "time_start": time.strftime("%H:%M:%S", time.gmtime(s_sec)),
+                "time_end": time.strftime("%H:%M:%S", time.gmtime(min(86399, s_sec + 300))),
+                "kind": "событие движения", "s": s_sec, "e": min(86400, s_sec + 300)})
     result = []
     for day in sorted(days.keys(), reverse=True):
         d = days[day]
@@ -611,7 +625,7 @@ def dashboard():
 @login_required
 def camera_request():
     ip = request.form.get("ip", "").strip()
-    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip) and not re.match(r"^[a-zA-Z0-9.-]+$", ip):
+    if not re.match(r"^[a-zA-Z0-9.-]{3,64}$", ip):
         flash("Некорректный IP или имя хоста."); return user_redirect("#camera-request")
     db.session.add(CameraRequest(user_id=current_user.id, ip=ip,
         login=request.form.get("login", "").strip() or None,
@@ -632,10 +646,8 @@ def camera_request_close(rid):
 @admin_required
 def admin_scan_page():
     st = scan_state()
-    pre_ip = request.args.get("ip", "")
-    pre_login = request.args.get("login", "")
-    pre_pass = request.args.get("pass", "")
-    return render_template("scan.html", state=st, pre_ip=pre_ip, pre_login=pre_login, pre_pass=pre_pass)
+    return render_template("scan.html", state=st,
+        pre_ip=request.args.get("ip", ""), pre_login=request.args.get("login", ""), pre_pass=request.args.get("pass", ""))
 
 @app.route("/admin/scan/start", methods=["POST"])
 @admin_required
@@ -853,7 +865,28 @@ def camera_page(camera_id):
     days = build_archive_days(camera)
     days_json = json.dumps([{"day": d["day"], "segments": d["segments"]} for d in days])
     return render_template("camera.html", camera=camera, days=days, days_json=days_json,
-        thumb=thumb_state(camera), is_admin=current_user.admin, team_role=team_role(current_user))
+        thumb=thumb_state(camera), zone=camera.motion_zone or "",
+        is_admin=current_user.admin, team_role=team_role(current_user))
+
+@app.route("/admin/camera/<int:camera_id>/zone", methods=["POST"])
+@admin_required
+def admin_camera_zone(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    if request.form.get("clear") == "1":
+        camera.motion_zone = None
+        flash("Зона детекции сброшена: движение ищется по всему кадру.")
+    else:
+        try:
+            x1 = float(request.form.get("x1", "0")); y1 = float(request.form.get("y1", "0"))
+            x2 = float(request.form.get("x2", "1")); y2 = float(request.form.get("y2", "1"))
+            if x2 - x1 < 0.05 or y2 - y1 < 0.05: raise ValueError
+            camera.motion_zone = f"{max(0,min(1,x1)):.4f},{max(0,min(1,y1)):.4f},{max(0,min(1,x2)):.4f},{max(0,min(1,y2)):.4f}"
+            flash("Зона детекции сохранена. Воркер применит за ~2 секунды.")
+        except ValueError:
+            flash("Некорректная зона: рамка слишком мала.")
+    db.session.commit()
+    audit(current_user, "motion_zone", camera.name)
+    return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/admin/camera/<int:camera_id>/motion", methods=["POST"])
 @admin_required
@@ -861,9 +894,9 @@ def admin_camera_motion(camera_id):
     camera = get_or_404(Camera, camera_id)
     camera.recording_mode = "motion" if (camera.recording_mode or "continuous") != "motion" else "continuous"
     db.session.commit()
-    mode_ru = "по движению" if camera.recording_mode == "motion" else "непрерывная"
+    mode_ru = "по движению (событийная)" if camera.recording_mode == "motion" else "непрерывная"
     audit(current_user, "recording_mode", f"{camera.name}={mode_ru}")
-    flash(f"Камера {camera.name}: режим записи — {mode_ru}. Воркер переключится за ~5 секунд.")
+    flash(f"Камера {camera.name}: режим записи — {mode_ru}. Воркер переключится за ~2 секунды.")
     return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/admin/camera/<int:camera_id>/glue/<day>", methods=["POST"])
@@ -1069,7 +1102,7 @@ def admin_impersonate(user_id):
 def admin_settings():
     for code, _ in PAY_METHODS: set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
     for k in ("transfer_instruction", "promised_amount", "promised_repay_seconds", "promised_fee_percent",
-              "partner_commission", "archive_order_price", "freeze_price_per_day",
+              "partner_commission", "archive_order_price", "freeze_price_per_day", "motion_threshold",
               "whitelabel_name", "whitelabel_primary", "whitelabel_logo"):
         set_setting(k, request.form.get(k, ""))
     db.session.commit()
@@ -1488,7 +1521,7 @@ def api_cameras():
     owner = effective_owner(current_user)
     cams = Camera.query.all() if current_user.admin else owner.cameras
     return jsonify([{"id": c.id, "name": c.name, "group": c.group_name, "active": c.active,
-        "recording": c.recording_enabled, "mode": c.recording_mode} for c in cams])
+        "recording": c.recording_enabled, "mode": c.recording_mode, "zone": c.motion_zone} for c in cams])
 
 @app.route("/api/cameras/<int:cid>/records")
 @login_required
