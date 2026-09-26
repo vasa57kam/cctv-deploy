@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS team_member (id INTEGER PRIMARY KEY, owner_id INTEGER
   user_id INTEGER NOT NULL UNIQUE, role VARCHAR(20) DEFAULT 'viewer', created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL, rtsp_url TEXT NOT NULL,
   user_id INTEGER, active BOOLEAN DEFAULT 1, recording_enabled BOOLEAN DEFAULT 0,
-  recording_mode VARCHAR(12) DEFAULT 'continuous', group_name VARCHAR(60), created_at TIMESTAMP);
+  recording_mode VARCHAR(12) DEFAULT 'continuous', motion_zone VARCHAR(60),
+  group_name VARCHAR(60), created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL, enabled BOOLEAN DEFAULT 1);
 CREATE TABLE IF NOT EXISTS "transaction" (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
@@ -53,6 +54,9 @@ CREATE TABLE IF NOT EXISTS archive_order (id INTEGER PRIMARY KEY, user_id INTEGE
   camera_id INTEGER NOT NULL, from_dt TIMESTAMP NOT NULL, to_dt TIMESTAMP NOT NULL,
   price FLOAT DEFAULT 0, status VARCHAR(10) DEFAULT 'pending', file_path VARCHAR(500),
   created_at TIMESTAMP, processed_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS camera_request (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+  ip VARCHAR(64) NOT NULL, login VARCHAR(64), password VARCHAR(64), comment VARCHAR(255),
+  status VARCHAR(10) DEFAULT 'pending', created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS partner (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE,
   commission_percent FLOAT DEFAULT 30, total_referrals INTEGER DEFAULT 0, total_earned FLOAT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS whitelabel (id INTEGER PRIMARY KEY, partner_id INTEGER NOT NULL UNIQUE,
@@ -67,7 +71,6 @@ if has("tariff"):
     if "interval_seconds" not in c:
         cur.execute("ALTER TABLE tariff ADD COLUMN interval_seconds INTEGER")
         cur.execute("UPDATE tariff SET interval_seconds = COALESCE(period_days,30)*86400 WHERE interval_seconds IS NULL")
-        print("migration: tariff += interval_seconds")
 
 if has("user"):
     c = cols("user")
@@ -76,45 +79,39 @@ if has("user"):
                       ("referred_by", "INTEGER"), ("partner_of", "INTEGER")]:
         if name not in c:
             cur.execute(f"ALTER TABLE user ADD COLUMN {name} {ddl}")
-            print(f"migration: user += {name}")
 
 if has("camera"):
     c = cols("camera")
     if "recording_enabled" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN recording_enabled BOOLEAN DEFAULT 0")
-        print("migration: camera += recording_enabled")
     if "recording_mode" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN recording_mode VARCHAR(12) DEFAULT 'continuous'")
-        print("migration: camera += recording_mode")
+    if "motion_zone" not in c:
+        cur.execute("ALTER TABLE camera ADD COLUMN motion_zone VARCHAR(60)")
+        print("migration: camera += motion_zone")
     if "group_name" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN group_name VARCHAR(60)")
-        print("migration: camera += group_name")
 
 if has("camera_access"):
     c = cols("camera_access")
     if "enabled" not in c:
         cur.execute("ALTER TABLE camera_access ADD COLUMN enabled BOOLEAN DEFAULT 1")
-        print("migration: camera_access += enabled")
     cur.execute("""INSERT INTO camera_access (camera_id, user_id, enabled)
         SELECT id, user_id, 1 FROM camera WHERE user_id IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM camera_access ca
                         WHERE ca.camera_id = camera.id AND ca.user_id = camera.user_id)""")
-    print("migration: camera_access seeded from old owners")
 
 if has("payment_request"):
     c = cols("payment_request")
     if "user_hidden" not in c:
         cur.execute("ALTER TABLE payment_request ADD COLUMN user_hidden BOOLEAN DEFAULT 0")
-        print("migration: payment_request += user_hidden")
     if "admin_hidden" not in c:
         cur.execute("ALTER TABLE payment_request ADD COLUMN admin_hidden BOOLEAN DEFAULT 0")
-        print("migration: payment_request += admin_hidden")
 
 if has("subscription_freeze"):
     c = cols("subscription_freeze")
     if "price" not in c:
         cur.execute("ALTER TABLE subscription_freeze ADD COLUMN price FLOAT DEFAULT 0")
-        print("migration: subscription_freeze += price")
 
 n = cur.execute("SELECT COUNT(*) FROM tariff").fetchone()[0]
 if n == 0:
