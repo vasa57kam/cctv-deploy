@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v4.5</span></h1>
+<h1>Админка <span class="badge warn">v4.6</span></h1>
 
 <details class="card" id="analytics" open>
 <summary>Аналитика</summary>
@@ -101,14 +101,15 @@
 
 <details class="card" id="cameras" open>
 <summary>Камеры (общий пул) — {{ cameras|length }}</summary>
+<p class="muted">Режимы записи: непрерывная | движение (ffmpeg+зона) | движение (ONVIF-события камеры) | движение (SMTP-письмо камеры, порт 2525, получатель cctv-cam&lt;ID&gt;@local). Переключаются кнопкой режима; зоны и порог — на странице камеры и в настройках.</p>
 <div class="tablewrap"><table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
 {% for cam in cameras %}
 <tr><td>{{ cam.id }}</td><td>{% set th = thumbs.get(cam.id) %}{% if th and th.url %}<img src="{{ th.url }}?t={{ range(100000)|random }}" style="width:64px;border-radius:6px;vertical-align:middle;margin-right:6px;">{% endif %}{{ cam.name }}{% if cam.group_name %} <span class="badge warn">{{ cam.group_name }}</span>{% endif %}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
-<td><span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %} {% if cam.recording_enabled %}<span class="badge ok">запись: {{ "движение" if cam.recording_mode == "motion" else "непрер." }}</span>{% if cam.motion_zone %}<span class="badge warn">зона</span>{% endif %}{% else %}<span class="badge warn">без записи</span>{% endif %}</td>
+<td><span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{% if cam.active %}<span class="badge ok">вкл</span>{% else %}<span class="badge bad">выкл</span>{% endif %} {% if cam.recording_enabled %}<span class="badge ok">запись: {{ {"continuous": "непрер.", "motion": "движ.ffmpeg", "onvif": "движ.ONVIF", "smtp": "движ.SMTP"}.get(cam.recording_mode, cam.recording_mode) }}</span>{% if cam.motion_zone %}<span class="badge warn">зона</span>{% endif %}{% else %}<span class="badge warn">без записи</span>{% endif %}</td>
 <td>{% for u in cam.users %}<span class="badge ok">{{ u.username }}</span> <form method="post" action="{{ url_for('admin_camera_revoke', camera_id=cam.id) }}" style="display:inline"><input type="hidden" name="user_id" value="{{ u.id }}"><button class="btn gray mini" type="submit">отозвать</button></form><br>{% else %}<span class="muted">никому</span>{% endfor %}</td>
 <td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn gray" type="submit">Выдать</button></form></td>
 <td><form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_motion', camera_id=cam.id) }}" style="display:inline" title="Переключить режим записи"><button class="btn gray mini" type="submit">{{ "непрерывная" if cam.recording_mode != "motion" else "ПО ДВИЖЕНИЮ" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_motion', camera_id=cam.id) }}" style="display:inline" title="Переключить режим записи"><button class="btn gray mini" type="submit">{{ {"continuous": "непрерывная", "motion": "ffmpeg", "onvif": "ONVIF", "smtp": "SMTP"}.get(cam.recording_mode, cam.recording_mode) }}</button></form>
 <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit">{{ "Выкл" if cam.active else "Вкл" }}</button></form>
 <form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить камеру {{ cam.name }} из пула?');"><button class="btn red mini" type="submit">Удалить</button></form>
 <a class="btn gray mini" href="{{ url_for('camera_page', camera_id=cam.id) }}">зона/шкала</a></td></tr>
@@ -249,8 +250,7 @@
     <label class="muted">Заморозка, р/день: <input name="freeze_price_per_day" value="{{ settings['freeze_price_per_day'] }}" style="width:90px"></label>
     <label class="muted">Порог движения (0.02–0.15): <input name="motion_threshold" value="{{ settings['motion_threshold'] }}" style="width:90px"></label>
   </div>
-  <p class="muted">Порог движения: ниже = чувствительнее (больше ложных срабатываний), выше = пишет только заметное движение.
-     Применяется к камерам в режиме «по движению» без пересоздания камеры.</p>
+  <p class="muted">Порог движения применяется к режиму «ffmpeg+зона»: ниже = чувствительнее, выше = только заметное движение.</p>
   <div class="formrow">
     <input name="whitelabel_name" value="{{ settings['whitelabel_name'] }}" placeholder="Название бренда">
     <input name="whitelabel_primary" value="{{ settings['whitelabel_primary'] }}" placeholder="#цвет" style="width:110px">
