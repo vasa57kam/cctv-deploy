@@ -1,20 +1,31 @@
-import os, re, sqlite3, subprocess, time, signal
+import os, re, sqlite3, subprocess, time, signal, threading, asyncio
 import select as pselect
+import urllib.parse
 from pathlib import Path
 
 BASE_DIR = Path("/opt/cctv"); DB_PATH = BASE_DIR / "app" / "cctv.db"
 ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"
 LOG_DIR = BASE_DIR / "storage" / "logs"; PREVIEW_DIR = BASE_DIR / "storage" / "previews"
 GRACE_SECONDS = 10
+SMTP_PORT = 2525
 procs = {}; configs = {}; live_logs = {}
 detectors = {}; det_frames = {}; recorders = {}; rec_logs = {}
-last_motion = {}; running = True; loops = 0
+last_motion = {}; onvif_threads = {}
+running = True; loops = 0
 
 def handle_signal(signum, frame):
     global running
     running = False
 
 signal.signal(signal.SIGTERM, handle_signal); signal.signal(signal.SIGINT, handle_signal)
+
+def mlog(cid, msg):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / f"camera_{cid}.log", "ab") as f:
+            f.write(f"[motion] {time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n".encode())
+    except Exception:
+        pass
 
 def get_settings():
     s = {"motion_threshold": "0.06"}
@@ -43,12 +54,81 @@ def get_cameras():
     except sqlite3.Error:
         return []
 
+def rtsp_creds(url):
+    p = urllib.parse.urlsplit(url)
+    return (p.hostname or ""), (urllib.parse.unquote(p.username or "")), (urllib.parse.unquote(p.password or ""))
+
 def camera_config(cam, settings):
     return (cam["rtsp_url"], bool(cam["recording_enabled"]),
             cam.get("recording_mode") or "continuous",
             cam.get("motion_zone") or "",
             settings.get("motion_threshold", "0.06"))
 
+# ---------- ONVIF ----------
+def onvif_loop(cid, host, user, pw, evt):
+    try:
+        from onvif import ONVIFCamera
+        cam = ONVIFCamera(host, 80, user, pw)
+        evts = cam.create_events_service()
+        evts.CreatePullPointSubscription()
+        mlog(cid, f"ONVIF subscription ok ({host})")
+        while not evt.is_set():
+            try:
+                res = evts.PullMessages({"Timeout": "PT5S", "MessageLimit": 20})
+            except Exception:
+                time.sleep(3); continue
+            for nm in getattr(res, "NotificationMessage", []) or []:
+                topic = ""
+                try:
+                    t = nm.Topic
+                    topic = t if isinstance(t, str) else str(getattr(t, "_value_1", t))
+                except Exception:
+                    pass
+                if any(k in topic for k in ("Motion", "CellMotion", "Detector", "Alarm")):
+                    last_motion[cid] = time.time()
+    except Exception as e:
+        mlog(cid, f"ONVIF error: {e}")
+    onvif_threads.pop(cid, None)
+
+def ensure_onvif(cid, rtsp_url):
+    t = onvif_threads.get(cid)
+    if t and t[0].is_alive(): return
+    host, user, pw = rtsp_creds(rtsp_url)
+    if not host: return
+    evt = threading.Event()
+    th = threading.Thread(target=onvif_loop, args=(cid, host, user, pw, evt), daemon=True)
+    onvif_threads[cid] = (th, evt)
+    th.start()
+
+def stop_onvif(cid):
+    t = onvif_threads.pop(cid, None)
+    if t:
+        t[1].set()
+
+# ---------- SMTP ----------
+def smtp_server_thread():
+    try:
+        from aiosmtpd.controller import Controller
+        class H:
+            async def handle_DATA(self, server, session, envelope):
+                for addr in list(envelope.rcpt_tos or []) + [envelope.mail_from or ""]:
+                    m = re.search(r"cam[_-]?(\d+)", addr or "")
+                    if m:
+                        last_motion[int(m.group(1))] = time.time()
+                return "250 Message accepted for delivery"
+        ctrl = Controller(H(), hostname="0.0.0.0", port=SMTP_PORT)
+        ctrl.start()
+        while running:
+            time.sleep(1)
+        ctrl.stop()
+    except Exception as e:
+        try:
+            with open(LOG_DIR / "smtp.log", "ab") as f:
+                f.write(f"[smtp] error: {e}\n".encode())
+        except Exception:
+            pass
+
+# ---------- ffmpeg detector / recorder / live ----------
 def log_handle(cid):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = LOG_DIR / f"camera_{cid}.log"
@@ -58,8 +138,7 @@ def log_handle(cid):
 
 def start_live(cam, with_segments):
     cid = cam["id"]
-    live_dir = LIVE_DIR / f"camera_{cid}"
-    archive_dir = ARCHIVE_DIR / f"camera_{cid}"
+    live_dir = LIVE_DIR / f"camera_{cid}"; archive_dir = ARCHIVE_DIR / f"camera_{cid}"
     live_dir.mkdir(parents=True, exist_ok=True); archive_dir.mkdir(parents=True, exist_ok=True)
     lf = log_handle(cid); live_logs[cid] = lf
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]]
@@ -134,6 +213,7 @@ def start_recorder(cam):
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
            "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
            "-map", "0:v", "-c:v", "copy", "-an", "-movflags", "+faststart", str(out)]
+    mlog(cid, f"recorder start -> {out.name}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
 def stop_recorder(cid):
@@ -144,6 +224,7 @@ def stop_recorder(cid):
         except Exception:
             try: r.kill()
             except Exception: pass
+        mlog(cid, "recorder stop")
     lf = rec_logs.pop(cid, None)
     if lf is not None:
         try: lf.close()
@@ -183,6 +264,8 @@ def cleanup_archives():
     except Exception:
         pass
 
+threading.Thread(target=smtp_server_thread, daemon=True).start()
+
 while running:
     settings = get_settings()
     cameras = get_cameras(); active_ids = set()
@@ -197,8 +280,13 @@ while running:
         if proc is None or proc.poll() is not None:
             if proc is not None:
                 proc.wait(); stop_live(cid)
-            procs[cid] = start_live(cam, rec and mode != "motion")
+            procs[cid] = start_live(cam, rec and mode == "continuous")
             configs[cid] = cfg
+        if mode == "onvif":
+            if rec: ensure_onvif(cid, rtsp)
+            else: stop_onvif(cid)
+        else:
+            stop_onvif(cid)
         if rec and mode == "motion":
             d = detectors.get(cid)
             if d is None or d.poll() is not None:
@@ -206,6 +294,9 @@ while running:
                 d = start_detector(cam, cfg); detectors[cid] = d; det_frames[cid] = 0
             if detector_motion(cid):
                 last_motion[cid] = now
+        else:
+            stop_detector(cid)
+        if rec and mode in ("motion", "onvif", "smtp"):
             gate = (now - last_motion.get(cid, 0)) < GRACE_SECONDS
             r = recorders.get(cid)
             if r is not None and r.poll() is not None:
@@ -215,13 +306,13 @@ while running:
             elif not gate and r is not None:
                 stop_recorder(cid)
         else:
-            stop_detector(cid)
             stop_recorder(cid)
-            last_motion.pop(cid, None)
+            if mode == "continuous":
+                last_motion.pop(cid, None)
     for cid in list(procs.keys()):
         if cid not in active_ids:
             stop_live(cid); configs.pop(cid, None)
-            stop_detector(cid); stop_recorder(cid); last_motion.pop(cid, None)
+            stop_detector(cid); stop_recorder(cid); stop_onvif(cid); last_motion.pop(cid, None)
     loops += 1
     if loops % 30 == 1: snap_thumbs(cameras)
     if loops % 900 == 0: cleanup_archives()
@@ -230,3 +321,4 @@ while running:
 for cid in list(procs.keys()): stop_live(cid)
 for cid in list(detectors.keys()): stop_detector(cid)
 for cid in list(recorders.keys()): stop_recorder(cid)
+for cid in list(onvif_threads.keys()): stop_onvif(cid)
