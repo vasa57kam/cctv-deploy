@@ -15,6 +15,7 @@
       {% if camera.recording_enabled %} · <span class="badge ok">запись: {{ {"continuous": "непрерывная", "motion": "движение (ffmpeg)", "onvif": "движение (ONVIF)", "smtp": "движение (SMTP)"}.get(camera.recording_mode, camera.recording_mode) }}</span>
       {% else %} · <span class="badge warn">запись выключена</span>{% endif %}
       {% if camera.motion_zone %} · <span class="badge warn">зона задана</span>{% endif %}
+      {% if camera.onvif_url %} · <span class="badge warn">onvif адрес задан</span>{% endif %}
     </p>
   </div>
 </div>
@@ -28,12 +29,16 @@
   <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" style="display:inline">
     <button class="btn gray" type="submit">Режим: {{ {"continuous": "НЕПРЕРЫВНАЯ", "motion": "ДВИЖЕНИЕ (FFMPEG+ЗОНА)", "onvif": "ДВИЖЕНИЕ (ONVIF)", "smtp": "ДВИЖЕНИЕ (SMTP-ПИСЬМО)"}.get(camera.recording_mode, camera.recording_mode) }} → переключить</button>
   </form>
-  <p class="muted" style="margin-top:8px;">
-    Непрерывная = куски по 5 минут всегда. Остальные три = событийная запись: файл пишется, пока есть движение,
-    и +10 секунд после тишины.<br>
+  <form method="post" action="{{ url_for('admin_camera_onvif', camera_id=camera.id) }}" class="formrow" style="margin-top:10px;">
+    <input name="onvif_url" value="{{ camera.onvif_url or '' }}" placeholder="ONVIF: http://user:pass@ip:port/onvif/device_service" style="flex:1">
+    <button class="btn gray" type="submit">Сохранить ONVIF</button>
+  </form>
+  <p class="muted">
+    Непрерывная = куски по 5 минут всегда. Остальные три = событийная запись: файл пишется, пока есть движение, и +10 сек после тишины.<br>
+    <b>ONVIF-адрес</b>: хост, порт и логин/пароль берутся из этой ссылки (пример: http://admin:Superuser17@31.129.204.17:10080/onvif/device_service).
+    Если поле пустое — берутся IP и креды из RTSP-ссылки, порт 80. Зоны движения для ONVIF/SMTP настраиваются в самой камере.<br>
     <b>FFMPEG+ЗОНА</b>: детектор на сервере, зона рисуется рамкой ниже, чувствительность — «Порог движения» в настройках админки.<br>
-    <b>ONVIF</b>: используются события самой камеры (логин/пароль берутся из RTSP-ссылки, порт ONVIF = 80); зоны настраиваются в веб-интерфейсе камеры.<br>
-    <b>SMTP</b>: в камере укажи SMTP-сервер = адрес нашего сервера, порт 2525, получатель <b>cctv-cam{{ camera.id }}@local</b> (ID камеры = {{ camera.id }}); письмо о движении открывает запись. Работает даже там, где ONVIF урезан.
+    <b>SMTP</b>: в камере SMTP-сервер = адрес нашего сервера, порт 2525, получатель <b>cctv-cam{{ camera.id }}@local</b> (ID камеры = {{ camera.id }}).
   </p>
 </div>
 
