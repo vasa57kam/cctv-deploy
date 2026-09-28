@@ -45,10 +45,14 @@ def get_cameras():
         conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
         try:
             rows = [dict(r) for r in conn.execute(
-                "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone FROM camera WHERE active=1")]
+                "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url FROM camera WHERE active=1")]
         except sqlite3.OperationalError:
-            rows = [dict(r) for r in conn.execute(
-                "SELECT id, rtsp_url, recording_enabled, recording_mode FROM camera WHERE active=1")]
+            try:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone FROM camera WHERE active=1")]
+            except sqlite3.OperationalError:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT id, rtsp_url, recording_enabled, recording_mode FROM camera WHERE active=1")]
         conn.close()
         return rows
     except sqlite3.Error:
@@ -58,20 +62,34 @@ def rtsp_creds(url):
     p = urllib.parse.urlsplit(url)
     return (p.hostname or ""), (urllib.parse.unquote(p.username or "")), (urllib.parse.unquote(p.password or ""))
 
+def onvif_params(cam):
+    url = (cam.get("onvif_url") or "").strip()
+    r_host, r_user, r_pw = rtsp_creds(cam["rtsp_url"])
+    if not url:
+        return r_host, 80, r_user, r_pw
+    if "://" not in url:
+        url = "http://" + url
+    p = urllib.parse.urlsplit(url)
+    host = p.hostname or r_host
+    port = p.port or 80
+    user = urllib.parse.unquote(p.username or "") or r_user
+    pw = urllib.parse.unquote(p.password or "") or r_pw
+    return host, port, user, pw
+
 def camera_config(cam, settings):
     return (cam["rtsp_url"], bool(cam["recording_enabled"]),
             cam.get("recording_mode") or "continuous",
             cam.get("motion_zone") or "",
-            settings.get("motion_threshold", "0.06"))
+            settings.get("motion_threshold", "0.06"),
+            cam.get("onvif_url") or "")
 
-# ---------- ONVIF ----------
-def onvif_loop(cid, host, user, pw, evt):
+def onvif_loop(cid, host, port, user, pw, evt):
     try:
         from onvif import ONVIFCamera
-        cam = ONVIFCamera(host, 80, user, pw)
+        cam = ONVIFCamera(host, port, user, pw)
         evts = cam.create_events_service()
         evts.CreatePullPointSubscription()
-        mlog(cid, f"ONVIF subscription ok ({host})")
+        mlog(cid, f"ONVIF subscription ok ({host}:{port})")
         while not evt.is_set():
             try:
                 res = evts.PullMessages({"Timeout": "PT5S", "MessageLimit": 20})
@@ -87,16 +105,16 @@ def onvif_loop(cid, host, user, pw, evt):
                 if any(k in topic for k in ("Motion", "CellMotion", "Detector", "Alarm")):
                     last_motion[cid] = time.time()
     except Exception as e:
-        mlog(cid, f"ONVIF error: {e}")
+        mlog(cid, f"ONVIF error ({host}:{port}): {e}")
     onvif_threads.pop(cid, None)
 
-def ensure_onvif(cid, rtsp_url):
+def ensure_onvif(cid, cam):
     t = onvif_threads.get(cid)
     if t and t[0].is_alive(): return
-    host, user, pw = rtsp_creds(rtsp_url)
+    host, port, user, pw = onvif_params(cam)
     if not host: return
     evt = threading.Event()
-    th = threading.Thread(target=onvif_loop, args=(cid, host, user, pw, evt), daemon=True)
+    th = threading.Thread(target=onvif_loop, args=(cid, host, port, user, pw, evt), daemon=True)
     onvif_threads[cid] = (th, evt)
     th.start()
 
@@ -105,7 +123,6 @@ def stop_onvif(cid):
     if t:
         t[1].set()
 
-# ---------- SMTP ----------
 def smtp_server_thread():
     try:
         from aiosmtpd.controller import Controller
@@ -128,7 +145,6 @@ def smtp_server_thread():
         except Exception:
             pass
 
-# ---------- ffmpeg detector / recorder / live ----------
 def log_handle(cid):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = LOG_DIR / f"camera_{cid}.log"
@@ -174,7 +190,7 @@ def zone_vf_prefix(zone):
         return ""
 
 def start_detector(cam, cfg):
-    rtsp, rec, mode, zone, thr = cfg
+    rtsp, rec, mode, zone, thr, onvif_url = cfg
     vf = zone_vf_prefix(zone) + f"select='gt(scene,{thr})'"
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
            "-rtsp_transport", "tcp", "-i", rtsp,
@@ -273,7 +289,7 @@ while running:
     for cam in cameras:
         cid = cam["id"]; active_ids.add(cid)
         cfg = camera_config(cam, settings)
-        rtsp, rec, mode, zone, thr = cfg
+        rtsp, rec, mode, zone, thr, onvif_url = cfg
         proc = procs.get(cid)
         if proc is not None and configs.get(cid) != cfg:
             stop_live(cid); proc = None
@@ -283,7 +299,7 @@ while running:
             procs[cid] = start_live(cam, rec and mode == "continuous")
             configs[cid] = cfg
         if mode == "onvif":
-            if rec: ensure_onvif(cid, rtsp)
+            if rec: ensure_onvif(cid, cam)
             else: stop_onvif(cid)
         else:
             stop_onvif(cid)
