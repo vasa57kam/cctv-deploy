@@ -114,6 +114,7 @@ class Camera(db.Model):
     active = db.Column(db.Boolean, default=True); recording_enabled = db.Column(db.Boolean, default=False)
     recording_mode = db.Column(db.String(12), default="continuous")
     motion_zone = db.Column(db.String(60), nullable=True)
+    onvif_url = db.Column(db.String(255), nullable=True)
     group_name = db.Column(db.String(60), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
@@ -868,6 +869,20 @@ def camera_page(camera_id):
         thumb=thumb_state(camera), zone=camera.motion_zone or "",
         is_admin=current_user.admin, team_role=team_role(current_user))
 
+@app.route("/admin/camera/<int:camera_id>/onvif", methods=["POST"])
+@admin_required
+def admin_camera_onvif(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    url = request.form.get("onvif_url", "").strip()
+    camera.onvif_url = url or None
+    db.session.commit()
+    audit(current_user, "onvif_url", f"{camera.name}={url or 'сброшено'}")
+    if url:
+        flash("ONVIF-адрес сохранён. Воркер переподпишется за ~2 секунды (смотри лог камеры).")
+    else:
+        flash("ONVIF-адрес сброшен: будут взяты IP и креды из RTSP, порт 80.")
+    return redirect(url_for("camera_page", camera_id=camera.id))
+
 @app.route("/admin/camera/<int:camera_id>/zone", methods=["POST"])
 @admin_required
 def admin_camera_zone(camera_id):
@@ -1450,9 +1465,10 @@ def admin_tariff_delete(tariff_id):
 @admin_required
 def admin_camera_add():
     name = request.form.get("name", "").strip(); rtsp_url = request.form.get("rtsp_url", "").strip()
+    onvif_url = request.form.get("onvif_url", "").strip()
     if not name or not rtsp_url: return admin_redirect("#cameras")
     db.session.add(Camera(name=name, rtsp_url=rtsp_url, active=True, recording_enabled=False,
-        group_name=request.form.get("group", "").strip() or None))
+        onvif_url=onvif_url or None, group_name=request.form.get("group", "").strip() or None))
     db.session.commit()
     return admin_redirect("#cameras")
 
@@ -1462,6 +1478,7 @@ def admin_camera_edit(camera_id):
     camera = get_or_404(Camera, camera_id)
     camera.name = request.form.get("name", "").strip()
     camera.rtsp_url = request.form.get("rtsp_url", "").strip()
+    camera.onvif_url = request.form.get("onvif_url", "").strip() or None
     camera.group_name = request.form.get("group", "").strip() or None
     db.session.commit()
     return admin_redirect("#cameras")
@@ -1525,7 +1542,8 @@ def api_cameras():
     owner = effective_owner(current_user)
     cams = Camera.query.all() if current_user.admin else owner.cameras
     return jsonify([{"id": c.id, "name": c.name, "group": c.group_name, "active": c.active,
-        "recording": c.recording_enabled, "mode": c.recording_mode, "zone": c.motion_zone} for c in cams])
+        "recording": c.recording_enabled, "mode": c.recording_mode, "zone": c.motion_zone,
+        "onvif": c.onvif_url} for c in cams])
 
 @app.route("/api/cameras/<int:cid>/records")
 @login_required
