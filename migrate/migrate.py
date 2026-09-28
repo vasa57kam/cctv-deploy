@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS team_member (id INTEGER PRIMARY KEY, owner_id INTEGER
   user_id INTEGER NOT NULL UNIQUE, role VARCHAR(20) DEFAULT 'viewer', created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera (id INTEGER PRIMARY KEY, name VARCHAR(120) NOT NULL, rtsp_url TEXT NOT NULL,
   user_id INTEGER, active BOOLEAN DEFAULT 1, recording_enabled BOOLEAN DEFAULT 0,
-  recording_mode VARCHAR(12) DEFAULT 'continuous', motion_zone VARCHAR(60),
+  recording_mode VARCHAR(12) DEFAULT 'continuous', motion_zone VARCHAR(60), onvif_url VARCHAR(255),
   group_name VARCHAR(60), created_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS camera_access (id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL, enabled BOOLEAN DEFAULT 1);
@@ -88,7 +88,9 @@ if has("camera"):
         cur.execute("ALTER TABLE camera ADD COLUMN recording_mode VARCHAR(12) DEFAULT 'continuous'")
     if "motion_zone" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN motion_zone VARCHAR(60)")
-        print("migration: camera += motion_zone")
+    if "onvif_url" not in c:
+        cur.execute("ALTER TABLE camera ADD COLUMN onvif_url VARCHAR(255)")
+        print("migration: camera += onvif_url")
     if "group_name" not in c:
         cur.execute("ALTER TABLE camera ADD COLUMN group_name VARCHAR(60)")
 
