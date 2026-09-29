@@ -26,7 +26,7 @@ header .spacer{flex:1}
 .badge.bad{background:#3b1d1d;color:var(--bad);}
 .badge.warn{background:#3b341a;color:var(--warn);}
 .impbar{background:#7f1d1d;color:#fecaca;padding:6px 14px;border-radius:8px;font-size:13px;}
-main{padding:18px;max-width:1120px;margin:0 auto;}
+main{padding:18px;max-width:1180px;margin:0 auto;}
 .card,details.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:16px;box-shadow:var(--shadow);}
 summary{cursor:pointer;font-size:16px;font-weight:700;}
 summary::-webkit-details-marker{display:none;}
@@ -67,17 +67,30 @@ pre.log{background:#0d1526;border:1px solid #33415c;border-radius:8px;padding:8p
 .tl{position:relative;height:36px;background:#0d1526;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;}
 .tl .seg{position:absolute;top:0;bottom:0;background:linear-gradient(180deg,var(--ok),#059669);opacity:.8;}
 .tl .seg:hover{opacity:1;}
+.tl .seg.cur{outline:2px solid var(--warn);opacity:1;}
 .tl .now{position:absolute;top:0;bottom:0;width:2px;background:var(--bad);}
 .tl-hours{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px;}
 .empty{text-align:center;color:var(--muted);padding:26px 10px;}
 .empty svg{opacity:.45;margin-bottom:8px;}
+.layout{display:grid;grid-template-columns:225px 1fr;gap:16px;align-items:start;}
+#sidenav{position:sticky;top:64px;display:flex;flex-direction:column;gap:3px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px;max-height:calc(100vh - 80px);overflow-y:auto;}
+#sidenav a{padding:8px 10px;border-radius:8px;color:var(--muted);text-decoration:none;font-size:13px;font-weight:600;white-space:nowrap;}
+#sidenav a:hover{background:#22304d;color:var(--text);}
+.tabbar{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px;}
+.tabbar button{background:#22304d;border:1px solid var(--line);color:var(--muted);border-radius:10px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:14px;}
+.tabbar button.on{background:var(--accent);color:#082032;border-color:transparent;}
+.tabpage{display:none;}
+.tabpage.on{display:block;}
+.stickyplayer{position:sticky;top:60px;z-index:30;}
 #mobnav{display:none;}
-@media (max-width:820px){
+@media (max-width:900px){
   main{padding:12px 10px 74px;}
+  .layout{grid-template-columns:1fr;}
+  #sidenav{position:static;flex-direction:row;overflow-x:auto;max-height:none;}
+  .stickyplayer{position:static;}
   #mobnav{display:flex;position:fixed;left:0;right:0;bottom:0;background:#101a30f2;backdrop-filter:blur(10px);border-top:1px solid var(--line);z-index:60;}
   #mobnav a{flex:1;text-align:center;padding:8px 2px 10px;color:var(--muted);font-size:11px;text-decoration:none;font-weight:600;}
   #mobnav a svg{display:block;margin:0 auto 3px;}
-  #mobnav a.act{color:var(--accent);}
   header{padding:8px 10px;}
 }
 </style>
@@ -88,7 +101,7 @@ pre.log{background:#0d1526;border:1px solid #33415c;border-radius:8px;padding:8p
     {% if brand.logo %}<img src="{{ brand.logo }}" alt="">{% else %}<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>{% endif %}
     {{ brand.name }}
   </span>
-  <span class="badge warn">v4.3</span>
+  <span class="badge warn">v4.9</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы вошли как {{ current_user.username }} — вернуться в админку</a>
@@ -134,6 +147,21 @@ document.addEventListener("DOMContentLoaded", function () {
       setTimeout(function () { el.scrollIntoView({block: "start"}); }, 80);
     }
   }
+  document.querySelectorAll("#sidenav a").forEach(function (a) {
+    a.addEventListener("click", function () {
+      var t = document.querySelector(a.getAttribute("href"));
+      if (t && t.tagName === "DETAILS") t.open = true;
+    });
+  });
+  document.querySelectorAll(".tabbar button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll(".tabbar button").forEach(function (x) { x.classList.remove("on"); });
+      document.querySelectorAll(".tabpage").forEach(function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      var pg = document.getElementById(b.dataset.tab);
+      if (pg) pg.classList.add("on");
+    });
+  });
 });
 </script>
 </body>
