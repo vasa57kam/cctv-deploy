@@ -10,7 +10,7 @@
     <h1 style="margin:0 0 6px;">{{ camera.name }}{% if camera.group_name %} <span class="badge neutral">{{ camera.group_name }}</span>{% endif %}</h1>
     <p class="muted" style="margin:0;">
       <span class="dot {{ 'on' if thumb and thumb.online else 'off' }}"></span>{{ "онлайн" if thumb and thumb.online else "офлайн" }}
-      {% if camera.recording_enabled %} · <span class="badge ok">запись</span>{% else %} · <span class="badge warn">запись выключена</span>{% endif %}
+      {% if camera.recording_enabled %} · <span class="badge ok">запись: {{ {"continuous": "непрерывная", "motion": "по движению", "onvif": "ONVIF", "smtp": "SMTP"}.get(camera.recording_mode, camera.recording_mode) }}</span>{% else %} · <span class="badge warn">запись выключена</span>{% endif %}
     </p>
   </div>
 </div>
@@ -101,14 +101,26 @@
     <form method="post" action="{{ url_for('admin_camera_recording', camera_id=camera.id) }}" style="display:inline">
       <button class="btn" type="submit">{{ "Выключить запись" if camera.recording_enabled else "Включить запись" }}</button>
     </form>
-    <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" style="display:inline;margin-left:6px;">
-      <button class="btn ghost" type="submit">Режим: {{ {"continuous": "непрерывная", "motion": "по движению", "onvif": "ONVIF", "smtp": "SMTP"}.get(camera.recording_mode, camera.recording_mode) }}</button>
+    <form method="post" action="{{ url_for('admin_camera_motion', camera_id=camera.id) }}" class="formrow" style="display:inline-flex;margin-left:6px;">
+      <select name="mode" style="padding:8px 10px;">
+        <option value="continuous" {% if (camera.recording_mode or "continuous") == "continuous" %}selected{% endif %}>непрерывная</option>
+        <option value="motion" {% if camera.recording_mode == "motion" %}selected{% endif %}>по движению (ffmpeg+зона)</option>
+        <option value="onvif" {% if camera.recording_mode == "onvif" %}selected{% endif %}>по движению (ONVIF камеры)</option>
+        <option value="smtp" {% if camera.recording_mode == "smtp" %}selected{% endif %}>по движению (письмо камеры)</option>
+      </select>
+      <button class="btn ghost" type="submit">Применить режим</button>
     </form>
+    <p class="muted" style="margin-top:10px;">
+      <b>непрерывная</b> — пишет всегда кусками по 5 минут.<br>
+      <b>по движению (ffmpeg+зона)</b> — детектор на сервере; зона рисуется ниже; чувствительность и хвост тишины — в настройках админки.<br>
+      <b>по движению (ONVIF)</b> — события самой камеры (зоны настраиваются в камере; адрес ONVIF — поле ниже).<br>
+      <b>по движению (SMTP)</b> — камера шлёт письмо о движении на cctv-cam{{ camera.id }}@local (порт 2525 нашего сервера).<br>
+      Во всех событийных режимах файл пишется, пока есть движение, и закрывается после хвоста тишины.
+    </p>
     <form method="post" action="{{ url_for('admin_camera_onvif', camera_id=camera.id) }}" class="formrow" style="margin-top:12px;">
       <input name="onvif_url" value="{{ camera.onvif_url or '' }}" placeholder="ONVIF URL (если нужен)" style="flex:1">
-      <button class="btn ghost" type="submit">Сохранить</button>
+      <button class="btn ghost" type="submit">Сохранить ONVIF</button>
     </form>
-    <p class="muted">Событийные режимы пишут файл пока есть движение и закрывают его через «хвост» тишины (настройка в админке).</p>
   </div>
 
   <div class="card">
