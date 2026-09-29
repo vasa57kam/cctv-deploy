@@ -15,14 +15,16 @@
   </div>
 </div>
 
-<div class="card stickyplayer" id="playercard">
+<div class="card playercard" id="playercard">
   <div class="formrow" style="margin-bottom:8px;">
     <button class="btn" id="btn-live" type="button">Лайв</button>
+    <button class="btn ghost" id="btn-collapse" type="button">Свернуть плеер</button>
     <span class="muted" id="now-playing">режим: лайв</span>
   </div>
   <video id="video" controls autoplay muted></video>
   <p class="muted" id="player-status" style="margin:6px 0 0;"></p>
 </div>
+<button class="btn ghost" id="gotoPlayer" type="button">↑ Плеер</button>
 
 <div class="tabbar">
   <button class="on" data-tab="tab-archive" type="button">Архив</button>
@@ -49,7 +51,7 @@
 
   <div class="card">
     <h2>Файлы архива</h2>
-    <p class="muted">«Смотреть» — в плеере выше. «Скачать» — файлом на устройство.</p>
+    <p class="muted">«Смотреть» — включает фрагмент в плеере выше (страница не прыгает). «Скачать» — файлом.</p>
     {% if days %}
       {% for d in days %}
       <details class="card" {% if loop.first %}open{% endif %} style="background:var(--card2);box-shadow:none;">
@@ -106,7 +108,7 @@
       <input name="onvif_url" value="{{ camera.onvif_url or '' }}" placeholder="ONVIF URL (если нужен)" style="flex:1">
       <button class="btn ghost" type="submit">Сохранить</button>
     </form>
-    <p class="muted">Событийные режимы пишут файл пока есть движение и закрывают его через «хвост» тишины (настраивается в общих настройках).</p>
+    <p class="muted">Событийные режимы пишут файл пока есть движение и закрывают его через «хвост» тишины (настройка в админке).</p>
   </div>
 
   <div class="card">
@@ -141,13 +143,31 @@ const video = document.getElementById("video");
 const statusEl = document.getElementById("player-status");
 const nowEl = document.getElementById("now-playing");
 const playerCard = document.getElementById("playercard");
+const gotoBtn = document.getElementById("gotoPlayer");
+const collapseBtn = document.getElementById("btn-collapse");
 const liveSrc = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
 let hls = null, pendingSeek = 0;
 function fmt(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");}
-function revealPlayer(){
+function updateGoto(){
   const r = playerCard.getBoundingClientRect();
-  if (r.bottom < 0 || r.top > window.innerHeight) playerCard.scrollIntoView({behavior:"smooth", block:"start"});
+  const hidden = (video.style.display === "none");
+  gotoBtn.style.display = (!hidden && (r.bottom < 0 || r.top > window.innerHeight)) ? "" : "none";
 }
+window.addEventListener("scroll", updateGoto, {passive:true});
+gotoBtn.addEventListener("click", function(){ playerCard.scrollIntoView({behavior:"smooth", block:"start"}); });
+collapseBtn.addEventListener("click", function(){
+  const hidden = (video.style.display === "none");
+  if (hidden) {
+    video.style.display = "";
+    collapseBtn.textContent = "Свернуть плеер";
+    video.play().catch(function(){});
+  } else {
+    video.style.display = "none";
+    collapseBtn.textContent = "Развернуть плеер";
+    video.pause();
+  }
+  updateGoto();
+});
 function markSeg(file){
   document.querySelectorAll("#tl .seg").forEach(function(el){
     el.classList.toggle("cur", el.dataset.file === file);
@@ -164,22 +184,26 @@ function playLive(){
   } else { video.src = liveSrc; }
   nowEl.textContent = "режим: лайв";
   markSeg(null);
-  video.play();
+  if (video.style.display !== "none") video.play().catch(function(){});
 }
 function playArchive(url, seek, file){
   if (hls) { hls.destroy(); hls = null; }
   pendingSeek = seek || 0;
   statusEl.textContent = "";
+  if (video.style.display === "none") {
+    video.style.display = "";
+    collapseBtn.textContent = "Свернуть плеер";
+  }
   video.src = url;
   video.addEventListener("loadedmetadata", function onm(){
     video.removeEventListener("loadedmetadata", onm);
     if (pendingSeek) video.currentTime = pendingSeek;
-    video.play();
+    video.play().catch(function(){});
   });
   nowEl.textContent = "архив: " + (file || "") + (pendingSeek ? " с " + fmt(pendingSeek) : "");
   markSeg(file || null);
-  toast("Воспроизведение: " + (file || "фрагмент"));
-  revealPlayer();
+  toast("Воспроизведение: " + (file || "фрагмент") + (pendingSeek ? " с " + fmt(pendingSeek) : ""));
+  updateGoto();
 }
 const tl = document.getElementById("tl");
 const sel = document.getElementById("day-sel");
@@ -220,6 +244,7 @@ if (tl && sel) {
 }
 document.getElementById("btn-live").addEventListener("click", playLive);
 playLive();
+updateGoto();
 (function () {
   var box = document.getElementById("zonebox");
   var rect = document.getElementById("zoneRect");
