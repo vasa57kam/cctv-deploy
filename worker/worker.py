@@ -6,11 +6,10 @@ from pathlib import Path
 BASE_DIR = Path("/opt/cctv"); DB_PATH = BASE_DIR / "app" / "cctv.db"
 ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"
 LOG_DIR = BASE_DIR / "storage" / "logs"; PREVIEW_DIR = BASE_DIR / "storage" / "previews"
-GRACE_SECONDS = 10
 SMTP_PORT = 2525
 procs = {}; configs = {}; live_logs = {}
 detectors = {}; det_frames = {}; recorders = {}; rec_logs = {}
-last_motion = {}; onvif_threads = {}
+last_motion = {}; rec_started = {}; onvif_threads = {}
 running = True; loops = 0
 
 def handle_signal(signum, frame):
@@ -28,7 +27,7 @@ def mlog(cid, msg):
         pass
 
 def get_settings():
-    s = {"motion_threshold": "0.06"}
+    s = {"motion_threshold": "0.06", "motion_grace": "45"}
     try:
         conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
         for row in conn.execute("SELECT key, value FROM setting").fetchall():
@@ -81,7 +80,8 @@ def camera_config(cam, settings):
             cam.get("recording_mode") or "continuous",
             cam.get("motion_zone") or "",
             settings.get("motion_threshold", "0.06"),
-            cam.get("onvif_url") or "")
+            cam.get("onvif_url") or "",
+            settings.get("motion_grace", "45"))
 
 def onvif_loop(cid, host, port, user, pw, evt):
     try:
@@ -190,7 +190,7 @@ def zone_vf_prefix(zone):
         return ""
 
 def start_detector(cam, cfg):
-    rtsp, rec, mode, zone, thr, onvif_url = cfg
+    rtsp, rec, mode, zone, thr, onvif_url, grace = cfg
     vf = zone_vf_prefix(zone) + f"select='gt(scene,{thr})'"
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
            "-rtsp_transport", "tcp", "-i", rtsp,
@@ -229,10 +229,11 @@ def start_recorder(cam):
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
            "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
            "-map", "0:v", "-c:v", "copy", "-an", "-movflags", "+faststart", str(out)]
+    rec_started[cid] = time.time()
     mlog(cid, f"recorder start -> {out.name}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
-def stop_recorder(cid):
+def stop_recorder(cid, reason=""):
     r = recorders.pop(cid, None)
     if r is not None:
         try:
@@ -240,7 +241,9 @@ def stop_recorder(cid):
         except Exception:
             try: r.kill()
             except Exception: pass
-        mlog(cid, "recorder stop")
+        dur = int(time.time() - rec_started.get(cid, time.time()))
+        mlog(cid, f"recorder stop (длительность события ~{dur} с) {reason}")
+    rec_started.pop(cid, None)
     lf = rec_logs.pop(cid, None)
     if lf is not None:
         try: lf.close()
@@ -286,10 +289,14 @@ while running:
     settings = get_settings()
     cameras = get_cameras(); active_ids = set()
     now = time.time()
+    try:
+        grace = max(5.0, min(300.0, float(settings.get("motion_grace", "45"))))
+    except ValueError:
+        grace = 45.0
     for cam in cameras:
         cid = cam["id"]; active_ids.add(cid)
         cfg = camera_config(cam, settings)
-        rtsp, rec, mode, zone, thr, onvif_url = cfg
+        rtsp, rec, mode, zone, thr, onvif_url, grace_s = cfg
         proc = procs.get(cid)
         if proc is not None and configs.get(cid) != cfg:
             stop_live(cid); proc = None
@@ -313,22 +320,24 @@ while running:
         else:
             stop_detector(cid)
         if rec and mode in ("motion", "onvif", "smtp"):
-            gate = (now - last_motion.get(cid, 0)) < GRACE_SECONDS
+            silent_for = now - last_motion.get(cid, 0)
+            gate = silent_for < grace
             r = recorders.get(cid)
             if r is not None and r.poll() is not None:
-                stop_recorder(cid); r = None
-            if gate and r is None:
+                stop_recorder(cid, "(поток сам оборвался)"); r = None
+            if gate and r is None and last_motion.get(cid):
                 recorders[cid] = start_recorder(cam)
             elif not gate and r is not None:
-                stop_recorder(cid)
+                stop_recorder(cid, f"(тишина в зоне {int(silent_for)} с >= хвоста {int(grace)} с)")
         else:
-            stop_recorder(cid)
+            if recorders.get(cid):
+                stop_recorder(cid, "(режим сменился)")
             if mode == "continuous":
                 last_motion.pop(cid, None)
     for cid in list(procs.keys()):
         if cid not in active_ids:
             stop_live(cid); configs.pop(cid, None)
-            stop_detector(cid); stop_recorder(cid); stop_onvif(cid); last_motion.pop(cid, None)
+            stop_detector(cid); stop_recorder(cid, "(камера отключена)"); stop_onvif(cid); last_motion.pop(cid, None)
     loops += 1
     if loops % 30 == 1: snap_thumbs(cameras)
     if loops % 900 == 0: cleanup_archives()
@@ -336,5 +345,5 @@ while running:
 
 for cid in list(procs.keys()): stop_live(cid)
 for cid in list(detectors.keys()): stop_detector(cid)
-for cid in list(recorders.keys()): stop_recorder(cid)
+for cid in list(recorders.keys()): stop_recorder(cid, "(остановка воркера)")
 for cid in list(onvif_threads.keys()): stop_onvif(cid)
