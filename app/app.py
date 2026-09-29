@@ -907,15 +907,18 @@ def admin_camera_zone(camera_id):
 @admin_required
 def admin_camera_motion(camera_id):
     camera = get_or_404(Camera, camera_id)
-    order = ["continuous", "motion", "onvif", "smtp"]
     names = {"continuous": "непрерывная", "motion": "по движению (ffmpeg+зона)",
              "onvif": "по движению (ONVIF камеры)", "smtp": "по движению (письмо камеры)"}
-    cur = camera.recording_mode or "continuous"
-    camera.recording_mode = order[(order.index(cur) + 1) % len(order)] if cur in order else "motion"
-    db.session.commit()
-    mode_ru = names[camera.recording_mode]
-    audit(current_user, "recording_mode", f"{camera.name}={mode_ru}")
-    flash(f"Камера {camera.name}: режим записи — {mode_ru}. Воркер переключится за ~2 секунды.")
+    mode = request.form.get("mode", "")
+    if mode not in names:
+        flash("Неизвестный режим записи.")
+    else:
+        camera.recording_mode = mode
+        db.session.commit()
+        audit(current_user, "recording_mode", f"{camera.name}={names[mode]}")
+        flash(f"Камера {camera.name}: режим записи — {names[mode]}. Воркер переключится за ~2 секунды.")
+    if request.form.get("back") == "admin":
+        return admin_redirect("#cameras")
     return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/admin/camera/<int:camera_id>/glue/<day>", methods=["POST"])
