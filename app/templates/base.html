@@ -44,9 +44,6 @@ details[open] > summary{margin-bottom:14px;}
 .btn.red{background:#7f1d1d;color:#fecaca;}
 .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text);}
 .btn.mini{padding:5px 10px;font-size:12px;border-radius:8px;}
-.btn.icon{padding:6px 8px;}
-.btn svg{width:14px;height:14px;}
-.btn.mini svg{width:12px;height:12px;}
 table{width:100%;border-collapse:collapse;font-size:14px;}
 td,th{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;}
 .tablewrap{overflow-x:auto;}
@@ -54,6 +51,7 @@ input,select,textarea{background:#0d1526;border:1px solid #33415c;color:var(--te
 input:focus,select:focus,textarea:focus{outline:2px solid rgba(56,189,248,.35);}
 .muted{color:var(--muted);font-size:13px;}
 video{width:100%;border-radius:12px;background:#000;}
+.playercard video{max-height:52vh;object-fit:contain;}
 .formrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center;}
 h1{font-size:22px;margin:0 0 16px;font-weight:800;}
 h2{font-size:16px;margin:0 0 12px;font-weight:700;}
@@ -89,7 +87,7 @@ pre.log{background:#0d1526;border:1px solid #33415c;border-radius:8px;padding:8p
 .tabbar button.on{background:var(--accent);color:#082032;border-color:transparent;}
 .tabpage{display:none;}
 .tabpage.on{display:block;}
-.stickyplayer{position:sticky;top:64px;z-index:30;}
+#gotoPlayer{position:fixed;right:14px;bottom:20px;z-index:70;display:none;box-shadow:var(--shadow);}
 .quickstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
 .qs{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;text-decoration:none;color:var(--text);display:flex;align-items:center;gap:12px;transition:transform .1s;}
 .qs:hover{transform:translateY(-2px);}
@@ -101,11 +99,12 @@ pre.log{background:#0d1526;border:1px solid #33415c;border-radius:8px;padding:8p
   main{padding:14px 10px 74px;}
   .layout{grid-template-columns:1fr;}
   #sidenav{position:static;flex-direction:row;overflow-x:auto;max-height:none;}
-  .stickyplayer{position:static;}
+  #gotoPlayer{bottom:84px;}
   #mobnav{display:flex;position:fixed;left:0;right:0;bottom:0;background:#101a30f2;backdrop-filter:blur(10px);border-top:1px solid var(--line);z-index:60;}
   #mobnav a{flex:1;text-align:center;padding:8px 2px 10px;color:var(--muted);font-size:11px;text-decoration:none;font-weight:600;}
   #mobnav a svg{display:block;margin:0 auto 3px;}
   header{padding:9px 10px;}
+  .playercard video{max-height:40vh;}
 }
 </style>
 </head>
@@ -115,7 +114,7 @@ pre.log{background:#0d1526;border:1px solid #33415c;border-radius:8px;padding:8p
     {% if brand.logo %}<img src="{{ brand.logo }}" alt="">{% else %}<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>{% endif %}
     {{ brand.name }}
   </span>
-  <span class="badge warn">v5.0</span>
+  <span class="badge warn">v5.1</span>
   {% if current_user.is_authenticated %}
     {% if session.get("impersonator") %}
       <a class="impbar" href="{{ url_for('stop_impersonation') }}">Вы как {{ current_user.username }} — вернуться</a>
