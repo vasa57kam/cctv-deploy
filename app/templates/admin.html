@@ -186,20 +186,39 @@
 </details>
 
 <details class="card" id="team">
-<summary>Команды B2B</summary>
+<summary>Команды B2B — сотрудники организаций</summary>
+<p class="muted">
+  <b>Организация</b> — обычный пользователь, которому подключён <b>B2B-тариф</b> (у тарифа есть лимит сотрудников).
+  <b>Сотрудник</b> — отдельный логин/пароль; он входит в кабинет и видит камеры организации согласно роли:
+  охранник — только лайв; менеджер — лайв и архив; бухгалтер — без камер; админ организации — всё.
+  Подписку платит организация; у сотрудника в кабинете нет платежей и тарифов.
+</p>
 {% if teams %}
 <div class="tablewrap"><table><tr><th>Организация</th><th>Сотрудник</th><th>Роль</th><th></th></tr>
-{% for m in teams %}<tr><td>{{ m.owner.username }}</td><td>{{ m.user.username }}</td><td>{{ m.role }}</td>
-<td><form method="post" action="{{ url_for('admin_team_remove', mid=m.id) }}" style="display:inline" onsubmit="return confirm('Убрать?');"><button class="btn red mini" type="submit">Убрать</button></form></td></tr>{% endfor %}
+{% for m in teams %}<tr><td>{{ m.owner.username }}</td><td>{{ m.user.username }}</td>
+<td>{{ {"viewer": "Охранник", "manager": "Менеджер", "accountant": "Бухгалтер", "admin": "Админ организации"}.get(m.role, m.role) }}</td>
+<td><form method="post" action="{{ url_for('admin_team_remove', mid=m.id) }}" style="display:inline" onsubmit="return confirm('Убрать сотрудника?');"><button class="btn red mini" type="submit">Убрать</button></form></td></tr>{% endfor %}
 </table></div>
-{% else %}<p class="muted">Команд нет.</p>{% endif %}
+{% else %}<p class="muted">Команд пока нет.</p>{% endif %}
 <h2>Добавить сотрудника</h2>
+{% set ns = namespace(hasb2b=false) %}
+{% for u in users if u.tariff and u.tariff.is_b2b %}{% set ns.hasb2b = true %}{% endfor %}
+{% if ns.hasb2b %}
 <form method="post" action="{{ url_for('admin_team_invite') }}" class="formrow">
-<select name="owner_id">{% for u in users %}{% if u.tariff and u.tariff.is_b2b %}<option value="{{ u.id }}">{{ u.username }}</option>{% endif %}{% endfor %}</select>
-<input name="username" placeholder="Логин" required>
-<input name="password" type="password" placeholder="Пароль" required>
+<select name="owner_id">{% for u in users if u.tariff and u.tariff.is_b2b %}<option value="{{ u.id }}">{{ u.username }} — {{ u.tariff.name }} (до {{ u.tariff.max_users }} сотр.)</option>{% endfor %}</select>
+<input name="username" placeholder="Логин сотрудника" required>
+<input name="password" type="password" placeholder="Пароль сотрудника" required>
 <select name="role">{% for code, label in roles %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select>
 <button class="btn" type="submit">Добавить</button></form>
+<p class="muted">Если логин уже существует — пользователь станет сотрудником этой организации (если не состоит в другой команде).
+   Если не существует — будет создан новый пользователь с этими логином и паролем.</p>
+{% else %}
+<p class="muted" style="border:1px dashed var(--line);border-radius:10px;padding:12px;">
+Список организаций пуст, потому что ни одному пользователю ещё не подключён B2B-тариф.<br>
+1) В блоке «Пользователи» выбери пользователя → форма «Тариф» → выбери тариф с бейджем B2B (например «B2B Офис»).<br>
+2) Вернись сюда — организация появится в списке, и можно будет создавать её сотрудников.
+</p>
+{% endif %}
 </details>
 
 <details class="card" id="tariffs">
