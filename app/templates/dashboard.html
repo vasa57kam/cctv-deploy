@@ -1,41 +1,31 @@
 {% extends "base.html" %}
 {% block content %}
 {% if current_user.admin and not session.get("impersonator") %}
-<h1>Камеры (весь пул)</h1>
+<h1>Все камеры</h1>
 {% if cameras %}
 <div class="grid">
   {% for camera in cameras %}
   <div class="cam">
     {% set th = thumbs.get(camera.id) %}
-    {% if th and th.url %}
-    <div class="thumbwrap" style="margin:-12px -12px 10px;">
-      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
-      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
-    </div>
-    {% endif %}
-    <h3>{{ camera.name }}</h3>
-    <p class="muted" style="margin:0 0 8px;">
+    {% if th and th.url %}<div class="thumbwrap"><img src="{{ th.url }}?t={{ range(100000)|random }}"></div>{% endif %}
+    <h3>{{ camera.name }}{% if camera.group_name %} <span class="badge neutral">{{ camera.group_name }}</span>{% endif %}</h3>
+    <p class="muted" style="margin:6px 0 10px;">
       <span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}
-      {% if camera.recording_enabled %}· <span class="badge ok">запись</span>{% else %}· <span class="badge warn">без записи</span>{% endif %}
-      {% if camera.group_name %}· {{ camera.group_name }}{% endif %}
+      {% if camera.recording_enabled %} · <span class="badge ok">запись</span>{% endif %}
     </p>
     <a class="btn" href="{{ url_for('camera_page', camera_id=camera.id) }}">Открыть</a>
   </div>
   {% endfor %}
 </div>
 {% else %}
-<div class="card empty">
-  <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>
-  <p>Камер пока нет. Добавьте первую в админке или найдите потоки парсером.</p>
-</div>
+<div class="card empty"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg><p>Камер пока нет. Добавьте первую в админке.</p></div>
 {% endif %}
 
 {% elif role %}
 <div class="card" id="subscribe">
   <h2>Корпоративный доступ</h2>
-  <p>Организация: <b>{{ owner.username }}</b>.
-     Роль: {{ {"viewer": "Охранник (только лайв)", "manager": "Менеджер (лайв+архив)", "accountant": "Бухгалтер (без камер)", "admin": "Админ организации"}.get(role, role) }}.</p>
-  <p class="muted">Подписку оплачивает организация. Вам доступны камеры ниже.</p>
+  <p>Организация: <b>{{ owner.username }}</b>. Роль: {{ {"viewer": "Охранник", "manager": "Менеджер", "accountant": "Бухгалтер", "admin": "Админ"}.get(role, role) }}.</p>
+  <p class="muted">Подписку оплачивает организация. Ниже — ваши камеры.</p>
 </div>
 <div id="cameras">
 <h1>Мои камеры</h1>
@@ -44,14 +34,9 @@
   {% for item in cam_items %}
   <div class="cam">
     {% set th = thumbs.get(item.camera.id) %}
-    {% if th and th.url %}
-    <div class="thumbwrap" style="margin:-12px -12px 10px;">
-      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
-      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
-    </div>
-    {% endif %}
+    {% if th and th.url %}<div class="thumbwrap"><img src="{{ th.url }}?t={{ range(100000)|random }}"></div>{% endif %}
     <h3>{{ item.camera.name }}</h3>
-    <p class="muted" style="margin:0 0 8px;"><span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}</p>
+    <p class="muted" style="margin:6px 0 10px;"><span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}</p>
     <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
   </div>
   {% endfor %}
@@ -65,34 +50,34 @@
 <div class="card" id="subscribe">
   <h2>Подписка</h2>
   {% if freeze_now %}
-    <p><span class="badge warn">заморожена</span> до {{ freeze_now.freeze_to|rudate }}. Доступ к камерам закрыт, запись архива продолжается.</p>
+    <p><span class="badge warn">заморожена</span> до {{ freeze_now.freeze_to.strftime("%d.%m.%Y") }}. Доступ закрыт, архив пишется.</p>
   {% elif current_user.tariff %}
-    <p>Тариф: <b>{{ current_user.tariff.name }}</b> (камер: {{ current_user.tariff.max_cameras }}, архив: {{ current_user.tariff.archive_days }} дн.)
-       {% if sub_active %}<span class="badge ok">активна</span> до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M:%S") }}
-       {% else %}<span class="badge bad">истекла</span>{% endif %}</p>
-    <form method="post" action="{{ url_for('auto_renew_toggle') }}" style="display:inline">
-      <button class="btn gray" type="submit">{{ "Выключить автопродление" if current_user.auto_renew else "Включить автопродление" }}</button>
+    <p>Тариф: <b>{{ current_user.tariff.name }}</b> · до {{ current_user.subscription_ends_at.strftime("%d.%m.%Y %H:%M") }}
+       {% if sub_active %}<span class="badge ok">активна</span>{% else %}<span class="badge bad">истекла</span>{% endif %}
+       {% if current_user.auto_renew %}<span class="badge ok">автопродление</span>{% endif %}
+    </p>
+    <form method="post" action="{{ url_for('auto_renew_toggle') }}" style="display:inline;margin-top:8px;">
+      <button class="btn ghost" type="submit">{{ "Выключить автопродление" if current_user.auto_renew else "Включить автопродление" }}</button>
     </form>
-    {% if current_user.auto_renew %}<span class="badge ok">автопродление</span>{% endif %}
-  {% else %}<p><span class="badge warn">тариф не подключён</span> выберите тариф в блоке «Тарифы» ниже</p>{% endif %}
-  <p class="muted">Баланс: {{ "%.2f"|format(current_user.balance) }} р.{% if current_user.credit_limit %} Доверительный лимит: {{ "%.2f"|format(current_user.credit_limit) }} р.{% endif %} Активных камер: {{ user_enabled_count }}.</p>
+  {% else %}<p><span class="badge warn">тариф не подключён</span> — выберите тариф в разделе ниже.</p>{% endif %}
+  <p class="muted" style="margin-top:10px;">Баланс: <b>{{ "%.0f"|format(current_user.balance) }} р.</b> · активные камеры: {{ user_enabled_count }}{% if current_user.credit_limit %} · лимит: {{ "%.0f"|format(current_user.credit_limit) }} р.{% endif %}</p>
 </div>
 
 <details class="card" id="topup" open>
 <summary>Пополнить баланс</summary>
 {% if methods %}
 <form method="post" action="{{ url_for('payment_request') }}" class="formrow">
-  <input name="amount" placeholder="Сумма" required>
+  <input name="amount" placeholder="Сумма" required type="number" min="1" style="width:130px;">
   <select name="method" id="topup-method">{% for code, label in methods %}<option value="{{ code }}">{{ label }}</option>{% endfor %}</select>
-  <input name="comment" placeholder="Комментарий / номер перевода" style="flex:1">
-  <button class="btn" type="submit">Создать заявку</button>
+  <input name="comment" placeholder="Комментарий (необязательно)" style="flex:1">
+  <button class="btn" type="submit">Отправить заявку</button>
 </form>
 <p class="muted" id="hint-box" style="white-space:pre-line"></p>
 <script>
 (function () {
   var hints = {
     {% for code, label in methods %}
-    "{{ code }}": {% if code == "transfer" %}{{ transfer_instruction | tojson }}{% elif code == "cash" %}"Оплатите наличными и создайте заявку — администратор подтвердит поступление."{% elif code == "card" %}"Онлайн-оплата картой появится после подключения платёжного шлюза."{% else %}"Укажите реквизиты в комментарии — администратор свяжется для подтверждения."{% endif %},
+    "{{ code }}": {% if code == "transfer" %}{{ transfer_instruction | tojson }}{% elif code == "cash" %}"Оплатите наличными и создайте заявку — админ подтвердит поступление."{% elif code == "card" %}"Онлайн-оплата картой появится позже."{% else %}"Укажите реквизиты в комментарии — админ свяжется для подтверждения."{% endif %},
     {% endfor %}
   };
   var sel = document.getElementById("topup-method");
@@ -101,28 +86,28 @@
   if (sel) { sel.addEventListener("change", upd); upd(); }
 })();
 </script>
-{% else %}<p class="muted">Способы пополнения отключены администратором.</p>{% endif %}
+{% else %}<p class="muted">Способы пополнения отключены.</p>{% endif %}
 {% if my_requests %}
 <div class="tablewrap"><table>
-  <tr><th>ID</th><th>Сумма</th><th>Способ</th><th>Комментарий</th><th>Статус</th><th></th></tr>
+  <tr><th>Сумма</th><th>Способ</th><th>Статус</th><th>Когда</th><th></th></tr>
   {% for item in my_requests %}
-  <tr><td>{{ item.p.id }}</td><td>{{ "%.2f"|format(item.p.amount) }}</td><td>{{ item.label }}</td><td>{{ item.p.comment or "" }}</td>
-  <td>{% if item.p.status == "pending" %}<span class="badge warn">на рассмотрении</span>{% elif item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
-  <td>
-    {% if item.p.status == "pending" %}
-      <form method="post" action="{{ url_for('payment_request_comment', pr_id=item.p.id) }}" class="formrow" style="margin:0;">
-        <input name="comment" value="{{ item.p.comment or '' }}" placeholder="Новый комментарий">
-        <button class="btn gray mini" type="submit">Изменить</button>
-      </form>
-      <form method="post" action="{{ url_for('payment_request_delete', pr_id=item.p.id) }}" style="display:inline" onsubmit="return confirm('Удалить заявку?');">
-        <button class="btn red mini" type="submit">Удалить</button>
-      </form>
-    {% else %}
-      <form method="post" action="{{ url_for('payment_request_hide', pr_id=item.p.id) }}" style="display:inline">
-        <button class="btn gray mini" type="submit">Скрыть</button>
-      </form>
-    {% endif %}
-  </td></tr>
+  <tr>
+    <td>{{ "%.0f"|format(item.p.amount) }} р.</td>
+    <td>{{ item.label }}</td>
+    <td>{% if item.p.status == "pending" %}<span class="badge warn">на рассмотрении</span>{% elif item.p.status == "approved" %}<span class="badge ok">подтверждено</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
+    <td>{{ item.p.created_at|rudate }}</td>
+    <td>
+      {% if item.p.status == "pending" %}
+        <form method="post" action="{{ url_for('payment_request_delete', pr_id=item.p.id) }}" style="display:inline" onsubmit="return confirm('Удалить заявку?');">
+          <button class="btn ghost mini" type="submit">Удалить</button>
+        </form>
+      {% else %}
+        <form method="post" action="{{ url_for('payment_request_hide', pr_id=item.p.id) }}" style="display:inline">
+          <button class="btn ghost mini" type="submit">Скрыть</button>
+        </form>
+      {% endif %}
+    </td>
+  </tr>
   {% endfor %}
 </table></div>
 {% endif %}
@@ -132,80 +117,76 @@
 <details class="card" id="promised" {% if active_debt %}open{% endif %}>
 <summary>Обещанный платёж</summary>
 {% if active_debt %}
-  <p><span class="badge warn">долг</span> К возврату {{ "%.2f"|format(active_debt.repay_amount) }} р. до {{ active_debt.due_at|rudate }}. Списывается автоматически.</p>
-  <form method="post" action="{{ url_for('promised_repay') }}" class="formrow" onsubmit="return confirm('Вернуть долг досрочно?');">
-    <button class="btn gray" type="submit">Вернуть досрочно {{ "%.2f"|format(active_debt.repay_amount) }} р.</button>
+  <p><span class="badge warn">долг</span> К возврату <b>{{ "%.0f"|format(active_debt.repay_amount) }} р.</b> до {{ active_debt.due_at|rudate }}. Списывается автоматически.</p>
+  <form method="post" action="{{ url_for('promised_repay') }}" style="margin-top:10px;" onsubmit="return confirm('Вернуть долг досрочно?');">
+    <button class="btn ghost" type="submit">Вернуть досрочно</button>
   </form>
 {% else %}
-  <p class="muted">Можно получить {{ "%.2f"|format(promised_amount) }} р. сейчас. Вернуть {{ "%.2f"|format(promised_amount * (1 + promised_fee / 100)) }} р. в течение {{ promised_repay_label }}.</p>
-  <form method="post" action="{{ url_for('promised_connect') }}" onsubmit="return confirm('Подключить обещанный платёж?');">
-    <button class="btn" type="submit">Подключить обещанный платёж</button>
+  <p class="muted">Можно получить <b>{{ "%.0f"|format(promised_amount) }} р.</b> сейчас, вернуть {{ "%.0f"|format(promised_amount * (1 + promised_fee / 100)) }} р. в течение {{ promised_repay_label }}.</p>
+  <form method="post" action="{{ url_for('promised_connect') }}" style="margin-top:10px;" onsubmit="return confirm('Подключить обещанный платёж?');">
+    <button class="btn" type="submit">Подключить</button>
   </form>
 {% endif %}
 </details>
 {% endif %}
 
 <details class="card" id="tariffs">
-<summary>Тарифы: подключить / продлить (пакеты со скидкой)</summary>
+<summary>Тарифы</summary>
 <div class="tablewrap"><table>
-  <tr><th>Тариф</th><th>Цена</th><th>Списание</th><th>Камер</th><th>Архив</th><th>Пакет и оплата</th></tr>
+  <tr><th>Тариф</th><th>Цена</th><th>Камер</th><th>Архив</th><th></th></tr>
   {% for opt in tariff_options %}
-  <tr><td>{{ opt.tariff.name }}{% if current_user.tariff_id == opt.tariff.id %} <span class="badge ok">текущий</span>{% endif %}
-      {% if opt.tariff.is_b2b %}<span class="badge warn">B2B</span>{% endif %}</td>
-  <td>{{ "%.2f"|format(opt.tariff.price) }} р.</td><td>{{ opt.label }}</td>
-  <td>{{ opt.tariff.max_cameras }}{% if opt.tariff.is_b2b %} + {{ opt.tariff.max_users }} сотр.{% endif %}</td>
-  <td>{{ opt.tariff.archive_days }} дн.</td>
-  <td><form method="post" action="{{ url_for('tariff_choose') }}" class="formrow" style="margin:0"
-        onsubmit="return confirm('Подключить или продлить тариф?');">
-    <input type="hidden" name="tariff_id" value="{{ opt.tariff.id }}">
-    <select name="bundle_id">
-      <option value="">1 интервал — {{ "%.2f"|format(opt.tariff.price) }} р.</option>
-      {% for b in opt.bundles %}
-      <option value="{{ b.id }}">{{ b.months }} мес −{{ b.discount_percent|int }}% — {{ "%.2f"|format(opt.tariff.price * b.months * (1 - b.discount_percent / 100)) }} р.</option>
-      {% endfor %}
-    </select>
-    <button class="btn" type="submit">{{ "Продлить" if current_user.tariff_id == opt.tariff.id else "Подключить" }}</button>
-  </form></td></tr>
+  <tr>
+    <td>{{ opt.tariff.name }}{% if current_user.tariff_id == opt.tariff.id %} <span class="badge ok">текущий</span>{% endif %}{% if opt.tariff.is_b2b %} <span class="badge warn">B2B</span>{% endif %}</td>
+    <td>{{ "%.0f"|format(opt.tariff.price) }} р.</td>
+    <td>{{ opt.tariff.max_cameras }}{% if opt.tariff.is_b2b %} + {{ opt.tariff.max_users }} сотр.{% endif %}</td>
+    <td>{{ opt.tariff.archive_days }} дн.</td>
+    <td><form method="post" action="{{ url_for('tariff_choose') }}" class="formrow" style="margin:0;gap:6px;" onsubmit="return confirm('Подключить/продлить тариф {{ opt.tariff.name }}?');">
+      <input type="hidden" name="tariff_id" value="{{ opt.tariff.id }}">
+      <select name="bundle_id" style="min-width:180px;">
+        <option value="">1 период — {{ "%.0f"|format(opt.tariff.price) }} р.</option>
+        {% for b in opt.bundles %}
+        <option value="{{ b.id }}">{{ b.months }} мес −{{ b.discount_percent|int }}% — {{ "%.0f"|format(opt.tariff.price * b.months * (1 - b.discount_percent / 100)) }} р.</option>
+        {% endfor %}
+      </select>
+      <button class="btn mini" type="submit">{{ "Продлить" if current_user.tariff_id == opt.tariff.id else "Подключить" }}</button>
+    </form></td>
+  </tr>
   {% endfor %}
 </table></div>
-<p class="muted">Пакет = предоплата за несколько месяцев со скидкой. Если на новом тарифе меньше камер, система попросит выбрать активные.</p>
+<p class="muted">Пакеты на несколько месяцев дешевле. При даунгрейде система попросит выбрать, какие камеры оставить активными.</p>
 </details>
 
 <details class="card" id="freeze">
-<summary>Заморозка подписки (платная)</summary>
+<summary>Заморозка подписки</summary>
 <form method="post" action="{{ url_for('freeze_request') }}" class="formrow">
-  <input name="days" value="7" placeholder="Дней (1–30)" style="width:150px">
+  <input name="days" value="7" placeholder="Дней (1–30)" style="width:140px" type="number" min="1" max="30">
   <button class="btn" type="submit">Запросить заморозку</button>
 </form>
-<p class="muted">Заморозка платная: {{ "%.0f"|format(freeze_price) }} ₽/день (списывается при подтверждении админом).
-   На время заморозки доступ закрыт и интервальные списания стоят на паузе, НО запись архива продолжается —
-   именно за хранение взимается плата. Срок подписки сдвигается на длительность заморозки.</p>
+<p class="muted">Платная: {{ "%.0f"|format(freeze_price) }} р./день. На время заморозки доступ закрыт, архив пишется, срок подписки сдвигается.</p>
 {% if my_freezes %}
 <div class="tablewrap"><table><tr><th>Период</th><th>Цена</th><th>Статус</th></tr>
 {% for f in my_freezes %}
-<tr><td>{{ f.freeze_from|rudate }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
+<tr><td>{{ f.freeze_from.strftime("%d.%m.%Y") }} — {{ f.freeze_to.strftime("%d.%m.%Y") }}</td>
 <td>{{ "%.0f"|format(f.price or 0) }} р.</td>
-<td>{% if f.status == "active" %}<span class="badge ok">действует</span>{% elif f.status == "pending" %}<span class="badge warn">на рассмотрении</span>{% else %}<span class="badge bad">отклонена</span>{% endif %}</td></tr>
+<td>{% if f.status == "active" %}<span class="badge ok">действует</span>{% elif f.status == "pending" %}<span class="badge warn">заявка</span>{% else %}<span class="badge bad">отклонена</span>{% endif %}</td></tr>
 {% endfor %}</table></div>
 {% endif %}
 </details>
 
 <details class="card" id="archive-request">
-<summary>Заказать нарезку фрагмента архива (платно)</summary>
+<summary>Заказать фрагмент архива</summary>
 <form method="post" action="{{ url_for('archive_order') }}" class="formrow">
-  <select name="camera_id">{% for item in cam_items %}<option value="{{ item.camera.id }}">{{ item.camera.name }}</option>{% endfor %}</select>
+  <select name="camera_id" style="min-width:160px;">{% for item in cam_items %}<option value="{{ item.camera.id }}">{{ item.camera.name }}</option>{% endfor %}</select>
   <input type="datetime-local" name="from_dt" required>
   <input type="datetime-local" name="to_dt" required>
   <button class="btn" type="submit">Заказать ({{ "%.0f"|format(archive_price) }} р.)</button>
 </form>
-<p class="muted">До 3 суток за заявку. Смотреть архив целиком можно бесплатно в плеере на странице камеры;
-   нарезка точного фрагмента файлом — платная услуга администратора.</p>
+<p class="muted">Смотреть архив можно бесплатно в плеере на странице камеры. Заказать готовый файл за период — {{ "%.0f"|format(archive_price) }} р., до 3 суток.</p>
 {% if archive_orders %}
-<div class="tablewrap"><table><tr><th>ID</th><th>Камера</th><th>Период</th><th>Цена</th><th>Статус</th><th></th></tr>
+<div class="tablewrap"><table><tr><th>Камера</th><th>Период</th><th>Статус</th><th></th></tr>
 {% for o in archive_orders %}
-<tr><td>{{ o.id }}</td><td>{{ o.camera.name }}</td>
+<tr><td>{{ o.camera.name }}</td>
 <td>{{ o.from_dt|rudate }} — {{ o.to_dt.strftime("%d.%m %H:%M") }}</td>
-<td>{{ "%.0f"|format(o.price) }} р.</td>
 <td>{% if o.status == "approved" %}<span class="badge ok">готово</span>{% elif o.status == "pending" %}<span class="badge warn">в работе</span>{% else %}<span class="badge bad">отклонено</span>{% endif %}</td>
 <td>{% if o.status == "approved" %}<a class="btn mini" href="{{ url_for('archive_order_download', oid=o.id) }}">Скачать</a>{% endif %}</td></tr>
 {% endfor %}</table></div>
@@ -213,20 +194,19 @@
 </details>
 
 <details class="card" id="camera-request">
-<summary>Заказать добавление камеры (по IP)</summary>
+<summary>Запросить добавление камеры</summary>
 <form method="post" action="{{ url_for('camera_request') }}" class="formrow">
-  <input name="ip" placeholder="IP-адрес или хост камеры" required style="flex:1">
-  <input name="login" placeholder="Логин камеры (если знаете)">
-  <input name="password" placeholder="Пароль камеры (если знаете)" type="password">
-  <input name="comment" placeholder="Комментарий: где стоит, модель" style="flex:1">
-  <button class="btn" type="submit">Отправить заявку</button>
+  <input name="ip" placeholder="IP-адрес камеры" required style="flex:1">
+  <input name="login" placeholder="Логин (если знаете)">
+  <input name="password" placeholder="Пароль (если знаете)" type="password">
+  <input name="comment" placeholder="Комментарий" style="flex:1">
+  <button class="btn" type="submit">Отправить</button>
 </form>
-<p class="muted">Администратор просканирует указанный адрес, найдёт поток и подключит камеру к вашему тарифу
-   (если по тарифу есть свободный слот).</p>
+<p class="muted">Если у вас есть IP-камера, которую хотите добавить — оставьте заявку, админ подключит.</p>
 {% if my_cam_requests %}
-<div class="tablewrap"><table><tr><th>ID</th><th>IP</th><th>Комментарий</th><th>Статус</th><th>Когда</th></tr>
+<div class="tablewrap"><table><tr><th>IP</th><th>Статус</th><th>Когда</th></tr>
 {% for r in my_cam_requests %}
-<tr><td>{{ r.id }}</td><td>{{ r.ip }}</td><td>{{ r.comment or "" }}</td>
+<tr><td>{{ r.ip }}</td>
 <td>{% if r.status == "pending" %}<span class="badge warn">в работе</span>{% else %}<span class="badge ok">закрыта</span>{% endif %}</td>
 <td>{{ r.created_at|rudate }}</td></tr>
 {% endfor %}</table></div>
@@ -239,9 +219,9 @@
 {% if team_members %}
 <div class="tablewrap"><table><tr><th>Логин</th><th>Роль</th></tr>
 {% for m in team_members %}
-<tr><td>{{ m.user.username }}</td><td>{{ {"viewer": "Охранник", "manager": "Менеджер", "accountant": "Бухгалтер", "admin": "Админ организации"}.get(m.role, m.role) }}</td></tr>
+<tr><td>{{ m.user.username }}</td><td>{{ {"viewer": "Охранник", "manager": "Менеджер", "accountant": "Бухгалтер", "admin": "Админ"}.get(m.role, m.role) }}</td></tr>
 {% endfor %}</table></div>
-{% else %}<p class="muted">Сотрудников пока нет. Их добавляет администратор по вашей просьбе.</p>{% endif %}
+{% else %}<p class="muted">Сотрудников пока нет. Попросите админа добавить.</p>{% endif %}
 </details>
 {% endif %}
 
@@ -252,38 +232,29 @@
   {% for item in cam_items %}
   <div class="cam">
     {% set th = thumbs.get(item.camera.id) %}
-    {% if th and th.url %}
-    <div class="thumbwrap" style="margin:-12px -12px 10px;">
-      <img src="{{ th.url }}?t={{ range(100000)|random }}" alt="">
-      <span class="playbadge"><svg width="30" height="30" viewBox="0 0 24 24" fill="rgba(255,255,255,.85)"><path d="M8 5v14l11-7z"/></svg></span>
-    </div>
-    {% endif %}
+    {% if th and th.url %}<div class="thumbwrap"><img src="{{ th.url }}?t={{ range(100000)|random }}"></div>{% endif %}
     <h3>{{ item.camera.name }}</h3>
-    <p class="muted" style="margin:0 0 8px;">
+    <p class="muted" style="margin:6px 0 10px;">
       <span class="dot {{ 'on' if th and th.online else 'off' }}"></span>{{ "онлайн" if th and th.online else "офлайн" }}
-      {% if item.enabled %}· <span class="badge ok">работает</span>{% else %}· <span class="badge bad">недоступна по тарифу</span>{% endif %}
-      {% if item.camera.recording_enabled %}· <span class="badge ok">запись</span>{% endif %}
+      {% if item.enabled %}<span class="badge ok">активна</span>{% else %}<span class="badge bad">недоступна</span>{% endif %}
     </p>
+    <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
     {% if item.enabled %}
-      <a class="btn" href="{{ url_for('camera_page', camera_id=item.camera.id) }}">Открыть</a>
-      <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline">
-        <input type="hidden" name="enabled" value="0">
-        <button class="btn gray" type="submit">Отключить</button>
-      </form>
+    <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline;margin-left:6px;">
+      <input type="hidden" name="enabled" value="0">
+      <button class="btn ghost mini" type="submit">Отключить</button>
+    </form>
     {% else %}
-      <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline">
-        <input type="hidden" name="enabled" value="1">
-        <button class="btn gray" type="submit">Включить</button>
-      </form>
+    <form method="post" action="{{ url_for('camera_set_enabled', camera_id=item.camera.id) }}" style="display:inline;margin-left:6px;">
+      <input type="hidden" name="enabled" value="1">
+      <button class="btn ghost mini" type="submit">Включить</button>
+    </form>
     {% endif %}
   </div>
   {% endfor %}
 </div>
 {% else %}
-<div class="card empty">
-  <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path d="M15 10l5-3v10l-5-3"/></svg>
-  <p>Камер пока нет. Попросите администратора выдать доступ или оставьте заявку на добавление камеры по IP.</p>
-</div>
+<div class="card empty"><p>Камер пока нет.</p></div>
 {% endif %}
 </div>
 {% endif %}
