@@ -37,7 +37,7 @@ DEFAULT_SETTINGS = {
     "transfer_instruction": "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). В комментарии укажите дату и последние 4 цифры.",
     "promised_amount": "300", "promised_repay_seconds": "604800", "promised_fee_percent": "10",
     "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
-    "motion_threshold": "0.06",
+    "motion_threshold": "0.06", "motion_grace": "45",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
 
@@ -1121,7 +1121,8 @@ def admin_impersonate(user_id):
 def admin_settings():
     for code, _ in PAY_METHODS: set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
     for k in ("transfer_instruction", "promised_amount", "promised_repay_seconds", "promised_fee_percent",
-              "partner_commission", "archive_order_price", "freeze_price_per_day", "motion_threshold",
+              "partner_commission", "archive_order_price", "freeze_price_per_day",
+              "motion_threshold", "motion_grace",
               "whitelabel_name", "whitelabel_primary", "whitelabel_logo"):
         set_setting(k, request.form.get(k, ""))
     db.session.commit()
