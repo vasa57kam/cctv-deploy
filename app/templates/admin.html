@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v5.0</span></h1>
+<h1>Админка <span class="badge warn">v5.2</span></h1>
 
 <div class="quickstats">
   <a class="qs" href="#analytics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg><div><b>{{ "%.0f"|format(stats.mrr) }} р.</b><span>MRR</span></div></a>
@@ -128,7 +128,8 @@
 
 <details class="card" id="cameras" open>
 <summary>Камеры — {{ cameras|length }}</summary>
-<p class="muted">Режимы записи: непрерывная / по движению (ffmpeg+зона) / ONVIF / SMTP. Хвост тишины — в настройках.</p>
+<p class="muted">Режим записи выбирается списком у каждой камеры и применяется кнопкой ✓ (остаётесь в админке).
+   Хвост тишины и порог движения — в «Настройках».</p>
 <div class="tablewrap"><table><tr><th>Камера</th><th>Статус</th><th>Доступ</th><th>Выдать</th><th>Действия</th></tr>
 {% for cam in cameras %}
 <tr><td>{% set th = thumbs.get(cam.id) %}{% if th and th.url %}<img src="{{ th.url }}?t={{ range(100000)|random }}" style="width:60px;border-radius:6px;vertical-align:middle;margin-right:6px;">{% endif %}{{ cam.name }}{% if cam.group_name %} <span class="badge neutral">{{ cam.group_name }}</span>{% endif %}<br><span class="muted" style="font-size:12px;">{{ cam.rtsp_url }}</span></td>
@@ -137,7 +138,16 @@
 <td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn ghost mini" type="submit">+</button></form></td>
 <td>
 <form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}">{{ "⏹" if cam.recording_enabled else "▶" }}</button></form>
-<form method="post" action="{{ url_for('admin_camera_motion', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="Сменить режим">↻</button></form>
+<form method="post" action="{{ url_for('admin_camera_motion', camera_id=cam.id) }}" style="display:inline" class="formrow" title="Режим записи: выбрать и применить">
+<input type="hidden" name="back" value="admin">
+<select name="mode" style="padding:4px 6px;font-size:12px;border-radius:8px;">
+<option value="continuous" {% if (cam.recording_mode or "continuous") == "continuous" %}selected{% endif %}>непрерывная</option>
+<option value="motion" {% if cam.recording_mode == "motion" %}selected{% endif %}>движение (ffmpeg)</option>
+<option value="onvif" {% if cam.recording_mode == "onvif" %}selected{% endif %}>движение (ONVIF)</option>
+<option value="smtp" {% if cam.recording_mode == "smtp" %}selected{% endif %}>движение (SMTP)</option>
+</select>
+<button class="btn gray mini" type="submit">✓</button>
+</form>
 <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="{{ "Выкл" if cam.active else "Вкл" }}">{{ "⏸" if cam.active else "▶" }}</button></form>
 <a class="btn ghost mini" href="{{ url_for('camera_page', camera_id=cam.id) }}" title="Открыть камеру">→</a>
 <form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить {{ cam.name }}?');"><button class="btn red mini" type="submit" title="Удалить">✕</button></form>
@@ -162,12 +172,12 @@
 <form method="post" action="{{ url_for('admin_user_toggle', user_id=u.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="Блок/Разблок">{{ "⛔" if u.active else "✓" }}</button></form>
 {% if not u.admin %}<form method="post" action="{{ url_for('admin_user_delete', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Удалить {{ u.username }}?');"><button class="btn red mini" type="submit" title="Удалить">✕</button></form>{% endif %}
 </td></tr>
-<tr><td colspan="7" class="muted">
+<tr><td colspan="6" class="muted">
 <form method="post" action="{{ url_for('admin_user_edit', user_id=u.id) }}" class="formrow" style="margin:0;"><input name="username" value="{{ u.username }}" placeholder="Логин"><button class="btn gray mini" type="submit">Переименовать</button></form>
 <form method="post" action="{{ url_for('admin_user_credit', user_id=u.id) }}" class="formrow" style="margin:4px 0 0 0;"><input name="credit_limit" value="{{ u.credit_limit or 0 }}" placeholder="Лимит"><button class="btn gray mini" type="submit">Лимит</button></form>
-<form method="post" id="pass-form-{{ u.id }}" class="formrow" style="margin:4px 0 0 0;" onsubmit="this.action='/admin/user/{{ u.id }}/password'"><input type="password" name="password" placeholder="Новый пароль"><button class="btn gray mini" type="submit">Сменить пароль</button></form>
+<form method="post" class="formrow" style="margin:4px 0 0 0;" onsubmit="this.action='/admin/user/{{ u.id }}/password'"><input type="password" name="password" placeholder="Новый пароль"><button class="btn gray mini" type="submit">Сменить пароль</button></form>
 <form method="post" action="{{ url_for('admin_topup') }}" class="formrow" style="margin:4px 0 0 0;"><input type="hidden" name="user_id" value="{{ u.id }}"><input name="amount" placeholder="+100 / -100" style="width:110px;"><input name="reason" placeholder="Причина" style="flex:1;"><button class="btn gray mini" type="submit">Баланс</button></form>
-<form method="post" id="tariff-form-{{ u.id }}" class="formrow" style="margin:4px 0 0 0;" onsubmit="this.action='/admin/user/{{ u.id }}/tariff'"><select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select><button class="btn gray mini" type="submit">Тариф</button></form>
+<form method="post" class="formrow" style="margin:4px 0 0 0;" onsubmit="this.action='/admin/user/{{ u.id }}/tariff'"><select name="tariff_id">{% for t in tariffs %}<option value="{{ t.id }}">{{ t.name }} — {{ t.price }}</option>{% endfor %}</select><button class="btn gray mini" type="submit">Тариф</button></form>
 </td></tr>
 {% endfor %}
 </table></div>
