@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v4.7</span></h1>
+<h1>Админка <span class="badge warn">v4.8</span></h1>
 
 <details class="card" id="analytics" open>
 <summary>Аналитика</summary>
@@ -102,7 +102,7 @@
 <details class="card" id="cameras" open>
 <summary>Камеры (общий пул) — {{ cameras|length }}</summary>
 <p class="muted">Режимы записи: непрерывная | движение (ffmpeg+зона) | движение (ONVIF-события камеры) | движение (SMTP-письмо камеры, порт 2525, получатель cctv-cam&lt;ID&gt;@local).
-   ONVIF-адрес (хост:порт:creds) задаётся в форме редактирования камеры ниже или на её странице; если пустой — берутся IP и креды из RTSP, порт 80.</p>
+   Событийная запись закрывается после «хвоста досъёмки» (настройка ниже): пока в зоне есть движение — пишем непрерывно, любой новый триггер сбрасывает таймер, поэтому «подошёл → сел → уехал» пишется одним файлом.</p>
 <div class="tablewrap"><table><tr><th>ID</th><th>Название</th><th>Статус</th><th>Доступ выдан</th><th>Выдать доступ</th><th>Действия</th></tr>
 {% for cam in cameras %}
 <tr><td>{{ cam.id }}</td><td>{% set th = thumbs.get(cam.id) %}{% if th and th.url %}<img src="{{ th.url }}?t={{ range(100000)|random }}" style="width:64px;border-radius:6px;vertical-align:middle;margin-right:6px;">{% endif %}{{ cam.name }}{% if cam.group_name %} <span class="badge warn">{{ cam.group_name }}</span>{% endif %}<br><span class="muted">{{ cam.rtsp_url }}</span></td>
@@ -249,9 +249,15 @@
     <label class="muted">Комиссия партнёра по умолч., %: <input name="partner_commission" value="{{ settings['partner_commission'] }}" style="width:90px"></label>
     <label class="muted">Цена нарезки фрагмента, р: <input name="archive_order_price" value="{{ settings['archive_order_price'] }}" style="width:90px"></label>
     <label class="muted">Заморозка, р/день: <input name="freeze_price_per_day" value="{{ settings['freeze_price_per_day'] }}" style="width:90px"></label>
-    <label class="muted">Порог движения (0.02–0.15): <input name="motion_threshold" value="{{ settings['motion_threshold'] }}" style="width:90px"></label>
   </div>
-  <p class="muted">Порог движения применяется к режиму «ffmpeg+зона»: ниже = чувствительнее, выше = только заметное движение.</p>
+  <div class="formrow">
+    <label class="muted">Порог движения (0.02–0.15): <input name="motion_threshold" value="{{ settings['motion_threshold'] }}" style="width:90px"></label>
+    <label class="muted">Хвост досъёмки, сек (10–300): <input name="motion_grace" value="{{ settings['motion_grace'] }}" style="width:90px"></label>
+  </div>
+  <p class="muted">Порог: ниже = чувствительнее (медленные объекты, ползущая машина), выше = меньше ложных срабатываний.
+     Хвост досъёмки: сколько секунд писать после последнего движения в зоне; любое новое движение сбрасывает таймер,
+     поэтому весь эпизод («подошёл → сел → уехал») пишется одним файлом и закрывается только по реальной тишине.
+     Рекомендуемые значения: порог 0.04, хвост 45–60 сек.</p>
   <div class="formrow">
     <input name="whitelabel_name" value="{{ settings['whitelabel_name'] }}" placeholder="Название бренда">
     <input name="whitelabel_primary" value="{{ settings['whitelabel_primary'] }}" placeholder="#цвет" style="width:110px">
