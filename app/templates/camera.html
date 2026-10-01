@@ -13,6 +13,7 @@
       {% if camera.recording_enabled %} · <span class="badge ok">запись: {{ {"continuous": "непрерывная", "motion": "по движению", "onvif": "ONVIF", "smtp": "SMTP"}.get(camera.recording_mode, camera.recording_mode) }}</span>{% else %} · <span class="badge warn">запись выключена</span>{% endif %}
     </p>
   </div>
+  <a class="btn ghost" href="{{ url_for('camera_archive_page', camera_id=camera.id) }}">Архив (отдельная страница)</a>
 </div>
 
 <div class="card playercard" id="playercard">
@@ -41,6 +42,8 @@
     </div>
     <div class="tl" id="tl"></div>
     <div class="tl-hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
+    <p class="muted" style="margin-top:8px;">Точная склейка любого диапазона (поминутно/посекундно) — на отдельной странице архива:
+       <a href="{{ url_for('camera_archive_page', camera_id=camera.id) }}">открыть</a>.</p>
     {% else %}
     <div class="empty">
       <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
@@ -111,7 +114,7 @@
       <button class="btn ghost" type="submit">Применить режим</button>
     </form>
     <p class="muted" style="margin-top:10px;">
-      <b>непрерывная</b> — пишет всегда кусками по 5 минут.<br>
+      <b>непрерывная</b> — пишет всегда кусками; длина куска задаётся в настройках админки («Длина куска записи, сек»).<br>
       <b>по движению (ffmpeg+зона)</b> — детектор на сервере; зона рисуется ниже; чувствительность и хвост тишины — в настройках админки.<br>
       <b>по движению (ONVIF)</b> — события самой камеры (зоны настраиваются в камере; адрес ONVIF — поле ниже).<br>
       <b>по движению (SMTP)</b> — камера шлёт письмо о движении на cctv-cam{{ camera.id }}@local (порт 2525 нашего сервера).<br>
