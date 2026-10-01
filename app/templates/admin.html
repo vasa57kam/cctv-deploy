@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Админка <span class="badge warn">v5.2</span></h1>
+<h1>Админка <span class="badge warn">v5.3</span></h1>
 
 <div class="quickstats">
   <a class="qs" href="#analytics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg><div><b>{{ "%.0f"|format(stats.mrr) }} р.</b><span>MRR</span></div></a>
@@ -129,7 +129,7 @@
 <details class="card" id="cameras" open>
 <summary>Камеры — {{ cameras|length }}</summary>
 <p class="muted">Режим записи выбирается списком у каждой камеры и применяется кнопкой ✓ (остаётесь в админке).
-   Хвост тишины и порог движения — в «Настройках».</p>
+   Хвост тишины, порог движения и длина куска — в «Настройках».</p>
 <div class="tablewrap"><table><tr><th>Камера</th><th>Статус</th><th>Доступ</th><th>Выдать</th><th>Действия</th></tr>
 {% for cam in cameras %}
 <tr><td>{% set th = thumbs.get(cam.id) %}{% if th and th.url %}<img src="{{ th.url }}?t={{ range(100000)|random }}" style="width:60px;border-radius:6px;vertical-align:middle;margin-right:6px;">{% endif %}{{ cam.name }}{% if cam.group_name %} <span class="badge neutral">{{ cam.group_name }}</span>{% endif %}<br><span class="muted" style="font-size:12px;">{{ cam.rtsp_url }}</span></td>
@@ -150,6 +150,7 @@
 </form>
 <form method="post" action="{{ url_for('admin_camera_toggle', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="{{ "Выкл" if cam.active else "Вкл" }}">{{ "⏸" if cam.active else "▶" }}</button></form>
 <a class="btn ghost mini" href="{{ url_for('camera_page', camera_id=cam.id) }}" title="Открыть камеру">→</a>
+<a class="btn ghost mini" href="{{ url_for('camera_archive_page', camera_id=cam.id) }}" title="Страница архива">архив</a>
 <form method="post" action="{{ url_for('admin_camera_delete', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Удалить {{ cam.name }}?');"><button class="btn red mini" type="submit" title="Удалить">✕</button></form>
 </td></tr>
 <tr><td colspan="5" class="muted"><form method="post" action="{{ url_for('admin_camera_edit', camera_id=cam.id) }}" class="formrow" style="margin:0;"><input name="name" value="{{ cam.name }}" placeholder="Название"><input name="group" value="{{ cam.group_name or '' }}" placeholder="Группа"><input name="rtsp_url" value="{{ cam.rtsp_url }}" placeholder="rtsp://… или m3u8" style="flex:1"><input name="onvif_url" value="{{ cam.onvif_url or '' }}" placeholder="ONVIF URL" style="flex:1"><button class="btn gray mini" type="submit">Сохранить</button></form></td></tr>
@@ -310,8 +311,11 @@
   <div class="formrow">
     <label class="muted">Порог движения: <input name="motion_threshold" value="{{ settings['motion_threshold'] }}" style="width:80px"></label>
     <label class="muted">Хвост тишины, сек: <input name="motion_grace" value="{{ settings['motion_grace'] }}" style="width:80px"></label>
+    <label class="muted">Длина куска записи, сек (10–3600): <input name="segment_seconds" value="{{ settings['segment_seconds'] }}" style="width:90px"></label>
   </div>
-  <p class="muted">Порог: ниже = чувствительнее. Хвост: сек тишины после последнего движения до закрытия события.</p>
+  <p class="muted">Порог: ниже = чувствительнее. Хвост: сек тишины после последнего движения до закрытия события.
+     Длина куска: длительность файлов непрерывной записи (по умолч. 300 = 5 мин); применяется воркером за ~5 сек,
+     уже записанные файлы не меняются. Событийная запись (по движению) идёт одним файлом на эпизод и от куска не зависит.</p>
   <div class="formrow">
     <input name="whitelabel_name" value="{{ settings['whitelabel_name'] }}" placeholder="Бренд">
     <input name="whitelabel_primary" value="{{ settings['whitelabel_primary'] }}" placeholder="#цвет" style="width:110px">
