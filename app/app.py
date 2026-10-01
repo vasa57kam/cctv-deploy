@@ -14,10 +14,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 BASE_DIR = Path("/opt/cctv"); STORAGE_DIR = BASE_DIR / "storage"
 LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
 PREVIEW_DIR = STORAGE_DIR / "previews"; EXPORT_DIR = STORAGE_DIR / "exports"
+CUTS_DIR = STORAGE_DIR / "cuts"
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 DAEMON_URL = "http://127.0.0.1:8099/"
 SCAN_STATE_PATH = STORAGE_DIR / "scan_state.json"
-for d in (DB_PATH.parent, LIVE_DIR, ARCHIVE_DIR, PREVIEW_DIR, EXPORT_DIR):
+CUTS_STATE_PATH = STORAGE_DIR / "cuts_state.json"
+for d in (DB_PATH.parent, LIVE_DIR, ARCHIVE_DIR, PREVIEW_DIR, EXPORT_DIR, CUTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -37,7 +39,7 @@ DEFAULT_SETTINGS = {
     "transfer_instruction": "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). В комментарии укажите дату и последние 4 цифры.",
     "promised_amount": "300", "promised_repay_seconds": "604800", "promised_fee_percent": "10",
     "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
-    "motion_threshold": "0.06", "motion_grace": "45",
+    "motion_threshold": "0.06", "motion_grace": "45", "segment_seconds": "300",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
 
@@ -413,6 +415,15 @@ def probe_stream(url, idx):
     except subprocess.TimeoutExpired: return False
     return out.exists() and out.stat().st_size > 0
 
+def probe_dur(p):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", str(p)],
+                           capture_output=True, text=True, timeout=15)
+        return float(r.stdout.strip())
+    except Exception:
+        return 300.0
+
 CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$")
 DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.mp4$")
 
@@ -531,6 +542,81 @@ def run_scan(ip, login, password, try_defaults):
         _write_scan_state(state)
     state["running"] = False
     _write_scan_state(state)
+
+def cuts_state():
+    if CUTS_STATE_PATH.exists():
+        try: return json.loads(CUTS_STATE_PATH.read_text())
+        except Exception: pass
+    return {"jobs": []}
+
+def _update_job(job):
+    st = cuts_state()
+    jobs = [j for j in st.get("jobs", []) if j.get("id") != job.get("id")]
+    jobs.append(job)
+    st["jobs"] = sorted(jobs, key=lambda x: x.get("created", ""), reverse=True)[:100]
+    tmp = CUTS_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False))
+    os.replace(tmp, CUTS_STATE_PATH)
+
+def _hms_to_sec(t):
+    h, m, s = t.split(":")
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+def run_cut(job):
+    cid = job["camera_id"]; day = job["day"]; frm = job["from"]; to = job["to"]; precise = job["precise"]
+    out_dir = CUTS_DIR / f"camera_{cid}"; out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / job["file"]
+    lst = out_dir / f".list_{job['id']}.txt"
+    try:
+        f_sec = _hms_to_sec(frm); t_sec = _hms_to_sec(to)
+        if t_sec <= f_sec:
+            job["status"] = "error"; job["error"] = "конец раньше начала"; _update_job(job); return
+        d = ARCHIVE_DIR / f"camera_{cid}"
+        entries = []
+        dayf = d / f"{day}.mp4"
+        if dayf.exists():
+            entries = [(dayf, 0, probe_dur(dayf))]
+        else:
+            for p in sorted(d.glob(f"{day}_*.mp4"), key=lambda x: x.name):
+                m = re.match(r"^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", p.name)
+                s = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else 0
+                entries.append((p, s, s + probe_dur(p)))
+        cov = [e for e in entries if e[1] < t_sec and e[2] > f_sec]
+        if not cov:
+            job["status"] = "error"; job["error"] = "в диапазоне нет записи"; _update_job(job); return
+        base = cov[0][1]
+        off_from = max(0.0, f_sec - base)
+        dur = min(cov[-1][2], float(t_sec)) - (base + off_from)
+        if dur <= 0:
+            job["status"] = "error"; job["error"] = "пустой диапазон"; _update_job(job); return
+        if len(cov) == 1:
+            src = ["-i", str(cov[0][0])]
+        else:
+            with open(lst, "w") as fh:
+                for e in cov:
+                    fh.write(f"file '{e[0]}'\n")
+            src = ["-f", "concat", "-safe", "0", "-i", str(lst)]
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
+               "-ss", f"{off_from:.3f}", "-t", f"{dur:.3f}"] + src
+        if precise:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        else:
+            cmd += ["-c", "copy"]
+        cmd += ["-an", "-movflags", "+faststart", str(out)]
+        r = subprocess.run(cmd, capture_output=True, timeout=3600)
+        try: lst.unlink()
+        except Exception: pass
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            job["status"] = "done"
+            job["size_mb"] = round(out.stat().st_size / 1048576, 1)
+        else:
+            job["status"] = "error"
+            job["error"] = (r.stderr.decode(errors="ignore")[:200] if r.stderr else "ошибка ffmpeg")
+    except Exception as e:
+        job["status"] = "error"; job["error"] = str(e)[:200]
+        try: lst.unlink()
+        except Exception: pass
+    _update_job(job)
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -869,6 +955,70 @@ def camera_page(camera_id):
         thumb=thumb_state(camera), zone=camera.motion_zone or "",
         is_admin=current_user.admin, team_role=team_role(current_user))
 
+@app.route("/camera/<int:camera_id>/archive")
+@login_required
+def camera_archive_page(camera_id):
+    camera = get_camera_or_403(camera_id)
+    if team_role(current_user) == "viewer": abort(403)
+    days = build_archive_days(camera)
+    days_json = json.dumps([{"day": d["day"], "segments": d["segments"]} for d in days])
+    cuts = [j for j in cuts_state().get("jobs", []) if j.get("camera_id") == camera.id][:30]
+    return render_template("archive.html", camera=camera, days=days, days_json=days_json, cuts=cuts,
+        is_admin=current_user.admin)
+
+@app.route("/camera/<int:camera_id>/cut", methods=["POST"])
+@login_required
+def camera_cut(camera_id):
+    camera = get_camera_or_403(camera_id)
+    if team_role(current_user) == "viewer": abort(403)
+    day = request.form.get("day", "").strip()
+    frm = request.form.get("from", "").strip()
+    to = request.form.get("to", "").strip()
+    precise = request.form.get("precise") == "1"
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day) or not re.match(r"^\d{2}:\d{2}:\d{2}$", frm) or not re.match(r"^\d{2}:\d{2}:\d{2}$", to):
+        flash("Формат: день ГГГГ-ММ-ДД, время ЧЧ:ММ:СС."); return redirect(url_for("camera_archive_page", camera_id=camera.id))
+    job = {"id": f"{camera.id}_{day}_{frm.replace(':', '')}_{to.replace(':', '')}_{int(time.time())}",
+           "camera_id": camera.id, "day": day, "from": frm, "to": to, "precise": precise,
+           "status": "running",
+           "file": f"{day}_{frm.replace(':', '.')}-{to.replace(':', '.')}.mp4",
+           "created": datetime.utcnow().isoformat()}
+    _update_job(job)
+    threading.Thread(target=run_cut, args=(job,), daemon=True).start()
+    audit(current_user, "cut_start", f"{camera.name} {day} {frm}-{to}")
+    flash("Склейка диапазона запущена в фоне — статус в блоке «Мои склейки».")
+    return redirect(url_for("camera_archive_page", camera_id=camera.id))
+
+@app.route("/camera/<int:camera_id>/cuts/status")
+@login_required
+def camera_cuts_status(camera_id):
+    camera = get_camera_or_403(camera_id)
+    return jsonify([j for j in cuts_state().get("jobs", []) if j.get("camera_id") == camera.id][:30])
+
+@app.route("/camera/<int:camera_id>/cut/delete", methods=["POST"])
+@admin_required
+def camera_cut_delete(camera_id):
+    job_id = request.form.get("job_id", "")
+    st = cuts_state()
+    job = next((j for j in st.get("jobs", []) if j.get("id") == job_id), None)
+    if job:
+        p = CUTS_DIR / f"camera_{camera_id}" / job.get("file", "")
+        if p.exists():
+            try: p.unlink()
+            except Exception: pass
+        st["jobs"] = [j for j in st["jobs"] if j.get("id") != job_id]
+        tmp = CUTS_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False))
+        os.replace(tmp, CUTS_STATE_PATH)
+        flash("Склейка удалена.")
+    return redirect(url_for("camera_archive_page", camera_id=camera_id))
+
+@app.route("/cuts/<int:camera_id>/<path:filename>")
+@login_required
+def cuts_file(camera_id, filename):
+    camera = get_camera_or_403(camera_id)
+    if team_role(current_user) == "viewer": abort(403)
+    return send_from_directory(str(CUTS_DIR / f"camera_{camera.id}"), filename, conditional=True)
+
 @app.route("/admin/camera/<int:camera_id>/onvif", methods=["POST"])
 @admin_required
 def admin_camera_onvif(camera_id):
@@ -1125,7 +1275,7 @@ def admin_settings():
     for code, _ in PAY_METHODS: set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
     for k in ("transfer_instruction", "promised_amount", "promised_repay_seconds", "promised_fee_percent",
               "partner_commission", "archive_order_price", "freeze_price_per_day",
-              "motion_threshold", "motion_grace",
+              "motion_threshold", "motion_grace", "segment_seconds",
               "whitelabel_name", "whitelabel_primary", "whitelabel_logo"):
         set_setting(k, request.form.get(k, ""))
     db.session.commit()
