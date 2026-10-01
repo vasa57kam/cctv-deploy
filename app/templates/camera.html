@@ -23,6 +23,17 @@
     <span class="muted" id="now-playing">режим: лайв</span>
   </div>
   <video id="video" controls autoplay muted></video>
+  <div class="formrow" id="seekpanel" style="margin-top:10px;margin-bottom:0;">
+    <span class="muted" id="curtime" style="min-width:220px;">—</span>
+    <button class="btn ghost mini" type="button" onclick="seekBy(-60)">−1 мин</button>
+    <button class="btn ghost mini" type="button" onclick="seekBy(-10)">−10 с</button>
+    <button class="btn ghost mini" type="button" onclick="seekBy(-1)">−1 с</button>
+    <button class="btn ghost mini" type="button" onclick="seekBy(1)">+1 с</button>
+    <button class="btn ghost mini" type="button" onclick="seekBy(10)">+10 с</button>
+    <button class="btn ghost mini" type="button" onclick="seekBy(60)">+1 мин</button>
+    <input type="text" id="jump" placeholder="ЧЧ:ММ:СС" style="width:110px;">
+    <button class="btn ghost mini" type="button" onclick="jumpTo()">К времени</button>
+  </div>
   <p class="muted" id="player-status" style="margin:6px 0 0;"></p>
 </div>
 <button class="btn ghost" id="gotoPlayer" type="button">↑ Плеер</button>
@@ -38,7 +49,7 @@
     {% if days %}
     <div class="formrow">
       <select id="day-sel" style="min-width:160px;">{% for d in days %}<option value="{{ d.day }}">{{ d.day }}</option>{% endfor %}</select>
-      <span class="muted">зелёное = есть запись; клик по отрезку = просмотр</span>
+      <span class="muted">зелёное = есть запись; клик по отрезку = просмотр с этого момента</span>
     </div>
     <div class="tl" id="tl"></div>
     <div class="tl-hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
@@ -54,7 +65,7 @@
 
   <div class="card">
     <h2>Файлы архива</h2>
-    <p class="muted">«Смотреть» — включает фрагмент в плеере выше (страница не прыгает). «Скачать» — файлом.</p>
+    <p class="muted">«Смотреть» — включает фрагмент в плеере выше. Точная перемотка — панель под плеером (кнопки секунд/минут и поле «К времени»).</p>
     {% if days %}
       {% for d in days %}
       <details class="card" {% if loop.first %}open{% endif %} style="background:var(--card2);box-shadow:none;">
@@ -75,7 +86,7 @@
             <td>{{ d.glued.time_start[:5] }}–{{ d.glued.time_end[:5] }}</td>
             <td>{{ d.glued.size_mb }} МБ</td>
             <td>
-              <button class="btn gray mini" type="button" onclick="playArchive(ARCH_BASE + '{{ d.glued.name }}', 0, '{{ d.glued.name }}')">Смотреть</button>
+              <button class="btn gray mini" type="button" onclick="playArchive(ARCH_BASE + '{{ d.glued.name }}', 0, '{{ d.glued.name }}', 0)">Смотреть</button>
               <a class="btn ghost mini" href="{{ url_for('archive_download', camera_id=camera.id, filename=d.glued.name) }}">Скачать</a>
             </td>
           </tr>
@@ -85,7 +96,7 @@
             <td>{{ rec.time_start[:5] }}–{{ rec.time_end[:5] }}</td>
             <td>{{ rec.size_mb }} МБ</td>
             <td>
-              <button class="btn gray mini" type="button" onclick="playArchive(ARCH_BASE + '{{ rec.name }}', 0, '{{ rec.name }}')">Смотреть</button>
+              <button class="btn gray mini" type="button" onclick="playArchive(ARCH_BASE + '{{ rec.name }}', 0, '{{ rec.name }}', {{ rec.s }})">Смотреть</button>
               {% if rec.ready %}<a class="btn ghost mini" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
             </td>
           </tr>
@@ -114,7 +125,7 @@
       <button class="btn ghost" type="submit">Применить режим</button>
     </form>
     <p class="muted" style="margin-top:10px;">
-      <b>непрерывная</b> — пишет всегда кусками; длина куска задаётся в настройках админки («Длина куска записи, сек»).<br>
+      <b>непрерывная</b> — пишет всегда кусками; длина куска задаётся в настройках админки.<br>
       <b>по движению (ffmpeg+зона)</b> — детектор на сервере; зона рисуется ниже; чувствительность и хвост тишины — в настройках админки.<br>
       <b>по движению (ONVIF)</b> — события самой камеры (зоны настраиваются в камере; адрес ONVIF — поле ниже).<br>
       <b>по движению (SMTP)</b> — камера шлёт письмо о движении на cctv-cam{{ camera.id }}@local (порт 2525 нашего сервера).<br>
@@ -161,8 +172,33 @@ const playerCard = document.getElementById("playercard");
 const gotoBtn = document.getElementById("gotoPlayer");
 const collapseBtn = document.getElementById("btn-collapse");
 const liveSrc = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
-let hls = null, pendingSeek = 0;
+let hls = null, pendingSeek = 0, curBase = 0, isLive = true;
 function fmt(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");}
+function fmtHMS(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(x).padStart(2,"0");}
+function parseHMS(v){const m=String(v).match(/^(\d{1,2}):(\d{2}):(\d{2})$/);return m?(+m[1])*3600+(+m[2])*60+(+m[3]):0;}
+video.addEventListener("timeupdate", function(){
+  const el=document.getElementById("curtime");
+  if(!el) return;
+  if(isLive){ el.textContent="прямой эфир — перемотка недоступна"; return; }
+  if(video.duration && isFinite(video.duration)){
+    el.textContent="на экране: "+fmtHMS(curBase+video.currentTime)+" · в файле: "+fmtHMS(video.currentTime)+" / "+fmtHMS(video.duration);
+  } else { el.textContent="в файле: "+fmtHMS(video.currentTime); }
+});
+function seekBy(d){
+  if(isLive){ toast("Прямой эфир — перемотка недоступна"); return; }
+  if(!video.src) return;
+  const max=(isFinite(video.duration)?video.duration:1e9)-0.05;
+  video.currentTime=Math.max(0,Math.min(max,video.currentTime+d));
+}
+function jumpTo(){
+  if(isLive){ toast("Прямой эфир — перемотка недоступна"); return; }
+  const v=document.getElementById("jump").value.trim();
+  if(!/^\d{1,2}:\d{2}:\d{2}$/.test(v)){ toast("Формат времени: ЧЧ:ММ:СС"); return; }
+  const T=parseHMS(v); const rel=T-curBase;
+  const max=isFinite(video.duration)?video.duration:1e9;
+  if(rel<0||rel>max){ toast("Время "+v+" вне текущего файла ("+fmtHMS(curBase)+"–"+fmtHMS(curBase+(isFinite(video.duration)?video.duration:0))+")"); return; }
+  video.currentTime=rel; video.play().catch(function(){});
+}
 function updateGoto(){
   const r = playerCard.getBoundingClientRect();
   const hidden = (video.style.display === "none");
@@ -192,6 +228,7 @@ function playLive(){
   if (hls) { hls.destroy(); hls = null; }
   video.removeAttribute("src");
   statusEl.textContent = "";
+  isLive = true; curBase = 0;
   if (window.Hls && Hls.isSupported()) {
     hls = new Hls();
     hls.loadSource(liveSrc); hls.attachMedia(video);
@@ -201,9 +238,11 @@ function playLive(){
   markSeg(null);
   if (video.style.display !== "none") video.play().catch(function(){});
 }
-function playArchive(url, seek, file){
+function playArchive(url, seek, file, base){
   if (hls) { hls.destroy(); hls = null; }
   pendingSeek = seek || 0;
+  curBase = base || 0;
+  isLive = false;
   statusEl.textContent = "";
   if (video.style.display === "none") {
     video.style.display = "";
@@ -215,9 +254,9 @@ function playArchive(url, seek, file){
     if (pendingSeek) video.currentTime = pendingSeek;
     video.play().catch(function(){});
   });
-  nowEl.textContent = "архив: " + (file || "") + (pendingSeek ? " с " + fmt(pendingSeek) : "");
+  nowEl.textContent = "архив: " + (file || "") + (pendingSeek ? " с " + fmtHMS(curBase + pendingSeek) : "");
   markSeg(file || null);
-  toast("Воспроизведение: " + (file || "фрагмент") + (pendingSeek ? " с " + fmt(pendingSeek) : ""));
+  toast("Воспроизведение: " + (file || "фрагмент"));
   updateGoto();
 }
 const tl = document.getElementById("tl");
@@ -252,8 +291,8 @@ if (tl && sel) {
     const d = DAYS.find(x => x.day === sel.value);
     if (!d) return;
     const sg = d.segments.find(x => T >= x.s && T < x.e);
-    if (!sg) { toast("На " + fmt(T) + " записи нет."); return; }
-    playArchive(ARCH_BASE + sg.file, sg.glued ? T : T - sg.s, sg.file);
+    if (!sg) { toast("На " + fmtHMS(T) + " записи нет."); return; }
+    playArchive(ARCH_BASE + sg.file, sg.glued ? T : T - sg.s, sg.file, sg.glued ? 0 : sg.s);
   });
   renderTL();
 }
