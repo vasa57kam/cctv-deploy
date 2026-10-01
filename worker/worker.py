@@ -6,10 +6,11 @@ from pathlib import Path
 BASE_DIR = Path("/opt/cctv"); DB_PATH = BASE_DIR / "app" / "cctv.db"
 ARCHIVE_DIR = BASE_DIR / "storage" / "archive"; LIVE_DIR = BASE_DIR / "storage" / "live"
 LOG_DIR = BASE_DIR / "storage" / "logs"; PREVIEW_DIR = BASE_DIR / "storage" / "previews"
+GRACE_SECONDS = 10
 SMTP_PORT = 2525
 procs = {}; configs = {}; live_logs = {}
 detectors = {}; det_frames = {}; recorders = {}; rec_logs = {}
-last_motion = {}; rec_started = {}; onvif_threads = {}
+last_motion = {}; onvif_threads = {}
 running = True; loops = 0
 
 def handle_signal(signum, frame):
@@ -27,7 +28,7 @@ def mlog(cid, msg):
         pass
 
 def get_settings():
-    s = {"motion_threshold": "0.06", "motion_grace": "45"}
+    s = {"motion_threshold": "0.06", "motion_grace": "45", "segment_seconds": "300"}
     try:
         conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
         for row in conn.execute("SELECT key, value FROM setting").fetchall():
@@ -76,12 +77,17 @@ def onvif_params(cam):
     return host, port, user, pw
 
 def camera_config(cam, settings):
+    try:
+        seg = max(10, min(3600, int(settings.get("segment_seconds", "300"))))
+    except ValueError:
+        seg = 300
     return (cam["rtsp_url"], bool(cam["recording_enabled"]),
             cam.get("recording_mode") or "continuous",
             cam.get("motion_zone") or "",
             settings.get("motion_threshold", "0.06"),
             cam.get("onvif_url") or "",
-            settings.get("motion_grace", "45"))
+            settings.get("motion_grace", "45"),
+            seg)
 
 def onvif_loop(cid, host, port, user, pw, evt):
     try:
@@ -152,7 +158,7 @@ def log_handle(cid):
         p.unlink()
     return open(p, "ab", buffering=0)
 
-def start_live(cam, with_segments):
+def start_live(cam, with_segments, seg):
     cid = cam["id"]
     live_dir = LIVE_DIR / f"camera_{cid}"; archive_dir = ARCHIVE_DIR / f"camera_{cid}"
     live_dir.mkdir(parents=True, exist_ok=True); archive_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +166,7 @@ def start_live(cam, with_segments):
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]]
     if with_segments:
         cmd += ["-map", "0:v", "-c:v", "copy", "-an",
-                "-f", "segment", "-segment_time", "300", "-reset_timestamps", "1", "-strftime", "1",
+                "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1", "-strftime", "1",
                 str(archive_dir / "%Y-%m-%d_%H-%M-%S.mp4")]
     cmd += ["-map", "0:v", "-c:v", "copy", "-an", "-f", "hls",
             "-hls_time", "6", "-hls_list_size", "6", "-hls_flags", "delete_segments",
@@ -190,7 +196,7 @@ def zone_vf_prefix(zone):
         return ""
 
 def start_detector(cam, cfg):
-    rtsp, rec, mode, zone, thr, onvif_url, grace = cfg
+    rtsp, rec, mode, zone, thr, onvif_url, grace, seg = cfg
     vf = zone_vf_prefix(zone) + f"select='gt(scene,{thr})'"
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
            "-rtsp_transport", "tcp", "-i", rtsp,
@@ -229,7 +235,6 @@ def start_recorder(cam):
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
            "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
            "-map", "0:v", "-c:v", "copy", "-an", "-movflags", "+faststart", str(out)]
-    rec_started[cid] = time.time()
     mlog(cid, f"recorder start -> {out.name}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
@@ -241,9 +246,7 @@ def stop_recorder(cid, reason=""):
         except Exception:
             try: r.kill()
             except Exception: pass
-        dur = int(time.time() - rec_started.get(cid, time.time()))
-        mlog(cid, f"recorder stop (длительность события ~{dur} с) {reason}")
-    rec_started.pop(cid, None)
+        mlog(cid, f"recorder stop {reason}")
     lf = rec_logs.pop(cid, None)
     if lf is not None:
         try: lf.close()
@@ -296,14 +299,14 @@ while running:
     for cam in cameras:
         cid = cam["id"]; active_ids.add(cid)
         cfg = camera_config(cam, settings)
-        rtsp, rec, mode, zone, thr, onvif_url, grace_s = cfg
+        rtsp, rec, mode, zone, thr, onvif_url, grace_s, seg = cfg
         proc = procs.get(cid)
         if proc is not None and configs.get(cid) != cfg:
             stop_live(cid); proc = None
         if proc is None or proc.poll() is not None:
             if proc is not None:
                 proc.wait(); stop_live(cid)
-            procs[cid] = start_live(cam, rec and mode == "continuous")
+            procs[cid] = start_live(cam, rec and mode == "continuous", seg)
             configs[cid] = cfg
         if mode == "onvif":
             if rec: ensure_onvif(cid, cam)
@@ -324,14 +327,14 @@ while running:
             gate = silent_for < grace
             r = recorders.get(cid)
             if r is not None and r.poll() is not None:
-                stop_recorder(cid, "(поток сам оборвался)"); r = None
+                stop_recorder(cid, "(поток оборвался)"); r = None
             if gate and r is None and last_motion.get(cid):
                 recorders[cid] = start_recorder(cam)
             elif not gate and r is not None:
-                stop_recorder(cid, f"(тишина в зоне {int(silent_for)} с >= хвоста {int(grace)} с)")
+                stop_recorder(cid, f"(тишина {int(silent_for)} с >= хвоста {int(grace)} с)")
         else:
             if recorders.get(cid):
-                stop_recorder(cid, "(режим сменился)")
+                stop_recorder(cid, "(смена режима)")
             if mode == "continuous":
                 last_motion.pop(cid, None)
     for cid in list(procs.keys()):
