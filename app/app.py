@@ -427,6 +427,18 @@ def probe_dur(p):
 CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$")
 DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.mp4$")
 
+def _chunk_start_sec(name):
+    m = re.match(r"^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", name)
+    if not m: return 0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+def _load_day_map(d, day):
+    p = d / f"{day}.mp4.json"
+    if p.exists():
+        try: return json.loads(p.read_text())
+        except Exception: pass
+    return None
+
 def build_archive_days(camera):
     camera_dir = ARCHIVE_DIR / f"camera_{camera.id}"
     if not camera_dir.exists(): return []
@@ -447,21 +459,17 @@ def build_archive_days(camera):
         elif m_chunk:
             day = m_chunk.group(1)
             d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
-            h, mi, s = m_chunk.group(2), m_chunk.group(3), m_chunk.group(4)
-            s_sec = int(h) * 3600 + int(mi) * 60 + int(s)
+            s_sec = _chunk_start_sec(p.name)
             e_sec = min(86400, s_sec + 300)
-            start = f"{h}:{mi}:{s}"
-            end = (datetime.strptime(f"{day} {h}:{mi}:{s}", "%Y-%m-%d %H:%M:%S") + timedelta(minutes=5)).strftime("%H:%M:%S")
             d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
                 "ready": (now_ts - st.st_mtime) > 60,
-                "time_start": start, "time_end": end, "kind": "кусок 5 мин", "s": s_sec, "e": e_sec})
+                "time_start": time.strftime("%H:%M:%S", time.gmtime(s_sec)),
+                "time_end": time.strftime("%H:%M:%S", time.gmtime(e_sec)),
+                "kind": "кусок записи", "s": s_sec, "e": e_sec})
         else:
             day = p.name[:10]
             d = days.setdefault(day, {"day": day, "glued": None, "chunks": []})
-            hm = re.match(r"^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", p.name)
-            s_sec = 0
-            if hm:
-                s_sec = int(hm.group(1)) * 3600 + int(hm.group(2)) * 60 + int(hm.group(3))
+            s_sec = _chunk_start_sec(p.name)
             d["chunks"].append({"name": p.name, "size_mb": round(st.st_size / 1048576, 1),
                 "ready": (now_ts - st.st_mtime) > 60,
                 "time_start": time.strftime("%H:%M:%S", time.gmtime(s_sec)),
@@ -472,13 +480,20 @@ def build_archive_days(camera):
         d = days[day]
         d["chunks"].sort(key=lambda x: x["name"])
         if d["glued"]:
-            d["ranges"] = "00:00–23:59 (весь день одним файлом)"
+            mmap = _load_day_map(camera_dir, day)
+            d["map"] = mmap
+            if mmap:
+                d["segments"] = [{"s": m["a"], "e": m["b"], "file": d["glued"]["name"], "glued": True, "o": m["o"]} for m in mmap]
+                d["ranges"] = ", ".join(f"{time.strftime('%H:%M', time.gmtime(m['a']))}–{time.strftime('%H:%M', time.gmtime(m['b']))}" for m in mmap)
+            else:
+                d["segments"] = [{"s": 0, "e": 86400, "file": d["glued"]["name"], "glued": True, "o": 0}]
+                d["ranges"] = "00:00–23:59 (весь день одним файлом)"
             d["total_mb"] = d["glued"]["size_mb"]
-            d["segments"] = [{"s": 0, "e": 86400, "file": d["glued"]["name"], "glued": True}]
         else:
+            d["map"] = None
             d["ranges"] = ", ".join(f"{c['time_start'][:5]}–{c['time_end'][:5]}" for c in d["chunks"]) or "нет данных"
             d["total_mb"] = round(sum(c["size_mb"] for c in d["chunks"]), 1)
-            d["segments"] = [{"s": c["s"], "e": c["e"], "file": c["name"], "glued": False} for c in d["chunks"]]
+            d["segments"] = [{"s": c["s"], "e": c["e"], "file": c["name"], "glued": False, "o": 0} for c in d["chunks"]]
         d["can_glue"] = (day < today) and (d["glued"] is None) and len(d["chunks"]) >= 1
         d["chunks"].sort(key=lambda x: x["name"], reverse=True)
         result.append(d)
@@ -562,60 +577,100 @@ def _hms_to_sec(t):
     h, m, s = t.split(":")
     return int(h) * 3600 + int(m) * 60 + int(s)
 
+def run_glue(cid, day):
+    d = ARCHIVE_DIR / f"camera_{cid}"
+    chunks = sorted(d.glob(f"{day}_*.mp4"), key=lambda p: p.name)
+    out = d / f"{day}.mp4"
+    if not chunks or out.exists(): return
+    entries = []
+    for p in chunks:
+        s = _chunk_start_sec(p.name)
+        entries.append((p, s, s + probe_dur(p)))
+    lst = d / f".concat_{day}.txt"
+    with open(lst, "w") as fh:
+        for e in entries:
+            fh.write(f"file '{e[0]}'\n")
+    r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                        "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out)],
+                       capture_output=True, timeout=7200)
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+        off = 0.0; mmap = []
+        for (p, s, e) in entries:
+            mmap.append({"a": s, "b": e, "o": off}); off += (e - s)
+        (d / f"{day}.mp4.json").write_text(json.dumps(mmap))
+        for (p, s, e) in entries:
+            try: p.unlink()
+            except Exception: pass
+    try: lst.unlink()
+    except Exception: pass
+
 def run_cut(job):
-    cid = job["camera_id"]; day = job["day"]; frm = job["from"]; to = job["to"]; precise = job["precise"]
+    cid = job["camera_id"]; day = job["day"]; precise = job["precise"]
     out_dir = CUTS_DIR / f"camera_{cid}"; out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / job["file"]
-    lst = out_dir / f".list_{job['id']}.txt"
     try:
-        f_sec = _hms_to_sec(frm); t_sec = _hms_to_sec(to)
+        f_sec = _hms_to_sec(job["from"]); t_sec = _hms_to_sec(job["to"])
         if t_sec <= f_sec:
             job["status"] = "error"; job["error"] = "конец раньше начала"; _update_job(job); return
         d = ARCHIVE_DIR / f"camera_{cid}"
-        entries = []
+        sources = []
         dayf = d / f"{day}.mp4"
         if dayf.exists():
-            entries = [(dayf, 0, probe_dur(dayf))]
+            mmap = _load_day_map(d, day)
+            if mmap:
+                for m in mmap:
+                    sources.append((dayf, m["a"], m["b"], m["o"]))
+            else:
+                sources.append((dayf, 0, probe_dur(dayf), 0))
         else:
             for p in sorted(d.glob(f"{day}_*.mp4"), key=lambda x: x.name):
-                m = re.match(r"^\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})", p.name)
-                s = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else 0
-                entries.append((p, s, s + probe_dur(p)))
-        cov = [e for e in entries if e[1] < t_sec and e[2] > f_sec]
-        if not cov:
+                s = _chunk_start_sec(p.name)
+                sources.append((p, s, s + probe_dur(p), 0))
+        pieces = []
+        for (path, a0, b0, o0) in sources:
+            a = max(a0, f_sec); b = min(b0, t_sec)
+            if b <= a: continue
+            pieces.append((path, o0 + (a - a0), b - a, a))
+        if not pieces:
             job["status"] = "error"; job["error"] = "в диапазоне нет записи"; _update_job(job); return
-        base = cov[0][1]
-        off_from = max(0.0, f_sec - base)
-        dur = min(cov[-1][2], float(t_sec)) - (base + off_from)
-        if dur <= 0:
-            job["status"] = "error"; job["error"] = "пустой диапазон"; _update_job(job); return
-        if len(cov) == 1:
-            src = ["-i", str(cov[0][0])]
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"] if precise else ["-c", "copy"]
+        mmap_out = []
+        if len(pieces) == 1:
+            path, ss, dur, a = pieces[0]
+            cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", str(path)] + enc + ["-an", "-movflags", "+faststart", str(out)]
+            r = subprocess.run(cmd, capture_output=True, timeout=7200)
+            if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+                job["status"] = "error"; job["error"] = (r.stderr.decode(errors="ignore")[:200] if r.stderr else "ошибка ffmpeg"); _update_job(job); return
+            mmap_out = [{"a": a, "b": a + dur, "o": 0.0}]
         else:
+            temps = []; off = 0.0
+            for i, (path, ss, dur, a) in enumerate(pieces):
+                tmp = out_dir / f".tmp_{job['id']}_{i}.mp4"
+                cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", str(path)] + enc + ["-an", str(tmp)]
+                r = subprocess.run(cmd, capture_output=True, timeout=7200)
+                if r.returncode != 0 or not tmp.exists():
+                    for t in temps:
+                        try: t.unlink()
+                        except Exception: pass
+                    job["status"] = "error"; job["error"] = "не удалось подготовить фрагменты"; _update_job(job); return
+                temps.append(tmp); mmap_out.append({"a": a, "b": a + dur, "o": off}); off += dur
+            lst = out_dir / f".list_{job['id']}.txt"
             with open(lst, "w") as fh:
-                for e in cov:
-                    fh.write(f"file '{e[0]}'\n")
-            src = ["-f", "concat", "-safe", "0", "-i", str(lst)]
-        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
-               "-ss", f"{off_from:.3f}", "-t", f"{dur:.3f}"] + src
-        if precise:
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
-        else:
-            cmd += ["-c", "copy"]
-        cmd += ["-an", "-movflags", "+faststart", str(out)]
-        r = subprocess.run(cmd, capture_output=True, timeout=3600)
-        try: lst.unlink()
-        except Exception: pass
-        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
-            job["status"] = "done"
-            job["size_mb"] = round(out.stat().st_size / 1048576, 1)
-        else:
-            job["status"] = "error"
-            job["error"] = (r.stderr.decode(errors="ignore")[:200] if r.stderr else "ошибка ffmpeg")
+                for t in temps:
+                    fh.write(f"file '{t}'\n")
+            r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
+                                "-c", "copy", "-movflags", "+faststart", str(out)], capture_output=True, timeout=7200)
+            for t in temps:
+                try: t.unlink()
+                except Exception: pass
+            try: lst.unlink()
+            except Exception: pass
+            if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+                job["status"] = "error"; job["error"] = "не удалось склеить фрагменты"; _update_job(job); return
+        job["status"] = "done"; job["map"] = mmap_out; job["base"] = mmap_out[0]["a"]
+        job["size_mb"] = round(out.stat().st_size / 1048576, 1)
     except Exception as e:
         job["status"] = "error"; job["error"] = str(e)[:200]
-        try: lst.unlink()
-        except Exception: pass
     _update_job(job)
 
 @app.route("/login", methods=["GET", "POST"])
@@ -950,7 +1005,7 @@ def camera_page(camera_id):
     camera = get_camera_or_403(camera_id)
     audit(current_user, "camera_view", camera.name)
     days = build_archive_days(camera)
-    days_json = json.dumps([{"day": d["day"], "segments": d["segments"]} for d in days])
+    days_json = json.dumps([{"day": d["day"], "segments": d["segments"], "map": d.get("map")} for d in days])
     return render_template("camera.html", camera=camera, days=days, days_json=days_json,
         thumb=thumb_state(camera), zone=camera.motion_zone or "",
         is_admin=current_user.admin, team_role=team_role(current_user))
@@ -961,7 +1016,7 @@ def camera_archive_page(camera_id):
     camera = get_camera_or_403(camera_id)
     if team_role(current_user) == "viewer": abort(403)
     days = build_archive_days(camera)
-    days_json = json.dumps([{"day": d["day"], "segments": d["segments"]} for d in days])
+    days_json = json.dumps([{"day": d["day"], "segments": d["segments"], "map": d.get("map")} for d in days])
     cuts = [j for j in cuts_state().get("jobs", []) if j.get("camera_id") == camera.id][:30]
     return render_template("archive.html", camera=camera, days=days, days_json=days_json, cuts=cuts,
         is_admin=current_user.admin)
@@ -1083,19 +1138,11 @@ def admin_camera_glue(camera_id, day):
     chunks = sorted([p for p in d.glob(f"{day}_*.mp4")]) if d.exists() else []
     if not chunks:
         flash("За этот день кусков нет."); return redirect(url_for("camera_page", camera_id=camera.id))
-    out = d / f"{day}.mp4"
-    if out.exists():
+    if (d / f"{day}.mp4").exists():
         flash("День уже склеен."); return redirect(url_for("camera_page", camera_id=camera.id))
-    lst = d / f".concat_{day}.txt"
-    with open(lst, "w") as fh:
-        for f in chunks:
-            fh.write(f"file '{f}'\n")
-    rm_list = " ".join(f"'{f}'" for f in chunks)
-    cmd = (f"ffmpeg -nostdin -loglevel error -f concat -safe 0 -i '{lst}' -c copy "
-           f"-movflags +faststart '{out}' && rm -f {rm_list} '{lst}' || rm -f '{lst}'")
-    subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    threading.Thread(target=run_glue, args=(camera.id, day), daemon=True).start()
     audit(current_user, "glue_day", f"{camera.name} {day}")
-    flash(f"Склейка дня {day} запущена в фоне: получится один файл с перемоткой; куски удалятся после успеха.")
+    flash(f"Склейка дня {day} запущена в фоне: файл + карта времени; куски удалятся после успеха.")
     return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/live/<int:camera_id>/<path:filename>")
