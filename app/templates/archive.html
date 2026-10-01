@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+  <div style="flex:1;min-width:220px;">
+    <h1 style="margin:0 0 6px;">Архив: {{ camera.name }}</h1>
+    <p class="muted" style="margin:0;">
+      <a class="btn ghost mini" href="{{ url_for('camera_page', camera_id=camera.id) }}">← К камере</a>
+      Выбор диапазона — посекундно; склейка идёт в фоне, статус ниже.
+    </p>
+  </div>
+</div>
+
+<div class="card playercard" id="playercard">
+  <div class="formrow" style="margin-bottom:8px;">
+    <span class="muted" id="now-playing">выберите фрагмент ниже</span>
+  </div>
+  <video id="video" controls muted></video>
+  <p class="muted" id="player-status" style="margin:6px 0 0;"></p>
+</div>
+
+<div class="card">
+  <h2>Шкала записи</h2>
+  {% if days %}
+  <div class="formrow">
+    <select id="day-sel" style="min-width:160px;">{% for d in days %}<option value="{{ d.day }}">{{ d.day }}</option>{% endfor %}</select>
+    <span class="muted">клик по зелёному = просмотр с этого момента; клик также ставит время «с» в форму склейки (Shift+клик — «по»)</span>
+  </div>
+  <div class="tl" id="tl"></div>
+  <div class="tl-hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
+  {% else %}
+  <div class="empty"><p>Записей пока нет.</p></div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Склеить диапазон (по желанию, посекундно)</h2>
+  <form method="post" action="{{ url_for('camera_cut', camera_id=camera.id) }}" class="formrow">
+    <select name="day" id="cut-day" style="min-width:150px;">{% for d in days %}<option value="{{ d.day }}">{{ d.day }}</option>{% endfor %}</select>
+    <label class="muted">с <input type="text" id="cut-from" name="from" value="00:00:00" pattern="\d{2}:\d{2}:\d{2}" style="width:110px;"></label>
+    <label class="muted">по <input type="text" id="cut-to" name="to" value="23:59:59" pattern="\d{2}:\d{2}:\d{2}" style="width:110px;"></label>
+    <label class="muted"><input type="checkbox" name="precise" value="1"> точно (перекод)</label>
+    <button class="btn" type="submit">Склеить диапазон</button>
+  </form>
+  <p class="muted">Без галки «точно» — быстрая склейка без перекодирования (границы могут сесть на ближайшие ключевые кадры, ±1–2 сек).
+     С галкой — покадрово точно, но дольше и грузит CPU. Готовый файл появится в «Моих склейках» и хранится в storage/cuts.</p>
+</div>
+
+<div class="card">
+  <h2>Мои склейки</h2>
+  <div class="tablewrap"><table id="cuts-table">
+    <tr><th>Диапазон</th><th>Точность</th><th>Статус</th><th>Размер</th><th></th></tr>
+    {% for j in cuts %}
+    <tr data-job="{{ j.id }}">
+      <td>{{ j.day }} {{ j["from"] }}–{{ j.to }}</td>
+      <td>{{ "точно" if j.precise else "быстро" }}</td>
+      <td>{% if j.status == "done" %}<span class="badge ok">готово</span>{% elif j.status == "running" %}<span class="badge warn">склеивается…</span>{% else %}<span class="badge bad">ошибка: {{ j.get("error", "") }}</span>{% endif %}</td>
+      <td>{{ j.get("size_mb", "") }} МБ</td>
+      <td>
+        {% if j.status == "done" %}
+        <button class="btn gray mini" type="button" onclick="playCut('{{ j.file }}', '{{ j.day }} {{ j["from"] }}–{{ j.to }}')">Смотреть</button>
+        <a class="btn ghost mini" href="{{ url_for('cuts_file', camera_id=camera.id, filename=j.file) }}">Скачать</a>
+        {% endif %}
+        {% if is_admin %}
+        <form method="post" action="{{ url_for('camera_cut_delete', camera_id=camera.id) }}" style="display:inline" onsubmit="return confirm('Удалить склейку?');">
+          <input type="hidden" name="job_id" value="{{ j.id }}">
+          <button class="btn red mini" type="submit">✕</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">Склеек пока нет.</td></tr>
+    {% endfor %}
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>Файлы дней</h2>
+  {% if days %}
+    {% for d in days %}
+    <details class="card" style="background:var(--card2);box-shadow:none;">
+      <summary>
+        <span class="badge ok">{{ d.day }}</span>
+        {{ d.ranges }} · {{ "%.0f"|format(d.total_mb) }} МБ
+        {% if d.glued %}<span class="badge neutral">склейка</span>{% endif %}
+      </summary>
+      {% if is_admin and d.can_glue %}
+      <form method="post" action="{{ url_for('admin_camera_glue', camera_id=camera.id, day=d.day) }}" style="margin:8px 0;">
+        <button class="btn ghost" type="submit" onclick="return confirm('Склеить весь день в один файл?');">Склеить весь день</button>
+      </form>
+      {% endif %}
+      <div class="tablewrap"><table>
+        <tr><th>Время</th><th>Размер</th><th></th></tr>
+        {% if d.glued %}
+        <tr>
+          <td>{{ d.glued.time_start[:5] }}–{{ d.glued.time_end[:5] }}</td>
+          <td>{{ d.glued.size_mb }} МБ</td>
+          <td>
+            <button class="btn gray mini" type="button" onclick="playFile(ARCH_BASE + '{{ d.glued.name }}', 0, '{{ d.glued.name }}')">Смотреть</button>
+            <a class="btn ghost mini" href="{{ url_for('archive_download', camera_id=camera.id, filename=d.glued.name) }}">Скачать</a>
+          </td>
+        </tr>
+        {% endif %}
+        {% for rec in d.chunks %}
+        <tr>
+          <td>{{ rec.time_start[:5] }}–{{ rec.time_end[:5] }}</td>
+          <td>{{ rec.size_mb }} МБ</td>
+          <td>
+            <button class="btn gray mini" type="button" onclick="playFile(ARCH_BASE + '{{ rec.name }}', 0, '{{ rec.name }}')">Смотреть</button>
+            {% if rec.ready %}<a class="btn ghost mini" href="{{ url_for('archive_download', camera_id=camera.id, filename=rec.name) }}">Скачать</a>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table></div>
+    </details>
+    {% endfor %}
+  {% else %}
+  <p class="muted">Файлов нет.</p>
+  {% endif %}
+</div>
+
+<script>
+const ARCH_BASE = "{{ url_for('archive_file', camera_id=camera.id, filename='') }}";
+const CUTS_BASE = "{{ url_for('cuts_file', camera_id=camera.id, filename='') }}";
+const DAYS = {{ days_json | safe }};
+const video = document.getElementById("video");
+const nowEl = document.getElementById("now-playing");
+const playerCard = document.getElementById("playercard");
+let pendingSeek = 0;
+function fmt(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=Math.floor(s%60);return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(ss).padStart(2,"0");}
+function revealPlayer(){
+  const r = playerCard.getBoundingClientRect();
+  if (r.bottom < 0 || r.top > window.innerHeight) playerCard.scrollIntoView({behavior:"smooth", block:"start"});
+}
+function playFile(url, seek, label){
+  pendingSeek = seek || 0;
+  video.src = url;
+  video.addEventListener("loadedmetadata", function onm(){
+    video.removeEventListener("loadedmetadata", onm);
+    if (pendingSeek) video.currentTime = pendingSeek;
+    video.play().catch(function(){});
+  });
+  nowEl.textContent = label || "фрагмент";
+  toast("Воспроизведение: " + (label || "фрагмент"));
+  revealPlayer();
+}
+function playCut(file, label){ playFile(CUTS_BASE + file, 0, label); }
+const tl = document.getElementById("tl");
+const sel = document.getElementById("day-sel");
+function renderTL(){
+  if (!tl) return;
+  tl.innerHTML = "";
+  const d = DAYS.find(x => x.day === sel.value);
+  if (!d) return;
+  d.segments.forEach(s => {
+    const el = document.createElement("div");
+    el.className = "seg";
+    el.style.left = (s.s / 86400 * 100) + "%";
+    el.style.width = Math.max(0.35, (s.e - s.s) / 86400 * 100) + "%";
+    el.title = fmt(s.s) + "–" + fmt(s.e);
+    el.dataset.file = s.file; el.dataset.s = s.s; el.dataset.glued = s.glued ? "1" : "0";
+    tl.appendChild(el);
+  });
+  if (sel.value === new Date().toISOString().slice(0, 10)) {
+    const n = new Date();
+    const sec = n.getUTCHours() * 3600 + n.getUTCMinutes() * 60 + n.getUTCSeconds();
+    const m = document.createElement("div");
+    m.className = "now"; m.style.left = (sec / 86400 * 100) + "%";
+    tl.appendChild(m);
+  }
+}
+if (tl && sel) {
+  sel.addEventListener("change", function(){
+    renderTL();
+    var cd = document.getElementById("cut-day");
+    if (cd) cd.value = sel.value;
+  });
+  tl.addEventListener("click", function (e) {
+    const r = tl.getBoundingClientRect();
+    const T = Math.round((e.clientX - r.left) / r.width * 86400);
+    if (e.shiftKey) {
+      document.getElementById("cut-to").value = fmt(Math.min(86399, T));
+      toast("Конец диапазона: " + fmt(T));
+      return;
+    }
+    document.getElementById("cut-from").value = fmt(T);
+    const d = DAYS.find(x => x.day === sel.value);
+    const sg = d ? d.segments.find(x => T >= x.s && T < x.e) : null;
+    if (!sg) { toast("На " + fmt(T) + " записи нет (время «с» всё равно установлено)."); return; }
+    playFile(ARCH_BASE + sg.file, sg.glued ? T : T - sg.s, sg.file + " с " + fmt(T));
+  });
+  renderTL();
+}
+setInterval(function(){
+  fetch("{{ url_for('camera_cuts_status', camera_id=camera.id) }}")
+    .then(function(r){ return r.json(); })
+    .then(function(jobs){
+      var dirty = false;
+      jobs.forEach(function(j){
+        var row = document.querySelector('tr[data-job="' + j.id + '"]');
+        if (!row) { dirty = true; return; }
+        var st = row.cells[2].innerHTML;
+        var want = j.status === "done" ? "готово" : (j.status === "running" ? "склеивается" : "ошибка");
+        if (st.indexOf(want) === -1) dirty = true;
+      });
+      if (dirty) location.reload();
+    }).catch(function(){});
+}, 5000);
+</script>
+{% endblock %}
