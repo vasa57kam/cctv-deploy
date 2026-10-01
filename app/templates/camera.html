@@ -1,12 +1,5 @@
 {% extends "base.html" %}
 {% block content %}
-<style>
-.tl .tick{position:absolute;top:0;bottom:0;width:1px;background:rgba(255,255,255,.18);pointer-events:none;}
-.tl .ticklbl{position:absolute;top:3px;transform:translateX(4px);font-size:10px;color:#cbd5e1;pointer-events:none;white-space:nowrap;}
-.tl .phead{position:absolute;top:0;bottom:0;width:2px;background:var(--accent);box-shadow:0 0 6px var(--accent);pointer-events:none;}
-.tl.big{height:64px;}
-.tl.big .ticklbl{top:auto;bottom:3px;font-size:11px;}
-</style>
 <div class="card" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
   {% if thumb and thumb.url %}
   <div class="thumbwrap" style="width:150px;flex:0 0 150px;">
@@ -23,40 +16,10 @@
   <a class="btn ghost" href="{{ url_for('camera_archive_page', camera_id=camera.id) }}">Архив (отдельная страница)</a>
 </div>
 
-<div class="card playercard" id="playercard">
-  <div class="formrow" style="margin-bottom:8px;">
-    <button class="btn" id="btn-live" type="button">Лайв</button>
-    <button class="btn ghost" id="btn-collapse" type="button">Свернуть плеер</button>
-    <span class="muted" id="now-playing">режим: лайв</span>
-  </div>
-  <video id="video" controls autoplay muted></video>
-  <div class="tl" id="ptl" style="margin:12px 0 6px;" title="Шкала файла: клик или протяжка = перемотка посекундно"></div>
-  <div class="formrow" style="margin-bottom:0;">
-    <input type="text" id="jump" placeholder="ЧЧ:ММ:СС" style="width:110px;">
-    <button class="btn ghost mini" type="button" onclick="jumpTo()">К времени</button>
-    <span class="muted" id="curtime" style="min-width:240px;">—</span>
-  </div>
-  <p class="muted" id="player-status" style="margin:6px 0 0;"></p>
-</div>
-<button class="btn ghost" id="gotoPlayer" type="button">↑ Плеер</button>
-
-<div class="card">
-  <h2>Детальная шкала (посекундно)</h2>
-  <div class="formrow">
-    <select id="wrw" onchange="wrW=+this.value;wr0=null;renderWR();">
-      <option value="60">окно 1 мин (деления 1 сек)</option>
-      <option value="300" selected>окно 5 мин (деления 5 сек)</option>
-      <option value="3600">окно 1 час (деления 1 мин)</option>
-      <option value="0">весь файл</option>
-    </select>
-    <button class="btn ghost mini" type="button" onclick="wrShift(-0.5)">← пол-окна</button>
-    <button class="btn ghost mini" type="button" onclick="wrShift(0.5)">пол-окна →</button>
-    <button class="btn ghost mini" type="button" onclick="wrCenter()">К плейхеду</button>
-    <label class="muted"><input type="checkbox" id="wrf" checked onchange="wrFollow=this.checked"> следить за плейхедом</label>
-    <span class="muted" id="wrinfo"></span>
-  </div>
-  <div class="tl big" id="wr" title="Клик = переход в эту секунду"></div>
-</div>
+{% set ARCH_BASE = url_for('archive_file', camera_id=camera.id, filename='') %}
+{% set LIVE_SRC = url_for('live_file', camera_id=camera.id, filename='index.m3u8') %}
+{% set DAYS_JSON = days_json %}
+{% include "player.html" %}
 
 <div class="tabbar">
   <button class="on" data-tab="tab-archive" type="button">Архив</button>
@@ -143,7 +106,6 @@
       <button class="btn ghost" type="submit">Сохранить ONVIF</button>
     </form>
   </div>
-
   <div class="card">
     <h2>Зона детекции (для режима «по движению»)</h2>
     <p class="muted">Нарисуйте рамку мышью или пальцем. Движение вне рамки не запускает запись.</p>
@@ -170,255 +132,49 @@
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
-const ARCH_BASE = "{{ url_for('archive_file', camera_id=camera.id, filename='') }}";
-const DAYS = {{ days_json | safe }};
-const video = document.getElementById("video");
-const statusEl = document.getElementById("player-status");
-const nowEl = document.getElementById("now-playing");
-const playerCard = document.getElementById("playercard");
-const gotoBtn = document.getElementById("gotoPlayer");
-const collapseBtn = document.getElementById("btn-collapse");
-const liveSrc = "{{ url_for('live_file', camera_id=camera.id, filename='index.m3u8') }}";
-let hls = null, isLive = true;
-let curMode = "linear", curBase = 0, curMap = [];
-let wrW = 300, wr0 = null, wrFollow = true;
-function fmtHMS(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(x).padStart(2,"0");}
-function parseHMS(v){const m=String(v).match(/^(\d{1,2}):(\d{2}):(\d{2})$/);return m?(+m[1])*3600+(+m[2])*60+(+m[3]):0;}
-function absToCur(T){
-  if (curMode === "linear") return T - curBase;
-  for (const m of curMap) { if (T >= m.a && T < m.b) return m.o + (T - m.a); }
-  return null;
-}
-function curToAbs(ct){
-  if (curMode === "linear") return curBase + ct;
-  for (const m of curMap) { const len = m.b - m.a; if (ct >= m.o && ct < m.o + len) return m.a + (ct - m.o); }
-  return curBase + ct;
-}
-function covList(){
-  if (curMode === "map" && curMap.length) return curMap;
-  if (video.duration && isFinite(video.duration)) return [{a: curBase, b: curBase + video.duration, o: 0}];
-  return [];
-}
-function tickStep(span){ if(span<=90)return 10; if(span<=600)return 60; if(span<=3600)return 300; if(span<=14400)return 900; return 3600; }
-function renderPTL(){
-  const el = document.getElementById("ptl"); if(!el) return;
-  el.innerHTML = "";
-  const cov = covList(); const dur = video.duration;
-  if (!cov.length || !dur || !isFinite(dur)) return;
-  cov.forEach(c=>{
-    const z=document.createElement("div"); z.className="seg";
-    z.style.left=(c.o/dur*100)+"%"; z.style.width=Math.max(0.3,(c.b-c.a)/dur*100)+"%";
-    z.title=fmtHMS(c.a)+"–"+fmtHMS(c.b); el.appendChild(z);
-  });
-  const A0=cov[0].a, A1=cov[cov.length-1].b, st=tickStep(A1-A0);
-  for(let t=Math.ceil(A0/st)*st;t<A1;t+=st){
-    const ct=absToCur(t); if(ct==null||ct<0||ct>dur) continue;
-    const tk=document.createElement("div"); tk.className="tick"; tk.style.left=(ct/dur*100)+"%"; el.appendChild(tk);
-    const lb=document.createElement("div"); lb.className="ticklbl"; lb.style.left=(ct/dur*100)+"%";
-    lb.textContent = st<60 ? fmtHMS(t) : fmtHMS(t).slice(0,5); el.appendChild(lb);
-  }
-  const h=document.createElement("div"); h.className="phead"; h.id="phead"; el.appendChild(h);
-  updatePTL();
-}
-function updatePTL(){
-  const h=document.getElementById("phead"); if(!h) return;
-  const dur=video.duration; if(!dur||!isFinite(dur)) return;
-  h.style.left=(video.currentTime/dur*100)+"%";
-}
-function seekPTL(e){
-  const el=document.getElementById("ptl"); const dur=video.duration;
-  if(!dur||!isFinite(dur)) return;
-  const r=el.getBoundingClientRect();
-  const ct=Math.max(0,Math.min(dur-0.05,(e.clientX-r.left)/r.width*dur));
-  video.currentTime=ct; video.play().catch(function(){});
-}
-function renderWR(){
-  const el=document.getElementById("wr"); if(!el) return;
-  el.innerHTML="";
-  const cov=covList(); const dur=video.duration;
-  if(!cov.length || !dur || !isFinite(dur)) return;
-  const A0=cov[0].a, A1=cov[cov.length-1].b;
-  let W=wrW; if(!W) W=A1-A0;
-  if(wr0==null) wr0=A0;
-  wr0=Math.max(A0,Math.min(wr0,A1-W));
-  const st = W<=60?1 : W<=300?5 : W<=3600?60 : 300;
-  const lst = W<=60?10 : W<=300?60 : W<=3600?600 : 3600;
-  cov.forEach(c=>{
-    const a=Math.max(c.a,wr0), b=Math.min(c.b,wr0+W);
-    if(b>a){const z=document.createElement("div"); z.className="seg"; z.style.left=((a-wr0)/W*100)+"%"; z.style.width=((b-a)/W*100)+"%"; el.appendChild(z);}
-  });
-  for(let t=Math.ceil(wr0/st)*st;t<wr0+W;t+=st){
-    const tk=document.createElement("div"); tk.className="tick"; tk.style.left=((t-wr0)/W*100)+"%"; el.appendChild(tk);
-    if(t%lst===0){const lb=document.createElement("div"); lb.className="ticklbl"; lb.style.left=((t-wr0)/W*100)+"%"; lb.textContent=fmtHMS(t); el.appendChild(lb);}
-  }
-  const h=document.createElement("div"); h.className="phead"; h.id="wrhead"; el.appendChild(h);
-  const info=document.getElementById("wrinfo"); if(info) info.textContent="окно: "+fmtHMS(wr0)+" – "+fmtHMS(wr0+W);
-  updateWR();
-}
-function updateWR(){
-  const h=document.getElementById("wrhead"); if(!h) return;
-  const cov=covList(); if(!cov.length) return;
-  const A0=cov[0].a, A1=cov[cov.length-1].b;
-  let W=wrW; if(!W) W=A1-A0;
-  const cur=curToAbs(video.currentTime);
-  if(wrFollow && (cur<wr0||cur>wr0+W)){ wr0=Math.max(A0,Math.min(cur-W/2,A1-W)); renderWR(); return; }
-  h.style.left=Math.max(0,Math.min(100,(cur-wr0)/W*100))+"%";
-}
-function seekWR(e){
-  const el=document.getElementById("wr"); const dur=video.duration;
-  if(!dur||!isFinite(dur)) return;
-  const cov=covList(); if(!cov.length) return;
-  const A0=cov[0].a, A1=cov[cov.length-1].b;
-  let W=wrW; if(!W) W=A1-A0;
-  const r=el.getBoundingClientRect();
-  const T=wr0+(e.clientX-r.left)/r.width*W;
-  const ct=absToCur(T);
-  if(ct==null||ct<0||ct>dur){ toast("На "+fmtHMS(T)+" записи в этом файле нет"); return; }
-  video.currentTime=ct; video.play().catch(function(){});
-}
-function wrShift(f){
-  const cov=covList(); if(!cov.length) return;
-  const A0=cov[0].a, A1=cov[cov.length-1].b;
-  let W=wrW; if(!W) W=A1-A0;
-  if(wr0==null) wr0=A0;
-  wr0=Math.max(A0,Math.min(wr0+W*f,A1-W));
-  renderWR();
-}
-function wrCenter(){
-  const cov=covList(); if(!cov.length) return;
-  const A0=cov[0].a, A1=cov[cov.length-1].b;
-  let W=wrW; if(!W) W=A1-A0;
-  wr0=Math.max(A0,Math.min(curToAbs(video.currentTime)-W/2,A1-W));
-  renderWR();
-}
-function bindDrag(el, fn){
-  let d=false;
-  el.addEventListener("mousedown", function(e){ d=true; fn(e); e.preventDefault(); });
-  window.addEventListener("mousemove", function(e){ if(d) fn(e); });
-  window.addEventListener("mouseup", function(){ d=false; });
-  el.addEventListener("touchstart", function(e){ d=true; fn(e.touches[0]); }, {passive:true});
-  el.addEventListener("touchmove", function(e){ if(d) fn(e.touches[0]); }, {passive:true});
-  window.addEventListener("touchend", function(){ d=false; });
-}
-video.addEventListener("loadedmetadata", function(){ renderPTL(); renderWR(); });
-video.addEventListener("timeupdate", function(){
-  const el=document.getElementById("curtime");
-  if(el){
-    if(isLive){ el.textContent="прямой эфир — перемотка недоступна"; }
-    else if(video.duration && isFinite(video.duration)){
-      el.textContent="на экране: "+fmtHMS(curToAbs(video.currentTime))+" · в файле: "+fmtHMS(video.currentTime)+" / "+fmtHMS(video.duration);
-    }
-  }
-  updatePTL(); updateWR();
-});
-function jumpTo(){
-  if(isLive){ toast("Прямой эфир — перемотка недоступна"); return; }
-  const v=document.getElementById("jump").value.trim();
-  if(!/^\d{1,2}:\d{2}:\d{2}$/.test(v)){ toast("Формат времени: ЧЧ:ММ:СС"); return; }
-  const ct=absToCur(parseHMS(v));
-  const dur=video.duration;
-  if(ct==null||ct<0||(dur&&isFinite(dur)&&ct>dur)){ toast("Времени "+v+" в этом файле нет"); return; }
-  video.currentTime=ct; video.play().catch(function(){});
-}
-function updateGoto(){
-  const r=playerCard.getBoundingClientRect();
-  const hidden=(video.style.display==="none");
-  gotoBtn.style.display=(!hidden&&(r.bottom<0||r.top>window.innerHeight))?"":"none";
-}
-window.addEventListener("scroll", updateGoto, {passive:true});
-gotoBtn.addEventListener("click", function(){ playerCard.scrollIntoView({behavior:"smooth", block:"start"}); });
-collapseBtn.addEventListener("click", function(){
-  const hidden=(video.style.display==="none");
-  if(hidden){ video.style.display=""; collapseBtn.textContent="Свернуть плеер"; video.play().catch(function(){}); }
-  else{ video.style.display="none"; collapseBtn.textContent="Развернуть плеер"; video.pause(); }
-  updateGoto();
-});
-function markSeg(file){
-  document.querySelectorAll("#tl .seg").forEach(function(el){ el.classList.toggle("cur", el.dataset.file===file); });
-}
-function startVideo(url, seekAbs, label){
-  if(hls){ hls.destroy(); hls=null; }
-  isLive=false; statusEl.textContent="";
-  if(video.style.display==="none"){ video.style.display=""; collapseBtn.textContent="Свернуть плеер"; }
-  const ct = seekAbs===null ? 0 : absToCur(seekAbs);
-  video.src=url;
-  video.addEventListener("loadedmetadata", function onm(){
-    video.removeEventListener("loadedmetadata", onm);
-    if(ct!==null&&ct>0) video.currentTime=ct;
-    video.play().catch(function(){});
-  });
-  nowEl.textContent=label;
-  updateGoto();
-}
-function playLinear(url, baseSec, label){ curMode="linear"; curBase=baseSec||0; curMap=[]; wr0=null; startVideo(url, baseSec, label); }
-function playMap(url, map, seekAbs, label){ curMode="map"; curMap=map||[]; curBase=(map&&map.length)?map[0].a:0; wr0=null; startVideo(url, seekAbs, label); }
-function playDay(file, day){
-  const d=DAYS.find(x=>x.day===day);
-  if(d&&d.map&&d.map.length) playMap(ARCH_BASE+file, d.map, d.map[0].a, file);
-  else playLinear(ARCH_BASE+file, 0, file);
-}
-function playLive(){
-  if(hls){ hls.destroy(); hls=null; }
-  video.removeAttribute("src"); statusEl.textContent="";
-  isLive=true; curMode="linear"; curBase=0; curMap=[]; wr0=null;
-  if(window.Hls&&Hls.isSupported()){
-    hls=new Hls(); hls.loadSource(liveSrc); hls.attachMedia(video);
-    hls.on(Hls.Events.ERROR, function(e,d){ if(d.fatal) statusEl.textContent="Нет сигнала: камера офлайн"; });
-  } else { video.src=liveSrc; }
-  nowEl.textContent="режим: лайв";
-  document.getElementById("ptl").innerHTML="";
-  document.getElementById("wr").innerHTML="";
-  markSeg(null);
-  if(video.style.display!=="none") video.play().catch(function(){});
-}
 const tl=document.getElementById("tl");
 const sel=document.getElementById("day-sel");
 function renderTL(){
-  if(!tl) return;
+  if(!tl)return;
   tl.innerHTML="";
   const d=DAYS.find(x=>x.day===sel.value);
-  if(!d) return;
+  if(!d)return;
   d.segments.forEach(s=>{
-    const el=document.createElement("div"); el.className="seg";
-    el.style.left=(s.s/86400*100)+"%"; el.style.width=Math.max(0.35,(s.e-s.s)/86400*100)+"%";
-    el.title=fmtHMS(s.s)+"–"+fmtHMS(s.e); el.dataset.file=s.file; tl.appendChild(el);
+    const el=document.createElement("div");el.className="seg";
+    el.style.left=(s.s/86400*100)+"%";el.style.width=Math.max(0.35,(s.e-s.s)/86400*100)+"%";
+    el.title=fmtHMS(s.s)+"–"+fmtHMS(s.e);el.dataset.file=s.file;tl.appendChild(el);
   });
   if(sel.value===new Date().toISOString().slice(0,10)){
-    const n=new Date(); const sec=n.getUTCHours()*3600+n.getUTCMinutes()*60+n.getUTCSeconds();
-    const m=document.createElement("div"); m.className="now"; m.style.left=(sec/86400*100)+"%"; tl.appendChild(m);
+    const n=new Date();const sec=n.getUTCHours()*3600+n.getUTCMinutes()*60+n.getUTCSeconds();
+    const m=document.createElement("div");m.className="now";m.style.left=(sec/86400*100)+"%";tl.appendChild(m);
   }
 }
 if(tl&&sel){
-  sel.addEventListener("change", renderTL);
-  tl.addEventListener("click", function(e){
+  sel.addEventListener("change",renderTL);
+  tl.addEventListener("click",function(e){
     const r=tl.getBoundingClientRect();
     const T=Math.round((e.clientX-r.left)/r.width*86400);
     const d=DAYS.find(x=>x.day===sel.value);
-    if(!d) return;
+    if(!d)return;
     const sg=d.segments.find(x=>T>=x.s&&T<x.e);
-    if(!sg){ toast("На "+fmtHMS(T)+" записи нет."); return; }
-    if(sg.glued&&d.map&&d.map.length) playMap(ARCH_BASE+sg.file, d.map, T, sg.file);
-    else if(sg.glued) playLinear(ARCH_BASE+sg.file, 0, sg.file);
-    else playLinear(ARCH_BASE+sg.file, sg.s, sg.file);
+    if(!sg){toast("На "+fmtHMS(T)+" записи нет.");return;}
+    if(sg.glued&&d.map&&d.map.length)playMap(ARCH_BASE+sg.file,d.map,T,sg.file);
+    else if(sg.glued)playLinear(ARCH_BASE+sg.file,0,sg.file);
+    else playLinear(ARCH_BASE+sg.file,sg.s,sg.file);
   });
   renderTL();
 }
-bindDrag(document.getElementById("ptl"), seekPTL);
-bindDrag(document.getElementById("wr"), seekWR);
-document.getElementById("btn-live").addEventListener("click", playLive);
-playLive();
-updateGoto();
 (function () {
   var box=document.getElementById("zonebox"); var rect=document.getElementById("zoneRect");
-  if(!box) return;
-  var drawing=false, sx=0, sy=0;
+  if(!box)return;
+  var drawing=false,sx=0,sy=0;
   var cur={% if zone %}{{ zone | tojson }}{% else %}null{% endif %};
   function show(z){
-    if(!z){ rect.style.display="none"; return; }
+    if(!z){rect.style.display="none";return;}
     var p=z.split(",").map(parseFloat);
     rect.style.display="block";
-    rect.style.left=(p[0]*100)+"%"; rect.style.top=(p[1]*100)+"%";
-    rect.style.width=((p[2]-p[0])*100)+"%"; rect.style.height=((p[3]-p[1])*100)+"%";
+    rect.style.left=(p[0]*100)+"%";rect.style.top=(p[1]*100)+"%";
+    rect.style.width=((p[2]-p[0])*100)+"%";rect.style.height=((p[3]-p[1])*100)+"%";
   }
   show(cur);
   function rel(e){
@@ -427,12 +183,12 @@ updateGoto();
     var cy=(e.touches?e.touches[0].clientY:e.clientY);
     return [(cx-r.left)/r.width,(cy-r.top)/r.height];
   }
-  function down(e){ drawing=true; var p=rel(e); sx=p[0]; sy=p[1]; e.preventDefault(); }
+  function down(e){drawing=true;var p=rel(e);sx=p[0];sy=p[1];e.preventDefault();}
   function move(e){
-    if(!drawing) return;
+    if(!drawing)return;
     var p=rel(e);
-    var x1=Math.min(sx,p[0]), x2=Math.max(sx,p[0]);
-    var y1=Math.min(sy,p[1]), y2=Math.max(sy,p[1]);
+    var x1=Math.min(sx,p[0]),x2=Math.max(sx,p[0]);
+    var y1=Math.min(sy,p[1]),y2=Math.max(sy,p[1]);
     show(x1+","+y1+","+x2+","+y2);
     document.getElementById("zx1").value=x1.toFixed(4);
     document.getElementById("zy1").value=y1.toFixed(4);
@@ -440,13 +196,13 @@ updateGoto();
     document.getElementById("zy2").value=y2.toFixed(4);
     e.preventDefault();
   }
-  function up(){ drawing=false; }
-  box.addEventListener("mousedown", down);
-  box.addEventListener("mousemove", move);
-  window.addEventListener("mouseup", up);
-  box.addEventListener("touchstart", down, {passive:false});
-  box.addEventListener("touchmove", move, {passive:false});
-  window.addEventListener("touchend", up);
+  function up(){drawing=false;}
+  box.addEventListener("mousedown",down);
+  box.addEventListener("mousemove",move);
+  window.addEventListener("mouseup",up);
+  box.addEventListener("touchstart",down,{passive:false});
+  box.addEventListener("touchmove",move,{passive:false});
+  window.addEventListener("touchend",up);
 })();
 </script>
 {% endblock %}
