@@ -1,130 +1,289 @@
-#!/usr/bin/env bash
-set -euo pipefail
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE="/opt/cctv"
-VERSION="4.0"
-[[ $EUID -ne 0 ]] && { echo "Запусти от root"; exit 1; }
-echo "=== CCTV install v$VERSION из $REPO ==="
-systemctl stop cctv-web cctv-worker cctv-billing cctv-browserd 2>/dev/null || true
-mkdir -p "$BASE/app/templates" "$BASE/app/static" "$BASE/worker" "$BASE/backup" \
-  "$BASE/storage/live" "$BASE/storage/archive" "$BASE/storage/logs" \
-  "$BASE/storage/previews" "$BASE/storage/exports"
-export DEBIAN_FRONTEND=noninteractive
-echo "=== Пакеты ==="
-apt-get update || echo "WARNING: apt update с ошибками"
-apt-get install -y python3 python3-venv python3-pip ffmpeg nginx sqlite3 openssl git
-id -u cctv &>/dev/null || useradd --system --home-dir "$BASE" --shell /usr/sbin/nologin cctv
-echo "=== Бэкапы ==="
-if [ -f "$BASE/app/cctv.db" ]; then
-  cp -a "$BASE/app/cctv.db" "$BASE/backup/cctv-$(date +%Y%m%d-%H%M%S).db"
-  ls -1t "$BASE/backup"/cctv-*.db 2>/dev/null | tail -n +8 | xargs -r rm -f
-  echo "бэкап базы ok"
+#!/bin/bash
+set -e
+
+# Цвета
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Проверка root
+if [ "$EUID" -ne 0 ]; then
+    log_error "Запустите скрипт от root: sudo bash install.sh"
+    exit 1
 fi
-if [ -f "$BASE/.env" ]; then
-  cp -a "$BASE/.env" "$BASE/backup/env-$(date +%Y%m%d-%H%M%S)"
-  ls -1t "$BASE/backup"/env-* 2>/dev/null | tail -n +8 | xargs -r rm -f
+
+# Проверка ОС
+if ! grep -qi 'ubuntu\|debian' /etc/os-release; then
+    log_warn "Скрипт тестировался на Ubuntu/Debian. На других ОС могут быть проблемы."
 fi
-echo "=== Копирование файлов ==="
-cp -f "$REPO/app/app.py" "$BASE/app/app.py"
-cp -f "$REPO/app/templates/"*.html "$BASE/app/templates/"
-cp -f "$REPO/app/static/manifest.json" "$BASE/app/static/manifest.json"
-cp -f "$REPO/worker/worker.py" "$REPO/worker/billing.py" "$REPO/worker/browserd.py" "$BASE/worker/"
-cp -f "$REPO/requirements.txt" "$BASE/app/requirements.txt"
-cp -f "$REPO/units/cctv-web.service" "$REPO/units/cctv-worker.service" \
-      "$REPO/units/cctv-billing.service" "$REPO/units/cctv-browserd.service" /etc/systemd/system/
-echo "=== Иконки PWA ==="
-python3 - "$BASE/app/static" <<'PYPNG'
-import sys, struct, zlib
-def png(sz, path):
-    def chunk(t, d):
-        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
-    raw = b""
-    for y in range(sz):
-        raw += b"\x00" + bytes([56, 189, 248]) * sz
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", sz, sz, 8, 2, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-d = sys.argv[1]
-png(192, f"{d}/icon-192.png"); png(512, f"{d}/icon-512.png")
-PYPNG
-echo "=== .env ==="
-if [ ! -f "$BASE/.env" ]; then
-  ADMIN_PASSWORD=$(openssl rand -hex 8); SECRET_KEY=$(openssl rand -hex 32)
-  printf 'SECRET_KEY=%s\nADMIN_USERNAME=admin\nADMIN_PASSWORD=%s\n' "$SECRET_KEY" "$ADMIN_PASSWORD" > "$BASE/.env"
-  chmod 600 "$BASE/.env"
-  echo "Admin password: $ADMIN_PASSWORD" > "$BASE/admin_password.txt"
-  chmod 600 "$BASE/admin_password.txt"
-  echo "пароль админа сохранён в $BASE/admin_password.txt"
+
+# Загрузка .env если есть
+if [ -f .env ]; then
+    source .env
 else
-  echo ".env уже есть — не трогаем"
+    log_warn ".env не найден, используются значения по умолчанию"
+    ADMIN_USERNAME="admin"
+    ADMIN_PASSWORD="admin123"
+    SECRET_KEY=$(openssl rand -hex 32)
+    DOMAIN=""
+    PORT=80
 fi
-echo "=== venv и зависимости ==="
-[ -f "$BASE/venv/bin/activate" ] || python3 -m venv "$BASE/venv"
-"$BASE/venv/bin/pip" install --upgrade pip
-"$BASE/venv/bin/pip" install -r "$BASE/app/requirements.txt"
-"$BASE/venv/bin/python" -m playwright install --with-deps chromium 2>/dev/null \
-  || "$BASE/venv/bin/python" -m playwright install chromium \
-  || echo "WARNING: chromium не поставился"
-echo "=== Миграция БД ==="
-python3 "$REPO/migrate/migrate.py"
-chown -R cctv:cctv "$BASE"
-echo "=== Освобождение порта 80 ==="
-wait_port_free() {
-  local n=0
-  while [ "$n" -lt "$1" ]; do
-    ss -tln | grep -q ':80 ' || return 0
-    sleep 1; n=$((n+1))
-  done
-  ss -tln | grep -q ':80 ' && return 1 || return 0
-}
-NGINX_LISTEN=80
-for i in 1 2 3; do
-  if ! ss -tln | grep -q ':80 '; then break; fi
-  PID=$(ss -tlnp | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1) || true
-  [ -z "$PID" ] && break
-  CID=""
-  if command -v docker &>/dev/null; then
-    CID=$(docker ps -q 2>/dev/null | while read -r c; do
-            docker top "$c" 2>/dev/null | awk -v p="$PID" '$2==p{print c; exit}'
-          done | head -1) || true
-  fi
-  if [ -n "$CID" ]; then
-    echo "порт 80 держит контейнер $CID — останавливаю"
-    docker update --restart=no "$CID" 2>/dev/null || true
-    docker stop "$CID" 2>/dev/null || true
-    if ! wait_port_free 10; then docker rm -f "$CID" 2>/dev/null || true; wait_port_free 5 || true; fi
-  else
-    echo "убиваю процесс $PID на порту 80"
-    kill -9 "$PID" 2>/dev/null || true
-    wait_port_free 5 || true
-  fi
-done
-if ss -tln | grep -q ':80 '; then
-  echo "WARNING: 80 занят — ставлю сайт на 8090 (нужен проброс 81->8090)"
-  NGINX_LISTEN=8090
+
+# Параметры по умолчанию
+INSTALL_DIR="${INSTALL_DIR:-/opt/cctv}"
+REPO_URL="${REPO_URL:-https://github.com/vasa57kam/cctv-deploy.git}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+NGINX_PORT="${NGINX_PORT:-80}"
+FLASK_PORT="${FLASK_PORT:-8077}"
+BROWSERD_PORT="${BROWSERD_PORT:-8099}"
+
+log_info "=== Развёртывание CCTV Cloud ==="
+log_info "Установка в: $INSTALL_DIR"
+log_info "Python: $PYTHON_BIN"
+log_info "Nginx порт: $NGINX_PORT"
+log_info "Flask порт: $FLASK_PORT"
+
+# 1. Системные зависимости
+log_info "=== Установка системных пакетов ==="
+apt-get update -qq
+apt-get install -y -qq \
+    python3 python3-venv python3-pip \
+    ffmpeg nginx git curl wget \
+    sqlite3 \
+    > /dev/null 2>&1
+log_info "Системные пакеты установлены"
+
+# 2. Клонирование/обновление репозитория
+log_info "=== Работа с репозиторием ==="
+if [ -d "$INSTALL_DIR" ]; then
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        cd "$INSTALL_DIR"
+        git pull || log_warn "git pull не удался, продолжаем с текущей версией"
+    else
+        log_error "$INSTALL_DIR существует, но не является git-репозиторием"
+        exit 1
+    fi
+else
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
 fi
-echo "=== Nginx ==="
-cp -f "$REPO/nginx/cctv.conf" /etc/nginx/sites-available/cctv
-sed -i "s/__PORT__/$NGINX_LISTEN/" /etc/nginx/sites-available/cctv
-ln -sf /etc/nginx/sites-available/cctv /etc/nginx/sites-enabled/cctv
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
-echo "=== Старт ==="
+
+# 3. Виртуальное окружение
+log_info "=== Python виртуальное окружение ==="
+if [ ! -d "$INSTALL_DIR/venv" ]; then
+    $PYTHON_BIN -m venv "$INSTALL_DIR/venv"
+fi
+source "$INSTALL_DIR/venv/bin/activate"
+pip install --upgrade pip -q
+pip install -r "$INSTALL_DIR/requirements.txt" -q
+log_info "Python пакеты установлены"
+
+# 4. Создание .env
+log_info "=== Настройка .env ==="
+if [ ! -f "$INSTALL_DIR/.env" ]; then
+    cat > "$INSTALL_DIR/.env" <<EOF
+ADMIN_USERNAME=$ADMIN_USERNAME
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+SECRET_KEY=$SECRET_KEY
+DOMAIN=$DOMAIN
+FLASK_PORT=$FLASK_PORT
+BROWSERD_PORT=$BROWSERD_PORT
+EOF
+    log_info "Создан .env с настройками по умолчанию"
+else
+    log_info ".env уже существует, не перезаписываем"
+fi
+source "$INSTALL_DIR/.env"
+
+# 5. Структура папок
+log_info "=== Создание папок ==="
+mkdir -p "$INSTALL_DIR/app/static"
+mkdir -p "$INSTALL_DIR/storage/{live,archive,logs,previews,exports,cuts}"
+mkdir -p "$INSTALL_DIR/backup"
+chown -R www-data:www-data "$INSTALL_DIR/storage" 2>/dev/null || true
+log_info "Папки созданы"
+
+# 6. Миграция БД
+log_info "=== Миграция базы данных ==="
+cd "$INSTALL_DIR"
+$INSTALL_DIR/venv/bin/python "$INSTALL_DIR/migrate/migrate.py"
+log_info "Миграция завершена"
+
+# 7. Systemd сервисы
+log_info "=== Настройка systemd сервисов ==="
+
+# cctv-web
+cat > /etc/systemd/system/cctv-web.service <<EOF
+[Unit]
+Description=CCTV Flask web
+After=network.target
+
+[Service]
+Type=notify
+User=root
+WorkingDirectory=$INSTALL_DIR/app
+Environment="PATH=$INSTALL_DIR/venv/bin"
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/venv/bin/gunicorn -w 2 -b 127.0.0.1:$FLASK_PORT --timeout 120 app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# cctv-worker
+cat > /etc/systemd/system/cctv-worker.service <<EOF
+[Unit]
+Description=CCTV worker (ffmpeg)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+Environment="PATH=$INSTALL_DIR/venv/bin"
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/worker/worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# cctv-billing
+cat > /etc/systemd/system/cctv-billing.service <<EOF
+[Unit]
+Description=CCTV billing
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+Environment="PATH=$INSTALL_DIR/venv/bin"
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/billing/billing.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# cctv-browserd
+cat > /etc/systemd/system/cctv-browserd.service <<EOF
+[Unit]
+Description=CCTV browser daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+Environment="PATH=$INSTALL_DIR/venv/bin"
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/browserd/browserd.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable --now cctv-web cctv-worker cctv-billing cctv-browserd
-if ! systemctl restart nginx; then
-  systemctl kill nginx 2>/dev/null || true; pkill -9 nginx 2>/dev/null || true
-  sleep 1; systemctl start nginx
-fi
+systemctl enable cctv-web cctv-worker cctv-billing cctv-browserd
+log_info "Systemd сервисы настроены"
+
+# 8. Nginx
+log_info "=== Настройка Nginx ==="
+cat > /etc/nginx/sites-available/cctv <<EOF
+server {
+    listen $NGINX_PORT;
+    server_name _;
+
+    client_max_body_size 100M;
+
+    location / {
+        proxy_pass http://127.0.0.1:$FLASK_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+    }
+
+    location /live/ {
+        proxy_pass http://127.0.0.1:$FLASK_PORT;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    location /archive/ {
+        proxy_pass http://127.0.0.1:$FLASK_PORT;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    location /thumb/ {
+        proxy_pass http://127.0.0.1:$FLASK_PORT;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    location /static/ {
+        alias $INSTALL_DIR/app/static/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/cctv /etc/nginx/sites-enabled/cctv
+nginx -t && systemctl reload nginx
+log_info "Nginx настроен"
+
+# 9. Запуск сервисов
+log_info "=== Запуск сервисов ==="
+systemctl restart cctv-web cctv-worker cctv-billing cctv-browserd
 sleep 3
-CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$NGINX_LISTEN/login)
-DCODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d '{"cmd":"status"}' http://127.0.0.1:8099/)
-echo "сайт: $CODE (ждём 200); демон браузера: $DCODE (ждём 200)"
-if [ "$CODE" != "200" ]; then
-  echo "!!! сайт не поднялся, логи:"
-  journalctl -u cctv-web -n 30 --no-pager || true
-  exit 1
+
+# 10. Проверка
+log_info "=== Проверка ==="
+if systemctl is-active --quiet cctv-web; then
+    log_info "✓ cctv-web работает"
+else
+    log_error " cctv-web не запустился"
+    journalctl -u cctv-web -n 20 --no-pager
 fi
-echo "$VERSION" > "$BASE/VERSION"; chown cctv:cctv "$BASE/VERSION"
-echo "=== ГОТОВО: v$VERSION, порт $NGINX_LISTEN ==="
-echo "пароль админа: cat $BASE/admin_password.txt"
+
+if systemctl is-active --quiet cctv-worker; then
+    log_info "✓ cctv-worker работает"
+else
+    log_error "✗ cctv-worker не запустился"
+    journalctl -u cctv-worker -n 20 --no-pager
+fi
+
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$FLASK_PORT/login 2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ]; then
+    log_info "✓ Сайт отвечает (код $HTTP_CODE)"
+else
+    log_error "✗ Сайт не отвечает (код $HTTP_CODE)"
+fi
+
+log_info "=== Развёртывание завершено ==="
+log_info "Админка: http://$(hostname -I | awk '{print $1}'):$NGINX_PORT/admin"
+log_info "Логин: $ADMIN_USERNAME"
+log_info "Пароль: $ADMIN_PASSWORD"
+log_info ""
+log_info "Полезные команды:"
+log_info "  journalctl -u cctv-web -f          # логи веб-сервера"
+log_info "  journalctl -u cctv-worker -f       # логи воркера"
+log_info "  systemctl restart cctv-web         # перезапуск веб"
+log_info "  cd $INSTALL_DIR && git pull && bash install.sh  # обновление"
