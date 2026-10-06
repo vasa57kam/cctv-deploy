@@ -20,145 +20,76 @@ def migrate():
     
     try:
         cur.executescript("""
-        CREATE TABLE IF NOT EXISTS setting (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
+        CREATE TABLE IF NOT EXISTS setting (key TEXT PRIMARY KEY, value TEXT);
         
         CREATE TABLE IF NOT EXISTS tariff (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            period_days INTEGER DEFAULT 30,
-            interval_seconds INTEGER DEFAULT 2592000,
-            max_cameras INTEGER DEFAULT 1,
-            archive_days INTEGER DEFAULT 7,
-            is_active INTEGER DEFAULT 1,
-            is_b2b INTEGER DEFAULT 0,
-            max_users INTEGER DEFAULT 1
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL NOT NULL,
+            period_days INTEGER DEFAULT 30, interval_seconds INTEGER DEFAULT 2592000,
+            max_cameras INTEGER DEFAULT 1, archive_days INTEGER DEFAULT 7,
+            is_active INTEGER DEFAULT 1, is_b2b INTEGER DEFAULT 0, max_users INTEGER DEFAULT 1
         );
         
         CREATE TABLE IF NOT EXISTS tariff_bundle (
-            id INTEGER PRIMARY KEY,
-            tariff_id INTEGER NOT NULL,
-            months INTEGER NOT NULL,
-            discount_percent REAL DEFAULT 0.0,
-            is_active INTEGER DEFAULT 1,
-            FOREIGN KEY (tariff_id) REFERENCES tariff(id)
+            id INTEGER PRIMARY KEY, tariff_id INTEGER NOT NULL, months INTEGER NOT NULL,
+            discount_percent REAL DEFAULT 0.0, is_active INTEGER DEFAULT 1
         );
         
         CREATE TABLE IF NOT EXISTS user (
-            id INTEGER PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            balance REAL DEFAULT 0.0,
-            credit_limit REAL DEFAULT 0.0,
-            admin INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            tariff_id INTEGER,
-            subscription_ends_at DATETIME,
-            auto_renew INTEGER DEFAULT 0,
-            referred_by INTEGER,
-            partner_of INTEGER,
-            FOREIGN KEY (tariff_id) REFERENCES tariff(id)
+            id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+            balance REAL DEFAULT 0.0, credit_limit REAL DEFAULT 0.0, admin INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            tariff_id INTEGER, subscription_ends_at DATETIME, auto_renew INTEGER DEFAULT 0,
+            referred_by INTEGER, partner_of INTEGER
         );
         
         CREATE TABLE IF NOT EXISTS camera (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            rtsp_url TEXT NOT NULL,
-            user_id INTEGER,
-            active INTEGER DEFAULT 1,
-            recording_enabled INTEGER DEFAULT 0,
-            recording_mode TEXT DEFAULT 'continuous',
-            motion_zone TEXT,
-            onvif_url TEXT,
-            group_name TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, rtsp_url TEXT NOT NULL, user_id INTEGER,
+            active INTEGER DEFAULT 1, recording_enabled INTEGER DEFAULT 0,
+            recording_mode TEXT DEFAULT 'continuous', motion_zone TEXT, onvif_url TEXT,
+            group_name TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE TABLE IF NOT EXISTS camera_access (
-            id INTEGER PRIMARY KEY,
-            camera_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            enabled INTEGER DEFAULT 1,
-            FOREIGN KEY (camera_id) REFERENCES camera(id),
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, user_id INTEGER NOT NULL, enabled INTEGER DEFAULT 1
         );
         
         CREATE TABLE IF NOT EXISTS camera_request (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            ip TEXT NOT NULL,
-            login TEXT,
-            password TEXT,
-            comment TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, ip TEXT NOT NULL, login TEXT,
+            password TEXT, comment TEXT, status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE TABLE IF NOT EXISTS "transaction" (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            reason TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount REAL NOT NULL,
+            reason TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE TABLE IF NOT EXISTS payment_request (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            method TEXT DEFAULT 'other',
-            comment TEXT,
-            status TEXT DEFAULT 'pending',
-            user_hidden INTEGER DEFAULT 0,
-            admin_hidden INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            processed_at DATETIME,
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount REAL NOT NULL,
+            method TEXT DEFAULT 'other', comment TEXT, status TEXT DEFAULT 'pending',
+            user_hidden INTEGER DEFAULT 0, admin_hidden INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, processed_at DATETIME
         );
         
         CREATE TABLE IF NOT EXISTS team_member (
-            id INTEGER PRIMARY KEY,
-            owner_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL UNIQUE,
-            role TEXT DEFAULT 'viewer',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (owner_id) REFERENCES user(id),
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, user_id INTEGER NOT NULL UNIQUE,
+            role TEXT DEFAULT 'viewer', created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE TABLE IF NOT EXISTS partner (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL UNIQUE,
-            commission_percent REAL DEFAULT 30.0,
-            total_referrals INTEGER DEFAULT 0,
-            total_earned REAL DEFAULT 0.0,
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE,
+            commission_percent REAL DEFAULT 30.0, total_referrals INTEGER DEFAULT 0,
+            total_earned REAL DEFAULT 0.0
         );
         
         CREATE TABLE IF NOT EXISTS whitelabel (
-            id INTEGER PRIMARY KEY,
-            partner_id INTEGER NOT NULL UNIQUE,
-            domain TEXT,
-            logo_url TEXT,
-            primary_color TEXT DEFAULT '#38bdf8',
-            brand_name TEXT DEFAULT 'CCTV',
-            FOREIGN KEY (partner_id) REFERENCES partner(id)
+            id INTEGER PRIMARY KEY, partner_id INTEGER NOT NULL UNIQUE, domain TEXT,
+            logo_url TEXT, primary_color TEXT DEFAULT '#38bdf8', brand_name TEXT DEFAULT 'CCTV'
         );
         
         CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT,
-            ip TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES user(id)
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, action TEXT NOT NULL,
+            target TEXT, ip TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
@@ -190,7 +121,6 @@ def migrate():
                     )
             print("migration: seeded default tariffs + bundles")
         
-        import os
         from werkzeug.security import generate_password_hash
         
         admin_user = os.environ.get("ADMIN_USERNAME", "admin")
