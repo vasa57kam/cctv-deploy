@@ -235,14 +235,20 @@ def init_db():
             Tariff(name="Бизнес", price=1990, interval_seconds=2592000, max_cameras=10, archive_days=7),
             Tariff(name="B2B Офис", price=4990, interval_seconds=2592000, max_cameras=20, archive_days=30, is_b2b=True, max_users=5),
             Tariff(name="B2B ТСЖ", price=1490, interval_seconds=2592000, max_cameras=8, archive_days=14, is_b2b=True, max_users=3)])
-        db.session.commit()
+        try: db.session.commit()
+        except Exception: db.session.rollback()
         for t in Tariff.query.all():
             db.session.add_all([TariffBundle(tariff_id=t.id, months=m, discount_percent=d) for m, d in ((3, 5.0), (6, 10.0), (12, 15.0))])
-        db.session.commit()
-    au = os.environ.get("ADMIN_USERNAME", "admin"); ap = os.environ.get("ADMIN_PASSWORD", "admin123")
+        try: db.session.commit()
+        except Exception: db.session.rollback()
+    au = os.environ.get("ADMIN_USERNAME", "admin")
+    ap = os.environ.get("ADMIN_PASSWORD", "admin123")
     if not User.query.filter_by(username=au).first():
-        db.session.add(User(username=au, password_hash=generate_password_hash(ap), admin=True, active=True, balance=0.0))
-        db.session.commit()
+        try:
+            db.session.add(User(username=au, password_hash=generate_password_hash(ap), admin=True, active=True, balance=0.0))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
 with app.app_context(): init_db()
 
@@ -525,19 +531,15 @@ def run_scan(ip, login, password, try_defaults):
     state["open_ports"] = [p for p, ok in sorted(opens) if ok]
     _write_scan_state(state)
     creds = []
-    if login:
-        creds.append((login, password or ""))
-    else:
-        creds.append(None)
-    if try_defaults:
-        creds.extend(DEFAULT_CREDS)
+    if login: creds.append((login, password or ""))
+    else: creds.append(None)
+    if try_defaults: creds.extend(DEFAULT_CREDS)
     rtsp_port = next((p for p in (554, 8554, 5540) if p in state["open_ports"]), None)
     candidates = []
     if rtsp_port:
         for c in creds:
             auth = ""
-            if c:
-                auth = f"{urllib.parse.quote(c[0], safe='')}:{urllib.parse.quote(c[1], safe='')}@"
+            if c: auth = f"{urllib.parse.quote(c[0], safe='')}:{urllib.parse.quote(c[1], safe='')}@"
             for pat in RTSP_PATTERNS:
                 candidates.append(f"rtsp://{auth}{ip}:{rtsp_port}{pat}")
     for hp in (80, 8080, 8000):
@@ -552,8 +554,7 @@ def run_scan(ip, login, password, try_defaults):
         idx += 1
         ok = probe_stream(url, idx)
         state["checked"] += 1
-        if ok:
-            state["results"].append({"idx": idx, "url": url})
+        if ok: state["results"].append({"idx": idx, "url": url})
         _write_scan_state(state)
     state["running"] = False
     _write_scan_state(state)
@@ -588,8 +589,7 @@ def run_glue(cid, day):
         entries.append((p, s, s + probe_dur(p)))
     lst = d / f".concat_{day}.txt"
     with open(lst, "w") as fh:
-        for e in entries:
-            fh.write(f"file '{e[0]}'\n")
+        for e in entries: fh.write(f"file '{e[0]}'\n")
     r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0",
                         "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out)],
                        capture_output=True, timeout=7200)
@@ -619,8 +619,7 @@ def run_cut(job):
         if dayf.exists():
             mmap_day = _load_day_map(d, day)
             if mmap_day:
-                for m in mmap_day:
-                    sources.append((dayf, m["a"], m["b"], m["o"]))
+                for m in mmap_day: sources.append((dayf, m["a"], m["b"], m["o"]))
             else:
                 sources.append((dayf, 0, probe_dur(dayf), 0))
         else:
@@ -666,8 +665,7 @@ def run_cut(job):
                     _update_job(job); return
                 temps.append(tmp); mmap_out.append({"a": a, "b": b, "o": off}); off += (b - a)
             with open(lst, "w") as fh:
-                for t in temps:
-                    fh.write(f"file '{t}'\n")
+                for t in temps: fh.write(f"file '{t}'\n")
             r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0",
                                 "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(out)],
                                capture_output=True, timeout=7200)
@@ -690,8 +688,7 @@ def run_cut(job):
         if dur <= 0:
             job["status"] = "error"; job["error"] = "пустой диапазон"; _update_job(job); return
         with open(lst, "w") as fh:
-            for (path, a0, b0, o0) in cov:
-                fh.write(f"file '{path}'\n")
+            for (path, a0, b0, o0) in cov: fh.write(f"file '{path}'\n")
         cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", f"{off_from:.3f}", "-t", f"{dur:.3f}",
                "-f", "concat", "-safe", "0", "-i", str(lst)] + enc + ["-an", "-movflags", "+faststart", str(out)]
         r = subprocess.run(cmd, capture_output=True, timeout=7200)
@@ -704,8 +701,7 @@ def run_cut(job):
         c_off = 0.0; mmap_out = []
         for (path, a0, b0, o0) in cov:
             a = max(a0, f_sec); b = min(b0, t_sec)
-            if b > a:
-                mmap_out.append({"a": a, "b": b, "o": c_off + (a - a0) - off_from})
+            if b > a: mmap_out.append({"a": a, "b": b, "o": c_off + (a - a0) - off_from})
             c_off += (b0 - a0)
         job["status"] = "done"; job["map"] = mmap_out; job["base"] = mmap_out[0]["a"]
         job["size_mb"] = round(out.stat().st_size / 1048576, 1)
@@ -772,8 +768,7 @@ def dashboard():
         cam_items = [{"camera": c, "enabled": bool(user_link(current_user.id, c.id).enabled)} for c in current_user.cameras]
     thumbs = {}
     allcams = cameras or [it["camera"] for it in cam_items]
-    for c in allcams:
-        thumbs[c.id] = thumb_state(c)
+    for c in allcams: thumbs[c.id] = thumb_state(c)
     tariff_options = [{"tariff": t, "label": interval_label(t.interval_seconds),
                        "bundles": [b for b in t.bundles if b.is_active]}
                       for t in Tariff.query.filter_by(is_active=True).order_by(Tariff.price).all()]
@@ -1124,10 +1119,8 @@ def admin_camera_onvif(camera_id):
     camera.onvif_url = url or None
     db.session.commit()
     audit(current_user, "onvif_url", f"{camera.name}={url or 'сброшено'}")
-    if url:
-        flash("ONVIF-адрес сохранён. Воркер переподпишется за ~2 секунды (смотри лог камеры).")
-    else:
-        flash("ONVIF-адрес сброшен: будут взяты IP и креды из RTSP, порт 80.")
+    if url: flash("ONVIF-адрес сохранён.")
+    else: flash("ONVIF-адрес сброшен.")
     return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/admin/camera/<int:camera_id>/zone", methods=["POST"])
@@ -1136,16 +1129,16 @@ def admin_camera_zone(camera_id):
     camera = get_or_404(Camera, camera_id)
     if request.form.get("clear") == "1":
         camera.motion_zone = None
-        flash("Зона детекции сброшена: движение ищется по всему кадру.")
+        flash("Зона детекции сброшена.")
     else:
         try:
             x1 = float(request.form.get("x1", "0")); y1 = float(request.form.get("y1", "0"))
             x2 = float(request.form.get("x2", "1")); y2 = float(request.form.get("y2", "1"))
             if x2 - x1 < 0.05 or y2 - y1 < 0.05: raise ValueError
             camera.motion_zone = f"{max(0,min(1,x1)):.4f},{max(0,min(1,y1)):.4f},{max(0,min(1,x2)):.4f},{max(0,min(1,y2)):.4f}"
-            flash("Зона детекции сохранена. Воркер применит за ~2 секунды.")
+            flash("Зона детекции сохранена.")
         except ValueError:
-            flash("Некорректная зона: рамка слишком мала.")
+            flash("Некорректная зона.")
     db.session.commit()
     audit(current_user, "motion_zone", camera.name)
     return redirect(url_for("camera_page", camera_id=camera.id))
@@ -1163,7 +1156,7 @@ def admin_camera_motion(camera_id):
         camera.recording_mode = mode
         db.session.commit()
         audit(current_user, "recording_mode", f"{camera.name}={names[mode]}")
-        flash(f"Камера {camera.name}: режим записи — {names[mode]}. Воркер переключится за ~2 секунды.")
+        flash(f"Камера {camera.name}: режим записи — {names[mode]}.")
     if request.form.get("back") == "admin":
         return admin_redirect("#cameras")
     return redirect(url_for("camera_page", camera_id=camera.id))
@@ -1184,7 +1177,7 @@ def admin_camera_glue(camera_id, day):
         flash("День уже склеен."); return redirect(url_for("camera_page", camera_id=camera.id))
     threading.Thread(target=run_glue, args=(camera.id, day), daemon=True).start()
     audit(current_user, "glue_day", f"{camera.name} {day}")
-    flash(f"Склейка дня {day} запущена в фоне: файл + карта времени; куски удалятся после успеха.")
+    flash(f"Склейка дня {day} запущена в фоне.")
     return redirect(url_for("camera_page", camera_id=camera.id))
 
 @app.route("/live/<int:camera_id>/<path:filename>")
@@ -1389,7 +1382,7 @@ def admin_freeze_action(freeze_id, action):
         if fr.user.subscription_ends_at:
             fr.user.subscription_ends_at = fr.user.subscription_ends_at + (fr.freeze_to - fr.freeze_from)
         db.session.commit()
-        flash(f"Заморозка одобрена: списано {price:.0f} ₽, доступ закрыт на период, запись идёт.")
+        flash(f"Заморозка одобрена: списано {price:.0f} ₽.")
     else:
         fr.status = "rejected"; db.session.commit(); flash("Заморозка отклонена.")
     return admin_redirect("#freezes")
@@ -1410,7 +1403,7 @@ def admin_archive_order(order_id, action):
     db.session.add(Transaction(user_id=o.user.id, amount=-o.price, reason=f"Нарезка фрагмента архива #{o.id} ({o.camera.name})"))
     o.status = "approved"; o.processed_at = datetime.utcnow()
     db.session.commit()
-    flash(f"Оплачено. Положи файл в /opt/cctv/storage/exports/order_{o.id}.mp4 — клиент сможет скачать.")
+    flash(f"Оплачено. Положи файл в /opt/cctv/storage/exports/order_{o.id}.mp4.")
     return admin_redirect("#archive-orders")
 
 @app.route("/admin/partner/create", methods=["POST"])
