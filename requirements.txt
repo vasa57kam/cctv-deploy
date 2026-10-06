@@ -2,6 +2,6 @@ Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
 Flask-Login==0.6.3
 gunicorn==22.0.0
-playwright==1.44.0
-onvif-zeep
-aiosmtpd
+werkzeug==3.0.3
+onvif-zeep==0.2.14
+aiosmtpd==1.4.6
