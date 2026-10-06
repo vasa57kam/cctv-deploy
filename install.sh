@@ -55,8 +55,15 @@ if [ ! -d "$INSTALL_DIR/venv" ]; then
 fi
 source "$INSTALL_DIR/venv/bin/activate"
 pip install --upgrade pip -q
-pip install -r "$INSTALL_DIR/requirements.txt" -q 2>/dev/null || true
-log_info "Готово"
+
+# ВАЖНО: без подавления ошибок!
+if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+    pip install -r "$INSTALL_DIR/requirements.txt"
+else
+    log_error "requirements.txt не найден!"
+    exit 1
+fi
+log_info "Python пакеты установлены"
 
 # .env
 log_info "=== .env ==="
