@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 import sqlite3
 import os
+import hashlib
 from pathlib import Path
 
 BASE_DIR = Path("/opt/cctv")
 DB_PATH = BASE_DIR / "app" / "cctv.db"
+
+def hash_password(password):
+    """Хеширование пароля через hashlib (без зависимости от werkzeug)"""
+    salt = os.urandom(16).hex()
+    hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return f"pbkdf2:sha256:100000${salt}${hash_obj.hex()}"
 
 def migrate():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -121,8 +128,6 @@ def migrate():
                     )
             print("migration: seeded default tariffs + bundles")
         
-        from werkzeug.security import generate_password_hash
-        
         admin_user = os.environ.get("ADMIN_USERNAME", "admin")
         admin_pass = os.environ.get("ADMIN_PASSWORD", "admin123")
         
@@ -131,7 +136,7 @@ def migrate():
             try:
                 cur.execute(
                     "INSERT INTO user (username, password_hash, admin, active) VALUES (?, ?, 1, 1)",
-                    (admin_user, generate_password_hash(admin_pass))
+                    (admin_user, hash_password(admin_pass))
                 )
                 conn.commit()
                 print(f"migration: created admin user '{admin_user}'")
