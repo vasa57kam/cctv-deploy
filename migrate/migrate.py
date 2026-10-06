@@ -8,7 +8,6 @@ BASE_DIR = Path("/opt/cctv")
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 
 def hash_password(password):
-    """Хеширование пароля через hashlib (без зависимости от werkzeug)"""
     salt = os.urandom(16).hex()
     hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
     return f"pbkdf2:sha256:100000${salt}${hash_obj.hex()}"
@@ -16,7 +15,6 @@ def hash_password(password):
 def migrate():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     
-    # WAL включаем ДО открытия основной транзакции
     conn_wal = sqlite3.connect(str(DB_PATH))
     conn_wal.execute("PRAGMA journal_mode=WAL")
     conn_wal.commit()
