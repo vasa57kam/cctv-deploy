@@ -357,11 +357,6 @@ def get_camera_or_403(camera_id):
     if not can_view_camera(camera): abort(403)
     return camera
 
-def can_add_camera_to_user(user):
-    if user is None: return True
-    if user.tariff is None: return False
-    return enabled_count(user) < user.tariff.max_cameras
-
 def camera_archive_days(camera):
     vals = [u.tariff.archive_days for u in camera.users if u.tariff is not None and u.tariff.archive_days]
     return max(vals) if vals else 7
