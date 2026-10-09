@@ -16,9 +16,11 @@ ARCHIVE_DIR = BASE_DIR / "storage" / "archive"
 LIVE_DIR = BASE_DIR / "storage" / "live"
 LOG_DIR = BASE_DIR / "storage" / "logs"
 PREVIEW_DIR = BASE_DIR / "storage" / "previews"
+SHARE_DIR = BASE_DIR / "storage" / "live_share"
 SMTP_PORT = 2525
 
 procs = {}
+share_procs = {}; share_logs = {}
 configs = {}
 live_logs = {}
 detectors = {}
@@ -77,7 +79,7 @@ def get_cameras():
             rows = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url, audio_enabled FROM camera WHERE active=1"
+                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url, audio_enabled, share_enabled FROM camera WHERE active=1"
                 )
             ]
         except sqlite3.OperationalError:
@@ -85,14 +87,14 @@ def get_cameras():
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, audio_enabled FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, audio_enabled, share_enabled FROM camera WHERE active=1"
                     )
                 ]
             except sqlite3.OperationalError:
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode, audio_enabled FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, audio_enabled, share_enabled FROM camera WHERE active=1"
                     )
                 ]
         conn.close()
@@ -368,6 +370,34 @@ def stop_recorder(cid, reason=""):
             pass
 
 
+
+def start_share(cam):
+    cid = cam["id"]
+    d = SHARE_DIR / f"camera_{cid}"
+    d.mkdir(parents=True, exist_ok=True)
+    lf = log_handle(cid); share_logs[cid] = lf
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
+           "-map", "0:v", "-c:v", "copy", "-an",
+           "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
+           "-hls_flags", "delete_segments", str(d / "index.m3u8")]
+    mlog(cid, "share stream start (без звука)")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
+
+def stop_share(cid):
+    proc = share_procs.pop(cid, None)
+    if proc is not None:
+        try:
+            proc.terminate(); proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+        mlog(cid, "share stream stop")
+    lf = share_logs.pop(cid, None)
+    if lf is not None:
+        try: lf.close()
+        except Exception: pass
+
 def snap_thumbs(cams):
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     for cam in cams:
@@ -447,6 +477,14 @@ while running:
             procs[cid] = start_live(cam, rec and mode == "continuous", seg)
             configs[cid] = cfg
 
+        sp = share_procs.get(cid)
+        want_share = bool(cam.get("share_enabled"))
+        if want_share and (sp is None or sp.poll() is not None):
+            if sp is not None: sp.wait()
+            share_procs[cid] = start_share(cam)
+        elif not want_share and sp is not None:
+            stop_share(cid)
+
         if mode == "onvif":
             if rec:
                 ensure_onvif(cid, cam)
@@ -490,6 +528,7 @@ while running:
         if cid not in active_ids:
             stop_live(cid)
             configs.pop(cid, None)
+            stop_share(cid)
             stop_detector(cid)
             stop_recorder(cid, "(камера отключена)")
             stop_onvif(cid)
@@ -505,6 +544,7 @@ while running:
 
 for cid in list(procs.keys()):
     stop_live(cid)
+for cid in list(share_procs.keys()): stop_share(cid)
 for cid in list(detectors.keys()):
     stop_detector(cid)
 for cid in list(recorders.keys()):

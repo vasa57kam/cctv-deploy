@@ -15,11 +15,12 @@ BASE_DIR = Path("/opt/cctv"); STORAGE_DIR = BASE_DIR / "storage"
 LIVE_DIR = STORAGE_DIR / "live"; ARCHIVE_DIR = STORAGE_DIR / "archive"
 PREVIEW_DIR = STORAGE_DIR / "previews"; EXPORT_DIR = STORAGE_DIR / "exports"
 CUTS_DIR = STORAGE_DIR / "cuts"
+SHARE_DIR = STORAGE_DIR / "live_share"
 DB_PATH = BASE_DIR / "app" / "cctv.db"
 DAEMON_URL = "http://127.0.0.1:8099/"
 SCAN_STATE_PATH = STORAGE_DIR / "scan_state.json"
 CUTS_STATE_PATH = STORAGE_DIR / "cuts_state.json"
-for d in (DB_PATH.parent, LIVE_DIR, ARCHIVE_DIR, PREVIEW_DIR, EXPORT_DIR, CUTS_DIR):
+for d in (DB_PATH.parent, LIVE_DIR, ARCHIVE_DIR, PREVIEW_DIR, EXPORT_DIR, CUTS_DIR, SHARE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -119,6 +120,8 @@ class Camera(db.Model):
     onvif_url = db.Column(db.String(255), nullable=True)
     group_name = db.Column(db.String(60), nullable=True)
     audio_enabled = db.Column(db.Boolean, default=True)
+    share_enabled = db.Column(db.Boolean, default=False)
+    share_token = db.Column(db.String(64), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
 
@@ -1912,4 +1915,36 @@ def admin_camera_audio_sell(camera_id):
     db.session.commit()
     audit(current_user, "audio_sell", f"{camera.name} owner={owner.username} price={price}")
     flash(f"Звук на {camera.name} продан за {price:.0f} р (списано с {owner.username}).")
+    return admin_redirect("#cameras")
+
+
+@app.route("/share/<token>")
+def share_page(token):
+    cam = Camera.query.filter_by(share_token=token, share_enabled=True).first()
+    if not cam or not cam.active: abort(404)
+    return render_template("share.html", camera=cam, token=token)
+
+
+@app.route("/share/<token>/live/<path:filename>")
+def share_live(token, filename):
+    cam = Camera.query.filter_by(share_token=token, share_enabled=True).first()
+    if not cam: abort(404)
+    return send_from_directory(str(SHARE_DIR / f"camera_{cam.id}"), filename, conditional=True)
+
+
+@app.route("/admin/camera/<int:camera_id>/share", methods=["POST"])
+@admin_required
+def admin_camera_share(camera_id):
+    import secrets
+    camera = get_or_404(Camera, camera_id)
+    if camera.share_enabled:
+        camera.share_enabled = 0
+        flash(f"Публичная ссылка для {camera.name} отключена.")
+    else:
+        camera.share_enabled = 1
+        camera.share_token = secrets.token_urlsafe(16)
+        db.session.commit()
+        flash(f"Гостевая ссылка создана (без звука): /share/{camera.share_token}")
+        return admin_redirect("#cameras")
+    db.session.commit()
     return admin_redirect("#cameras")

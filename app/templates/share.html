@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ camera.name }} — трансляция</title>
+<style>
+body{margin:0;background:#0b1220;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;min-height:100vh;}
+h1{font-size:18px;margin:16px 0 8px;}
+.wrap{width:min(96vw,960px);}
+video{width:100%;display:block;background:#000;border-radius:12px;}
+.note{color:#94a3b8;font-size:12px;margin:8px 0 20px;text-align:center;}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:6px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot"></span>{{ camera.name }} — прямой эфир</h1>
+  <video id="v" controls autoplay muted playsinline></video>
+  <p class="note">Гостевой доступ. Трансляция без звука. Ссылку предоставил владелец системы.</p>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+const src = "{{ url_for('share_live', token=token, filename='index.m3u8') }}";
+const v = document.getElementById("v");
+if (window.Hls && Hls.isSupported()) {
+  const hls = new Hls();
+  hls.loadSource(src); hls.attachMedia(v);
+  hls.on(Hls.Events.ERROR, (e,d) => { if (d.fatal) document.querySelector(".note").textContent = "Трансляция недоступна"; });
+} else { v.src = src; }
+</script>
+</body>
+</html>

@@ -152,6 +152,12 @@ def migrate():
             cur.execute("ALTER TABLE camera ADD COLUMN audio_enabled INTEGER DEFAULT 1")
         except Exception:
             pass
+        for col, ddl in (("share_enabled", "ALTER TABLE camera ADD COLUMN share_enabled INTEGER DEFAULT 0"),
+                         ("share_token", "ALTER TABLE camera ADD COLUMN share_token TEXT")):
+            try:
+                cur.execute(ddl)
+            except Exception:
+                pass
         conn.commit()
         print("migration ok")
         
