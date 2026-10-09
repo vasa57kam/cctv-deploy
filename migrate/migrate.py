@@ -99,6 +99,12 @@ def migrate():
         
         CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+
+        CREATE TABLE IF NOT EXISTS services (
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, type TEXT NOT NULL,
+            config TEXT, status TEXT DEFAULT 'active', created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+        CREATE INDEX IF NOT EXISTS idx_services_user ON services(user_id);
+        CREATE INDEX IF NOT EXISTS idx_services_type ON services(type);
         """)
         
         cur.execute("SELECT COUNT(*) FROM tariff")

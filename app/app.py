@@ -1792,3 +1792,88 @@ def manifest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
+
+@app.route("/admin/db/export")
+@admin_required
+def admin_db_export():
+    from flask import Response
+    data = {"version": "1.0", "exported_at": datetime.utcnow().isoformat(),
+            "cameras": [], "users": [], "tariffs": [], "settings": [], "camera_access": []}
+    for cam in Camera.query.all():
+        data["cameras"].append({"name": cam.name, "rtsp_url": cam.rtsp_url, "active": cam.active,
+            "recording_enabled": cam.recording_enabled, "recording_mode": cam.recording_mode,
+            "motion_zone": cam.motion_zone, "onvif_url": cam.onvif_url, "group_name": cam.group_name})
+    for u in User.query.all():
+        data["users"].append({"username": u.username, "balance": u.balance, "credit_limit": u.credit_limit,
+            "admin": u.admin, "active": u.active, "auto_renew": u.auto_renew})
+    for t in Tariff.query.all():
+        data["tariffs"].append({"name": t.name, "price": t.price, "interval_seconds": t.interval_seconds,
+            "max_cameras": t.max_cameras, "archive_days": t.archive_days, "is_b2b": t.is_b2b,
+            "max_users": t.max_users, "is_active": t.is_active})
+    for s in Setting.query.all():
+        data["settings"].append({"key": s.key, "value": s.value})
+    for row in db.session.execute(camera_access.select()).fetchall():
+        u = db.session.get(User, row.user_id); c = db.session.get(Camera, row.camera_id)
+        if u and c:
+            data["camera_access"].append({"username": u.username, "camera_name": c.name, "enabled": row.enabled})
+    audit(current_user, "db_export", f"{len(data['cameras'])} камер")
+    js = json.dumps(data, ensure_ascii=False, indent=2)
+    fn = f"cctv-backup-{datetime.utcnow():%Y%m%d-%H%M%S}.json"
+    return Response(js, mimetype="application/json", headers={"Content-Disposition": f"attachment; filename={fn}"})
+
+
+@app.route("/admin/db/import", methods=["POST"])
+@admin_required
+def admin_db_import():
+    if 'file' not in request.files:
+        flash("Файл не выбран"); return admin_redirect("#settings")
+    f = request.files['file']
+    if f.filename == '':
+        flash("Файл не выбран"); return admin_redirect("#settings")
+    try: data = json.loads(f.read().decode('utf-8'))
+    except Exception as e:
+        flash(f"Ошибка чтения: {e}"); return admin_redirect("#settings")
+    mode = request.form.get("mode", "cameras")
+    st = {"cameras": 0, "tariffs": 0, "settings": 0, "access": 0}
+    if mode in ("cameras", "all"):
+        for cd in data.get("cameras", []):
+            ex = Camera.query.filter_by(rtsp_url=cd["rtsp_url"]).first()
+            if ex:
+                ex.name = cd["name"]; ex.active = cd.get("active", True)
+                ex.recording_enabled = cd.get("recording_enabled", False)
+                ex.recording_mode = cd.get("recording_mode", "continuous")
+                ex.motion_zone = cd.get("motion_zone"); ex.onvif_url = cd.get("onvif_url")
+                ex.group_name = cd.get("group_name")
+            else:
+                db.session.add(Camera(name=cd["name"], rtsp_url=cd["rtsp_url"], active=cd.get("active", True),
+                    recording_enabled=cd.get("recording_enabled", False),
+                    recording_mode=cd.get("recording_mode", "continuous"),
+                    motion_zone=cd.get("motion_zone"), onvif_url=cd.get("onvif_url"),
+                    group_name=cd.get("group_name")))
+            st["cameras"] += 1
+    if mode in ("tariffs", "all"):
+        for td in data.get("tariffs", []):
+            ex = Tariff.query.filter_by(name=td["name"]).first()
+            if ex:
+                ex.price = td["price"]; ex.max_cameras = td.get("max_cameras", 1); ex.archive_days = td.get("archive_days", 7)
+            else:
+                db.session.add(Tariff(name=td["name"], price=td["price"],
+                    interval_seconds=td.get("interval_seconds", 2592000), max_cameras=td.get("max_cameras", 1),
+                    archive_days=td.get("archive_days", 7), is_b2b=td.get("is_b2b", False), max_users=td.get("max_users", 1)))
+            st["tariffs"] += 1
+    if mode in ("settings", "all"):
+        for sd in data.get("settings", []):
+            set_setting(sd["key"], sd["value"]); st["settings"] += 1
+    if mode in ("cameras", "all"):
+        db.session.flush()
+        for ad in data.get("camera_access", []):
+            u = User.query.filter_by(username=ad["username"]).first()
+            c = Camera.query.filter_by(name=ad["camera_name"]).first()
+            if u and c and db.session.execute(camera_access.select().where(
+                    camera_access.c.user_id == u.id, camera_access.c.camera_id == c.id)).fetchone() is None:
+                db.session.execute(camera_access.insert().values(user_id=u.id, camera_id=c.id, enabled=ad.get("enabled", True)))
+                st["access"] += 1
+    db.session.commit()
+    flash(f"Импорт: {st['cameras']} камер, {st['tariffs']} тарифов, {st['settings']} настроек, {st['access']} прав")
+    audit(current_user, "db_import", str(st))
+    return admin_redirect("#settings")

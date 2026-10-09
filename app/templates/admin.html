@@ -357,4 +357,22 @@
 </details>
 </div>
 </div>
+
+<div class="card" id="db-export">
+  <h2>Экспорт/Импорт базы данных</h2>
+  <p class="muted">Бэкап камер, тарифов, настроек и прав доступа. Пароли не экспортируются.</p>
+  <div class="formrow" style="gap:10px;">
+    <a class="btn" href="{{ url_for('admin_db_export') }}">Скачать бэкап JSON</a>
+  </div>
+  <form method="post" action="{{ url_for('admin_db_import') }}" enctype="multipart/form-data" class="formrow" style="gap:10px;margin-top:10px;">
+    <input type="file" name="file" accept=".json" required>
+    <select name="mode" style="width:auto;">
+      <option value="cameras">Камеры + права</option>
+      <option value="tariffs">Тарифы</option>
+      <option value="settings">Настройки</option>
+      <option value="all">Всё целиком</option>
+    </select>
+    <button class="btn" type="submit" onclick="return confirm('Импортировать?')">Импортировать</button>
+  </form>
+</div>
 {% endblock %}
