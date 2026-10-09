@@ -122,6 +122,7 @@ class Camera(db.Model):
     audio_enabled = db.Column(db.Boolean, default=True)
     share_enabled = db.Column(db.Boolean, default=False)
     share_token = db.Column(db.String(64), nullable=True)
+    share_audio = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
 
@@ -1947,4 +1948,18 @@ def admin_camera_share(camera_id):
         flash(f"Гостевая ссылка создана (без звука): /share/{camera.share_token}")
         return admin_redirect("#cameras")
     db.session.commit()
+    return admin_redirect("#cameras")
+
+
+@app.route("/admin/camera/<int:camera_id>/share/audio", methods=["POST"])
+@admin_required
+def admin_camera_share_audio(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    if not camera.share_enabled:
+        flash("Сначала создай гостевую ссылку (кнопка со значком ссылки).")
+        return admin_redirect("#cameras")
+    camera.share_audio = 0 if camera.share_audio else 1
+    db.session.commit()
+    audit(current_user, "share_audio_toggle", f"{camera.name}={camera.share_audio}")
+    flash(f"Гостевая ссылка {camera.name}: звук {'ВКЛ' if camera.share_audio else 'ВЫКЛ'}.")
     return admin_redirect("#cameras")

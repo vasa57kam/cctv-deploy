@@ -20,7 +20,7 @@ SHARE_DIR = BASE_DIR / "storage" / "live_share"
 SMTP_PORT = 2525
 
 procs = {}
-share_procs = {}; share_logs = {}
+share_procs = {}; share_logs = {}; share_configs = {}
 configs = {}
 live_logs = {}
 detectors = {}
@@ -79,7 +79,7 @@ def get_cameras():
             rows = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url, audio_enabled, share_enabled FROM camera WHERE active=1"
+                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url, audio_enabled, share_enabled, share_audio FROM camera WHERE active=1"
                 )
             ]
         except sqlite3.OperationalError:
@@ -87,14 +87,14 @@ def get_cameras():
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, audio_enabled, share_enabled FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, audio_enabled, share_enabled, share_audio FROM camera WHERE active=1"
                     )
                 ]
             except sqlite3.OperationalError:
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode, audio_enabled, share_enabled FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, audio_enabled, share_enabled, share_audio FROM camera WHERE active=1"
                     )
                 ]
         conn.close()
@@ -376,9 +376,10 @@ def start_share(cam):
     d = SHARE_DIR / f"camera_{cid}"
     d.mkdir(parents=True, exist_ok=True)
     lf = log_handle(cid); share_logs[cid] = lf
+    ac = (["-map", "0:v", "-c:v", "copy", "-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
+          if bool(cam.get("share_audio")) else ["-map", "0:v", "-c:v", "copy", "-an"])
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
-           "-map", "0:v", "-c:v", "copy", "-an",
+           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]] + ac + [
            "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
            "-hls_flags", "delete_segments", str(d / "index.m3u8")]
     mlog(cid, "share stream start (без звука)")
@@ -479,9 +480,13 @@ while running:
 
         sp = share_procs.get(cid)
         want_share = bool(cam.get("share_enabled"))
-        if want_share and (sp is None or sp.poll() is not None):
+        saudio = bool(cam.get("share_audio"))
+        if want_share and (sp is None or sp.poll() is not None or share_configs.get(cid) != saudio):
             if sp is not None: sp.wait()
+            stop_share(cid)
             share_procs[cid] = start_share(cam)
+            share_configs[cid] = saudio
+            mlog(cid, f"share stream (re)start audio={saudio}")
         elif not want_share and sp is not None:
             stop_share(cid)
 

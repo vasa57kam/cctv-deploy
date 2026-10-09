@@ -153,7 +153,8 @@ def migrate():
         except Exception:
             pass
         for col, ddl in (("share_enabled", "ALTER TABLE camera ADD COLUMN share_enabled INTEGER DEFAULT 0"),
-                         ("share_token", "ALTER TABLE camera ADD COLUMN share_token TEXT")):
+                         ("share_token", "ALTER TABLE camera ADD COLUMN share_token TEXT"),
+                         ("share_audio", "ALTER TABLE camera ADD COLUMN share_audio INTEGER DEFAULT 0")):
             try:
                 cur.execute(ddl)
             except Exception:
