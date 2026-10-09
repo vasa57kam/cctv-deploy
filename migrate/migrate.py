@@ -148,6 +148,10 @@ def migrate():
                 conn.rollback()
                 print(f"migration: admin user '{admin_user}' already exists")
         
+        try:
+            cur.execute("ALTER TABLE camera ADD COLUMN audio_enabled INTEGER DEFAULT 1")
+        except Exception:
+            pass
         conn.commit()
         print("migration ok")
         

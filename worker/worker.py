@@ -77,7 +77,7 @@ def get_cameras():
             rows = [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url FROM camera WHERE active=1"
+                    "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, onvif_url, audio_enabled FROM camera WHERE active=1"
                 )
             ]
         except sqlite3.OperationalError:
@@ -85,14 +85,14 @@ def get_cameras():
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, motion_zone, audio_enabled FROM camera WHERE active=1"
                     )
                 ]
             except sqlite3.OperationalError:
                 rows = [
                     dict(r)
                     for r in conn.execute(
-                        "SELECT id, rtsp_url, recording_enabled, recording_mode FROM camera WHERE active=1"
+                        "SELECT id, rtsp_url, recording_enabled, recording_mode, audio_enabled FROM camera WHERE active=1"
                     )
                 ]
         conn.close()
@@ -291,7 +291,7 @@ def zone_vf_prefix(zone):
 
 
 def start_detector(cam, cfg):
-    rtsp, rec, mode, zone, thr, onvif_url, grace, seg = cfg
+    rtsp, rec, mode, zone, thr, onvif_url, grace, seg, audio_on = cfg
     vf = zone_vf_prefix(zone) + f"select='gt(scene,{thr})'"
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
@@ -433,7 +433,7 @@ while running:
         cid = cam["id"]
         active_ids.add(cid)
         cfg = camera_config(cam, settings)
-        rtsp, rec, mode, zone, thr, onvif_url, grace_s, seg = cfg
+        rtsp, rec, mode, zone, thr, onvif_url, grace_s, seg, audio_on = cfg
 
         proc = procs.get(cid)
         if proc is not None and configs.get(cid) != cfg:

@@ -39,7 +39,7 @@ DEFAULT_SETTINGS = {
     "transfer_instruction": "Переведите сумму на карту Сбербанк: 0000 0000 0000 0000 (Имя Фамилия). В комментарии укажите дату и последние 4 цифры.",
     "promised_amount": "300", "promised_repay_seconds": "604800", "promised_fee_percent": "10",
     "partner_commission": "30", "archive_order_price": "100", "freeze_price_per_day": "50",
-    "motion_threshold": "0.06", "motion_grace": "45", "segment_seconds": "300",
+    "motion_threshold": "0.06", "motion_grace": "45", "segment_seconds": "300", "audio_camera_price": "100",
     "whitelabel_name": "CCTV Cloud", "whitelabel_primary": "#38bdf8", "whitelabel_logo": "",
 }
 
@@ -118,6 +118,7 @@ class Camera(db.Model):
     motion_zone = db.Column(db.String(60), nullable=True)
     onvif_url = db.Column(db.String(255), nullable=True)
     group_name = db.Column(db.String(60), nullable=True)
+    audio_enabled = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     users = db.relationship("User", secondary="camera_access", backref="cameras")
 
@@ -1352,7 +1353,7 @@ def admin_settings():
     for code, _ in PAY_METHODS: set_setting(f"method_{code}", "1" if request.form.get(f"method_{code}") else "0")
     for k in ("transfer_instruction", "promised_amount", "promised_repay_seconds", "promised_fee_percent",
               "partner_commission", "archive_order_price", "freeze_price_per_day",
-              "motion_threshold", "motion_grace", "segment_seconds",
+              "motion_threshold", "motion_grace", "segment_seconds", "audio_camera_price",
               "whitelabel_name", "whitelabel_primary", "whitelabel_logo"):
         set_setting(k, request.form.get(k, ""))
     db.session.commit()
@@ -1877,3 +1878,38 @@ def admin_db_import():
     flash(f"Импорт: {st['cameras']} камер, {st['tariffs']} тарифов, {st['settings']} настроек, {st['access']} прав")
     audit(current_user, "db_import", str(st))
     return admin_redirect("#settings")
+
+
+@app.route("/admin/camera/<int:camera_id>/audio", methods=["POST"])
+@admin_required
+def admin_camera_audio(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    camera.audio_enabled = 0 if camera.audio_enabled else 1
+    db.session.commit()
+    audit(current_user, "audio_toggle", f"{camera.name}={camera.audio_enabled}")
+    flash(f"Камера {camera.name}: звук {'ВКЛ' if camera.audio_enabled else 'ВЫКЛ'}.")
+    return admin_redirect("#cameras")
+
+
+@app.route("/admin/camera/<int:camera_id>/audio/sell", methods=["POST"])
+@admin_required
+def admin_camera_audio_sell(camera_id):
+    camera = get_or_404(Camera, camera_id)
+    try:
+        price = float(get_setting("audio_camera_price", "100") or 100)
+    except ValueError:
+        price = 100.0
+    row = db.session.execute(camera_access.select().where(
+        camera_access.c.camera_id == camera.id, camera_access.c.enabled == True)).fetchone()
+    owner = db.session.get(User, row.user_id) if row else None
+    if owner is None:
+        flash("У камеры нет владельца с доступом."); return admin_redirect("#cameras")
+    if owner.balance < price:
+        flash(f"У владельца {owner.username} недостаточно баланса ({price:.0f} р)."); return admin_redirect("#cameras")
+    owner.balance -= price
+    db.session.add(Transaction(user_id=owner.id, amount=-price, reason=f"Услуга «звук с камеры» {camera.name}"))
+    camera.audio_enabled = 1
+    db.session.commit()
+    audit(current_user, "audio_sell", f"{camera.name} owner={owner.username} price={price}")
+    flash(f"Звук на {camera.name} продан за {price:.0f} р (списано с {owner.username}).")
+    return admin_redirect("#cameras")

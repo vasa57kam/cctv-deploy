@@ -138,6 +138,8 @@
 <td><form method="post" action="{{ url_for('admin_camera_grant', camera_id=cam.id) }}" class="formrow"><select name="user_id">{% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}</select><button class="btn ghost mini" type="submit">+</button></form></td>
 <td>
 <form method="post" action="{{ url_for('admin_camera_recording', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="{{ "Выкл запись" if cam.recording_enabled else "Вкл запись" }}">{{ "⏹" if cam.recording_enabled else "▶" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_audio', camera_id=cam.id) }}" style="display:inline"><button class="btn gray mini" type="submit" title="Звук вкл/выкл">{{ "🔊" if cam.audio_enabled else "🔇" }}</button></form>
+<form method="post" action="{{ url_for('admin_camera_audio_sell', camera_id=cam.id) }}" style="display:inline" onsubmit="return confirm('Списать плату за звук с владельца камеры?');"><button class="btn gray mini" type="submit" title="Продать звук">💰</button></form>
 <form method="post" action="{{ url_for('admin_camera_motion', camera_id=cam.id) }}" style="display:inline" class="formrow" title="Режим записи: выбрать и применить">
 <input type="hidden" name="back" value="admin">
 <select name="mode" style="padding:4px 6px;font-size:12px;border-radius:8px;">
