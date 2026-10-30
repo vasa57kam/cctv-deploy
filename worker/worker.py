@@ -2,6 +2,7 @@ import os, re, sqlite3, subprocess, time, signal, threading
 import select as pselect
 import urllib.parse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 BASE_DIR = Path("/opt/cctv")
 DB_PATH = BASE_DIR / "app" / "cctv.db"
@@ -12,11 +13,21 @@ LOG_DIR = BASE_DIR / "storage" / "logs"
 PREVIEW_DIR = BASE_DIR / "storage" / "previews"
 SMTP_PORT = 2525
 
+# Защита от сетевого шторма
+FFMPEG_STIMEOUT = "5000000"   # 5 сек таймаут на RTSP-подключение (микросекунды)
+FFMPEG_RWTIMEOUT = "5000000"  # 5 сек таймаут на чтение
+STARTUP_DELAY = 0.5           # задержка между стартами камер (сек)
+ERROR_COOLDOWN = 30           # после 3 ошибок подряд — пауза 30 сек
+MAX_RESTART_ATTEMPTS = 3      # макс. рестартов подряд до cooldown
+
 procs = {}; configs = {}; live_logs = {}
 detectors = {}; det_frames = {}; recorders = {}; rec_logs = {}
 last_motion = {}; onvif_threads = {}
 share_procs = {}; share_logs = {}; share_configs = {}
+errors_count = {}             # счётчик ошибок по камерам
+cooldown_until = {}           # до какого момента камера в cooldown
 running = True; loops = 0
+startup_done = False
 
 
 def handle_signal(signum, frame):
@@ -195,6 +206,17 @@ def audio_flags(cam):
             if bool(cam.get("audio_enabled", 1)) else ["-an"])
 
 
+def ffmpeg_base(rtsp_url):
+    """Базовые флаги ffmpeg с таймаутами против SYN-флуда."""
+    return [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+        "-rtsp_transport", "tcp",
+        "-stimeout", FFMPEG_STIMEOUT,
+        "-rw_timeout", FFMPEG_RWTIMEOUT,
+        "-i", rtsp_url,
+    ]
+
+
 def start_live(cam, with_segments, seg):
     cid = cam["id"]
     live_dir = LIVE_DIR / f"camera_{cid}"
@@ -204,8 +226,7 @@ def start_live(cam, with_segments, seg):
     lf = log_handle(cid)
     live_logs[cid] = lf
     ac = audio_flags(cam)
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]]
+    cmd = ffmpeg_base(cam["rtsp_url"])
     if with_segments:
         cmd += ["-map", "0:v", "-c:v", "copy"] + ac + [
             "-f", "segment", "-segment_time", str(seg),
@@ -214,6 +235,7 @@ def start_live(cam, with_segments, seg):
     cmd += ["-map", "0:v", "-c:v", "copy"] + ac + [
         "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
         "-hls_flags", "delete_segments", str(live_dir / "index.m3u8")]
+    mlog(cid, f"start_live (with_segments={with_segments})")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
 
@@ -239,10 +261,9 @@ def start_share(cam):
     share_logs[cid] = lf
     ac = (["-map", "0:v", "-c:v", "copy", "-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
           if bool(cam.get("share_audio")) else ["-map", "0:v", "-c:v", "copy", "-an"])
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"]] + ac + [
-           "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
-           "-hls_flags", "delete_segments", str(d / "index.m3u8")]
+    cmd = ffmpeg_base(cam["rtsp_url"]) + ac + [
+        "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
+        "-hls_flags", "delete_segments", str(d / "index.m3u8")]
     mlog(cid, f"share stream start audio={bool(cam.get('share_audio'))}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
@@ -277,9 +298,9 @@ def zone_vf_prefix(zone):
 def start_detector(cam, cfg):
     rtsp, rec, mode, zone, thr, onvif_url, grace_s, seg, audio_on = cfg
     vf = zone_vf_prefix(zone) + f"select='gt(scene,{thr})'"
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
-           "-rtsp_transport", "tcp", "-i", rtsp,
-           "-vf", vf, "-vsync", "0", "-f", "null", "-"]
+    # -r 2 = 2 fps вместо 25 → 10x меньше нагрузка на сеть
+    cmd = ffmpeg_base(cam["rtsp_url"]) + [
+        "-vf", vf, "-r", "2", "-vsync", "0", "-f", "null", "-"]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             text=True, errors="ignore")
 
@@ -317,10 +338,9 @@ def start_recorder(cam):
     lf = log_handle(cid)
     rec_logs[cid] = lf
     ac = audio_flags(cam)
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-           "-rtsp_transport", "tcp", "-i", cam["rtsp_url"],
-           "-map", "0:v", "-c:v", "copy"] + ac + [
-           "-movflags", "+faststart", str(out)]
+    cmd = ffmpeg_base(cam["rtsp_url"]) + [
+        "-map", "0:v", "-c:v", "copy"] + ac + [
+        "-movflags", "+faststart", str(out)]
     mlog(cid, f"recorder start -> {out.name}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
 
@@ -340,23 +360,30 @@ def stop_recorder(cid, reason=""):
         except Exception: pass
 
 
+def snap_one(cam):
+    """Снимок одной камеры (для параллельного запуска)."""
+    out = PREVIEW_DIR / f"thumb_{cam['id']}.jpg"
+    tmp = PREVIEW_DIR / f".thumb_{cam['id']}.tmp.jpg"
+    cmd = ffmpeg_base(cam["rtsp_url"]) + ["-frames:v", "1", "-y", str(tmp)]
+    try:
+        r = subprocess.run(cmd, timeout=10, capture_output=True)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, out)
+            return True
+        elif tmp.exists():
+            tmp.unlink()
+    except Exception:
+        if tmp.exists():
+            try: tmp.unlink()
+            except Exception: pass
+    return False
+
+
 def snap_thumbs(cams):
+    """Параллельный снимок всех камер — не блокирует главный цикл."""
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    for cam in cams:
-        out = PREVIEW_DIR / f"thumb_{cam['id']}.jpg"
-        tmp = PREVIEW_DIR / f".thumb_{cam['id']}.tmp.jpg"
-        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
-               "-i", cam["rtsp_url"], "-frames:v", "1", "-y", str(tmp)]
-        try:
-            r = subprocess.run(cmd, timeout=10, capture_output=True)
-            if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
-                os.replace(tmp, out)
-            elif tmp.exists():
-                tmp.unlink()
-        except Exception:
-            if tmp.exists():
-                try: tmp.unlink()
-                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(4, len(cams) or 1)) as ex:
+        list(ex.map(snap_one, cams))
 
 
 def cleanup_archives():
@@ -382,6 +409,9 @@ def cleanup_archives():
 
 threading.Thread(target=smtp_server_thread, daemon=True).start()
 
+# ПЛАВНЫЙ СТАРТ: камеры запускаются по очереди с задержкой
+print(f"[worker] v7.0: плавный старт камер с задержкой {STARTUP_DELAY}с")
+
 while running:
     settings = get_settings()
     cameras = get_cameras()
@@ -392,9 +422,26 @@ while running:
     except ValueError:
         grace = 45.0
 
+    # Первый проход после запуска — плавный старт
+    if not startup_done and cameras:
+        print(f"[worker] запуск {len(cameras)} камер по очереди...")
+        for cam in cameras:
+            cid = cam["id"]
+            procs[cid] = start_live(cam, bool(cam["recording_enabled"]) and (cam.get("recording_mode") or "continuous") == "continuous",
+                                    max(10, min(3600, int(settings.get("segment_seconds", "300") or "300"))))
+            configs[cid] = camera_config(cam, settings)
+            time.sleep(STARTUP_DELAY)
+        startup_done = True
+        print(f"[worker] все {len(cameras)} камер запущены")
+
     for cam in cameras:
         cid = cam["id"]
         active_ids.add(cid)
+
+        # Пропускаем камеры в cooldown
+        if cid in cooldown_until and time.time() < cooldown_until[cid]:
+            continue
+
         cfg = camera_config(cam, settings)
         rtsp, rec, mode, zone, thr, onvif_url, grace_s, seg, audio_on = cfg
 
@@ -402,12 +449,26 @@ while running:
         if proc is not None and configs.get(cid) != cfg:
             stop_live(cid)
             proc = None
-        if proc is None or proc.poll() is not None:
-            if proc is not None:
-                proc.wait()
-                stop_live(cid)
+
+        # Проверка падения: если процесс умер — считаем ошибку
+        if proc is not None and proc.poll() is not None:
+            errors_count[cid] = errors_count.get(cid, 0) + 1
+            mlog(cid, f"процесс упал (ошибок подряд: {errors_count[cid]})")
+            if errors_count[cid] >= MAX_RESTART_ATTEMPTS:
+                cooldown_until[cid] = time.time() + ERROR_COOLDOWN
+                mlog(cid, f"cooldown {ERROR_COOLDOWN}с (слишком много ошибок)")
+                print(f"[worker] камера {cid} в cooldown на {ERROR_COOLDOWN}с")
+            stop_live(cid)
+            proc = None
+
+        if proc is None and cid not in cooldown_until:
             procs[cid] = start_live(cam, rec and mode == "continuous", seg)
             configs[cid] = cfg
+            # Успешный запуск = сброс счётчика
+            if errors_count.get(cid, 0) > 0 and proc.poll() is None:
+                time.sleep(0.2)  # дать ffmpeg 200мс на установку соединения
+                if procs[cid].poll() is None:
+                    errors_count[cid] = 0
 
         sp = share_procs.get(cid)
         want_share = bool(cam.get("share_enabled"))
@@ -467,6 +528,8 @@ while running:
             stop_onvif(cid)
             stop_share(cid)
             last_motion.pop(cid, None)
+            errors_count.pop(cid, None)
+            cooldown_until.pop(cid, None)
 
     loops += 1
     if loops % 30 == 1:
